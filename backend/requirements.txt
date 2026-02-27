@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-multipart
+anthropic
+pdfplumber
+faster-whisper
+sqlalchemy[asyncio]>=2.0
+aiomysql>=0.2.0
+python-dotenv>=1.0.0
