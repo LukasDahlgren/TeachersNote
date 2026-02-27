@@ -47,9 +47,10 @@ async def save_lecture_to_db(
     alignment: list[dict],
     enhanced: list[dict],
     pptx_path: str | None,
+    pdf_path: str | None = None,
     is_demo: bool = False,
 ) -> int:
-    lecture = Lecture(name=name, is_demo=is_demo, pptx_path=pptx_path)
+    lecture = Lecture(name=name, is_demo=is_demo, pptx_path=pptx_path, pdf_path=pdf_path)
     db.add(lecture)
     await db.flush()
 
@@ -111,6 +112,10 @@ async def lecture_to_response(db: AsyncSession, lecture_id: int) -> dict:
         select(Alignment).where(Alignment.lecture_id == lecture_id).order_by(Alignment.slide_number)
     )).scalars().all()
 
+    enriched_rows = (await db.execute(
+        select(EnrichedSlide).where(EnrichedSlide.lecture_id == lecture_id).order_by(EnrichedSlide.slide_number)
+    )).scalars().all()
+
     return {
         "slides": [{"slide": s.slide_number, "text": s.text} for s in slides_rows],
         "transcript": [
@@ -119,6 +124,16 @@ async def lecture_to_response(db: AsyncSession, lecture_id: int) -> dict:
         "alignment": [
             {"slide": a.slide_number, "start_segment": a.start_segment, "end_segment": a.end_segment}
             for a in align_rows
+        ],
+        "enhanced": [
+            {
+                "slide": e.slide_number,
+                "summary": e.summary,
+                "slide_content": e.slide_content,
+                "lecturer_additions": e.lecturer_additions,
+                "key_takeaways": e.key_takeaways,
+            }
+            for e in enriched_rows
         ],
     }
 
@@ -173,7 +188,15 @@ async def demo(db: AsyncSession = Depends(get_db)):
         is_demo=True,
     )
 
-    return {"slides": slides, "transcript": transcript, "alignment": alignment}
+    return {"slides": slides, "transcript": transcript, "alignment": alignment, "enhanced": enhanced}
+
+
+@app.get("/pdf/{filename}")
+def serve_pdf(filename: str):
+    path = GENERATED_DIR / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path, media_type="application/pdf")
 
 
 @app.get("/download/{filename}")
@@ -213,6 +236,10 @@ async def process(
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
+        # Copy PDF to generated/ for permanent storage
+        saved_pdf_path = GENERATED_DIR / f"{pptx_path.stem}.pdf"
+        shutil.copy2(pdf_path, saved_pdf_path)
+
     lecture_id = await save_lecture_to_db(
         db=db,
         name=pdf.filename or "upload.pdf",
@@ -221,10 +248,11 @@ async def process(
         alignment=result["alignment"],
         enhanced=result["enhanced"],
         pptx_path=str(pptx_path.relative_to(Path(__file__).parent)),
+        pdf_path=str(saved_pdf_path.relative_to(Path(__file__).parent)),
         is_demo=False,
     )
 
-    return {**result, "lecture_id": lecture_id}
+    return {**result, "lecture_id": lecture_id, "pdf_url": f"/pdf/{saved_pdf_path.name}"}
 
 
 @app.get("/lectures")
@@ -256,4 +284,5 @@ async def get_lecture(lecture_id: int, db: AsyncSession = Depends(get_db)):
         "lecture_id": lecture.id,
         "name": lecture.name,
         "download_url": f"/download/{Path(lecture.pptx_path).name}" if lecture.pptx_path else None,
+        "pdf_url": f"/pdf/{Path(lecture.pdf_path).name}" if lecture.pdf_path else None,
     }

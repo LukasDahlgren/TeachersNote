@@ -16,18 +16,19 @@ SLIDE_HEIGHT = Inches(7.5)
 def pdf_to_images(pdf_path: str, dpi: int = 150) -> list[bytes]:
     """Render each PDF page to PNG bytes in parallel."""
     doc = fitz.open(pdf_path)
-    zoom = dpi / 72
-    matrix = fitz.Matrix(zoom, zoom)
-    page_count = len(doc)
+    try:
+        zoom = dpi / 72
+        matrix = fitz.Matrix(zoom, zoom)
+        page_count = len(doc)
 
-    def render_page(idx: int) -> tuple[int, bytes]:
-        pix = doc[idx].get_pixmap(matrix=matrix)
-        return idx, pix.tobytes("png")
+        def render_page(idx: int) -> tuple[int, bytes]:
+            pix = doc[idx].get_pixmap(matrix=matrix)
+            return idx, pix.tobytes("png")
 
-    with ThreadPoolExecutor() as pool:
-        results = list(pool.map(render_page, range(page_count)))
-
-    doc.close()
+        with ThreadPoolExecutor() as pool:
+            results = list(pool.map(render_page, range(page_count)))
+    finally:
+        doc.close()
     return [img for _, img in sorted(results)]
 
 

@@ -3,6 +3,8 @@ import json
 import re
 import anthropic
 
+client = anthropic.Anthropic()
+
 
 def build_prompt(slides: list[dict], segments: list[dict]) -> str:
     lines = ["SLIDES (presented in order during the lecture):"]
@@ -45,7 +47,6 @@ def align(slides_path: str, transcript_path: str, output_path: str) -> None:
     print(f"Loaded {len(slides)} slides and {len(segments)} transcript segments")
     print("Calling Claude API for alignment...")
 
-    client = anthropic.Anthropic()
     prompt = build_prompt(slides, segments)
 
     message = client.messages.create(

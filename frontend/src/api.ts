@@ -1,6 +1,6 @@
-import type { ProcessResult } from "./types";
+import type { ProcessResult, LectureSummary } from "./types";
 
-const BASE = "http://localhost:8000";
+const BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
 export async function processFiles(pdf: File, audio: File): Promise<ProcessResult> {
   const form = new FormData();
@@ -18,4 +18,16 @@ export async function checkHealth(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+export async function getLectures(): Promise<LectureSummary[]> {
+  const res = await fetch(`${BASE}/lectures`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function getLecture(id: number): Promise<ProcessResult & { name: string }> {
+  const res = await fetch(`${BASE}/lectures/${id}`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
 }

@@ -48,6 +48,74 @@ function FileSelectedIcon() {
 
 const AUDIO_EXTENSIONS = /\.(mp4|mov|webm|wav|m4a|mp3)$/i;
 
+interface DropZoneProps {
+  label: string;
+  accept: string;
+  file: File | null;
+  dragOver: boolean;
+  loading: boolean;
+  icon: React.ReactNode;
+  dropTitle: string;
+  dropHint: string;
+  dropAccepts: string;
+  inputRef: React.RefObject<HTMLInputElement | null>;
+  onDrop: (e: React.DragEvent) => void;
+  onDragOver: (over: boolean) => void;
+  onFileChange: (file: File) => void;
+  onClear: () => void;
+}
+
+function DropZone({
+  label, accept, file, dragOver, loading, icon,
+  dropTitle, dropHint, dropAccepts,
+  inputRef, onDrop, onDragOver, onFileChange, onClear,
+}: DropZoneProps) {
+  return (
+    <div className="drop-zone-wrapper">
+      <div className="drop-zone-label">{label}</div>
+      <div
+        className={`drop-zone${dragOver ? " drag-over" : ""}${file ? " has-file" : ""}`}
+        onClick={() => inputRef.current?.click()}
+        onDragOver={e => { e.preventDefault(); onDragOver(true); }}
+        onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node)) onDragOver(false); }}
+        onDrop={onDrop}
+      >
+        <input
+          ref={inputRef}
+          type="file"
+          accept={accept}
+          style={{ display: "none" }}
+          disabled={loading}
+          onChange={e => { const f = e.target.files?.[0]; if (f) onFileChange(f); }}
+        />
+        {file ? (
+          <div className="file-info">
+            <FileSelectedIcon />
+            <span className="file-name">{file.name}</span>
+            <span className="file-size">{formatBytes(file.size)}</span>
+            <button
+              type="button"
+              className="clear-btn"
+              onClick={e => { e.stopPropagation(); onClear(); }}
+            >
+              ×
+            </button>
+          </div>
+        ) : (
+          <div className="drop-prompt">
+            {icon}
+            <div>
+              <div className="drop-title">{dropTitle}</div>
+              <div className="drop-hint">{dropHint}</div>
+              <div className="drop-accepts">{dropAccepts}</div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function UploadForm({ onSubmit, loading }: Props) {
   const [pdfFile, setPdfFile] = useState<File | null>(null);
   const [audioFile, setAudioFile] = useState<File | null>(null);
@@ -63,11 +131,9 @@ export default function UploadForm({ onSubmit, loading }: Props) {
     const file = e.dataTransfer.files[0];
     if (!file) return;
     if (file.type !== "application/pdf" && !file.name.endsWith(".pdf")) {
-      setError("Please drop a PDF file for slides.");
-      return;
+      setError("Please drop a PDF file for slides."); return;
     }
-    setError("");
-    setPdfFile(file);
+    setError(""); setPdfFile(file);
   }
 
   function handleAudioDrop(e: React.DragEvent) {
@@ -76,11 +142,9 @@ export default function UploadForm({ onSubmit, loading }: Props) {
     const file = e.dataTransfer.files[0];
     if (!file) return;
     if (!AUDIO_EXTENSIONS.test(file.name)) {
-      setError("Please drop an audio or video file (.mp4, .mov, .webm, .wav, .m4a, .mp3).");
-      return;
+      setError("Please drop an audio or video file (.mp4, .mov, .webm, .wav, .m4a, .mp3)."); return;
     }
-    setError("");
-    setAudioFile(file);
+    setError(""); setAudioFile(file);
   }
 
   function handleSubmit(e: React.FormEvent) {
@@ -100,107 +164,39 @@ export default function UploadForm({ onSubmit, loading }: Props) {
         Upload lecture slides (PDF) and an audio or video recording to generate an aligned transcript.
       </p>
 
-      {/* PDF drop zone */}
-      <div className="drop-zone-wrapper">
-        <div className="drop-zone-label">Slides (PDF)</div>
-        <div
-          className={`drop-zone${pdfDragOver ? " drag-over" : ""}${pdfFile ? " has-file" : ""}`}
-          onClick={() => pdfInputRef.current?.click()}
-          onDragOver={e => { e.preventDefault(); setPdfDragOver(true); }}
-          onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setPdfDragOver(false); }}
-          onDrop={handlePdfDrop}
-        >
-          <input
-            ref={pdfInputRef}
-            type="file"
-            accept=".pdf"
-            style={{ display: "none" }}
-            disabled={loading}
-            onChange={e => {
-              const file = e.target.files?.[0];
-              if (file) { setError(""); setPdfFile(file); }
-            }}
-          />
-          {pdfFile ? (
-            <div className="file-info">
-              <FileSelectedIcon />
-              <span className="file-name">{pdfFile.name}</span>
-              <span className="file-size">{formatBytes(pdfFile.size)}</span>
-              <button
-                type="button"
-                className="clear-btn"
-                onClick={e => {
-                  e.stopPropagation();
-                  setPdfFile(null);
-                  if (pdfInputRef.current) pdfInputRef.current.value = "";
-                }}
-              >
-                ×
-              </button>
-            </div>
-          ) : (
-            <div className="drop-prompt">
-              <PdfIcon />
-              <div>
-                <div className="drop-title">Drop PDF here or click to browse</div>
-                <div className="drop-hint">Drag and drop your lecture slide deck</div>
-                <div className="drop-accepts">Accepts: .pdf</div>
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
+      <DropZone
+        label="Slides (PDF)"
+        accept=".pdf"
+        file={pdfFile}
+        dragOver={pdfDragOver}
+        loading={loading}
+        icon={<PdfIcon />}
+        dropTitle="Drop PDF here or click to browse"
+        dropHint="Drag and drop your lecture slide deck"
+        dropAccepts="Accepts: .pdf"
+        inputRef={pdfInputRef}
+        onDrop={handlePdfDrop}
+        onDragOver={setPdfDragOver}
+        onFileChange={file => { setError(""); setPdfFile(file); }}
+        onClear={() => { setPdfFile(null); if (pdfInputRef.current) pdfInputRef.current.value = ""; }}
+      />
 
-      {/* Audio drop zone */}
-      <div className="drop-zone-wrapper">
-        <div className="drop-zone-label">Video / Audio</div>
-        <div
-          className={`drop-zone${audioDragOver ? " drag-over" : ""}${audioFile ? " has-file" : ""}`}
-          onClick={() => audioInputRef.current?.click()}
-          onDragOver={e => { e.preventDefault(); setAudioDragOver(true); }}
-          onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setAudioDragOver(false); }}
-          onDrop={handleAudioDrop}
-        >
-          <input
-            ref={audioInputRef}
-            type="file"
-            accept=".mp4,.mov,.webm,.wav,.m4a,.mp3"
-            style={{ display: "none" }}
-            disabled={loading}
-            onChange={e => {
-              const file = e.target.files?.[0];
-              if (file) { setError(""); setAudioFile(file); }
-            }}
-          />
-          {audioFile ? (
-            <div className="file-info">
-              <FileSelectedIcon />
-              <span className="file-name">{audioFile.name}</span>
-              <span className="file-size">{formatBytes(audioFile.size)}</span>
-              <button
-                type="button"
-                className="clear-btn"
-                onClick={e => {
-                  e.stopPropagation();
-                  setAudioFile(null);
-                  if (audioInputRef.current) audioInputRef.current.value = "";
-                }}
-              >
-                ×
-              </button>
-            </div>
-          ) : (
-            <div className="drop-prompt">
-              <AudioIcon />
-              <div>
-                <div className="drop-title">Drop audio/video here or click to browse</div>
-                <div className="drop-hint">Drag and drop your recording</div>
-                <div className="drop-accepts">Accepts: .mp4 .mov .webm .wav .m4a .mp3</div>
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
+      <DropZone
+        label="Video / Audio"
+        accept=".mp4,.mov,.webm,.wav,.m4a,.mp3"
+        file={audioFile}
+        dragOver={audioDragOver}
+        loading={loading}
+        icon={<AudioIcon />}
+        dropTitle="Drop audio/video here or click to browse"
+        dropHint="Drag and drop your recording"
+        dropAccepts="Accepts: .mp4 .mov .webm .wav .m4a .mp3"
+        inputRef={audioInputRef}
+        onDrop={handleAudioDrop}
+        onDragOver={setAudioDragOver}
+        onFileChange={file => { setError(""); setAudioFile(file); }}
+        onClear={() => { setAudioFile(null); if (audioInputRef.current) audioInputRef.current.value = ""; }}
+      />
 
       {error && <p className="form-error">{error}</p>}
 

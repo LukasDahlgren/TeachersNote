@@ -1,3 +1,4 @@
+import logging
 import os
 
 from dotenv import load_dotenv
@@ -10,6 +11,10 @@ DB_PORT = os.getenv("DB_PORT", "3306")
 DB_USER = os.getenv("DB_USER", "root")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 DB_NAME = os.getenv("DB_NAME", "lecturesummary")
+
+_missing = [k for k, v, d in [("DB_HOST", DB_HOST, "localhost"), ("DB_USER", DB_USER, "root"), ("DB_PASSWORD", DB_PASSWORD, ""), ("DB_NAME", DB_NAME, "lecturesummary")] if v == d]
+if _missing:
+    logging.warning("DB config using default/empty values for: %s", ", ".join(_missing))
 
 DATABASE_URL = (
     f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"

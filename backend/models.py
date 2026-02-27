@@ -15,6 +15,7 @@ class Lecture(Base):
     name       = Column(String(255), nullable=False)
     is_demo    = Column(Boolean, nullable=False, default=False)
     pptx_path  = Column(String(512), nullable=True)
+    pdf_path   = Column(String(512), nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
     slides              = relationship("Slide", back_populates="lecture", cascade="all, delete-orphan")

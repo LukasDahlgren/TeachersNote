@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import anthropic
 
+client = anthropic.Anthropic()
 
 SYSTEM_PROMPT = """Du är assistent som hjälper studenter att förstå föreläsningsinnehåll.
 Du får en föreläsningsbild (slide) och en transkription av vad föreläsaren sade under den bilden.
@@ -72,8 +73,6 @@ def enrich(slides_path: str, aligned_path: str, transcript_path: str, output_pat
     if already_done:
         print(f"Resuming: {len(already_done)}/{total} slides already done, {len(pending)} remaining")
 
-    client = anthropic.Anthropic()
-
     def process(a: dict) -> None:
         slide = slides_by_num[a["slide"]]
         transcript_segs = segments[a["start_segment"]: a["end_segment"] + 1]
@@ -90,9 +89,6 @@ def enrich(slides_path: str, aligned_path: str, transcript_path: str, output_pat
 
         with results_lock:
             results.append(entry)
-            sorted_results = sorted(results, key=lambda x: x["slide"])
-            with open(output_path, "w", encoding="utf-8") as f:
-                json.dump(sorted_results, f, ensure_ascii=False, indent=2)
             done_count = len(results)
 
         print(f"  Slide {a['slide']}/{total} done ({done_count}/{total} total)", flush=True)
@@ -101,6 +97,10 @@ def enrich(slides_path: str, aligned_path: str, transcript_path: str, output_pat
         futures = [pool.submit(process, a) for a in pending]
         for future in as_completed(futures):
             future.result()  # re-raise any exceptions
+
+    sorted_results = sorted(results, key=lambda x: x["slide"])
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(sorted_results, f, ensure_ascii=False, indent=2)
 
     print(f"\nEnriched {len(results)} slides → {output_path}")
 
