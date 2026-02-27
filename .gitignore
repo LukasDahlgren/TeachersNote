@@ -28,3 +28,7 @@ textdemo.mp4
 textdemo.wav
 *.pdf
 *.pptx
+
+# Large upload/generated dirs
+backend/uploads/
+backend/generated/
