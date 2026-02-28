@@ -12,10 +12,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.security import APIKeyHeader
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -83,6 +84,29 @@ def _env_truthy(name: str, default: bool = False) -> bool:
 DISABLE_EXTERNAL_AI = _env_truthy("DISABLE_EXTERNAL_AI", default=False)
 if DISABLE_EXTERNAL_AI:
     LOGGER.warning("DISABLE_EXTERNAL_AI=true: regeneration uses deterministic fallback notes only.")
+
+APP_API_KEY = os.getenv("API_KEY")
+if not APP_API_KEY:
+    raise RuntimeError(
+        "API_KEY environment variable is not set. Add it to backend/.env before starting the server."
+    )
+
+_API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def _require_api_key(key: str | None = Depends(_API_KEY_HEADER)) -> None:
+    if key != APP_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+async def _require_api_key_or_token(
+    key: str | None = Depends(_API_KEY_HEADER),
+    token: str | None = Query(default=None),
+) -> None:
+    """Used for SSE endpoints where EventSource cannot send custom headers."""
+    if key == APP_API_KEY or token == APP_API_KEY:
+        return
+    raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 def _join_text(parts: list[str]) -> str:
@@ -1045,7 +1069,7 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/demo")
+@app.get("/demo", dependencies=[Depends(_require_api_key)])
 async def demo(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Lecture).where(Lecture.is_demo == True).limit(1))
     existing = result.scalar_one_or_none()
@@ -1093,7 +1117,7 @@ async def demo(db: AsyncSession = Depends(get_db)):
     return {"slides": slides, "transcript": transcript, "alignment": alignment, "enhanced": enhanced}
 
 
-@app.get("/pdf/{filename}")
+@app.get("/pdf/{filename}", dependencies=[Depends(_require_api_key)])
 def serve_pdf(filename: str):
     path = _resolve_generated_download_path(filename)
     if not path:
@@ -1101,7 +1125,7 @@ def serve_pdf(filename: str):
     return FileResponse(path, media_type="application/pdf")
 
 
-@app.get("/download/{filename}")
+@app.get("/download/{filename}", dependencies=[Depends(_require_api_key)])
 def download(filename: str):
     path = _resolve_generated_download_path(filename)
     if not path:
@@ -1113,7 +1137,7 @@ def download(filename: str):
     )
 
 
-@app.post("/process/jobs", status_code=status.HTTP_202_ACCEPTED)
+@app.post("/process/jobs", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(_require_api_key)])
 async def start_process_job(
     pdf: UploadFile = File(...),
     audio: UploadFile = File(...),
@@ -1187,7 +1211,7 @@ async def start_process_job(
     return _upload_job_public_state(snapshot)
 
 
-@app.get("/process/jobs/{job_id}")
+@app.get("/process/jobs/{job_id}", dependencies=[Depends(_require_api_key)])
 async def get_process_job(job_id: str):
     await _cleanup_expired_upload_jobs()
     snapshot = await _get_upload_job_snapshot(job_id)
@@ -1201,6 +1225,7 @@ async def stream_process_job(
     job_id: str,
     request: Request,
     last_event_id: int | None = None,
+    _auth: None = Depends(_require_api_key_or_token),
 ):
     await _cleanup_expired_upload_jobs()
     snapshot = await _get_upload_job_snapshot(job_id)
@@ -1267,7 +1292,7 @@ async def stream_process_job(
     )
 
 
-@app.post("/process")
+@app.post("/process", dependencies=[Depends(_require_api_key)])
 async def process(
     pdf: UploadFile = File(...),
     audio: UploadFile = File(...),
@@ -1318,7 +1343,7 @@ async def process(
     }
 
 
-@app.get("/lectures")
+@app.get("/lectures", dependencies=[Depends(_require_api_key)])
 async def list_lectures(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Lecture).order_by(Lecture.created_at.desc()))
     lectures = result.scalars().all()
@@ -1336,7 +1361,7 @@ async def list_lectures(db: AsyncSession = Depends(get_db)):
     ]
 
 
-@app.get("/lectures/{lecture_id}")
+@app.get("/lectures/{lecture_id}", dependencies=[Depends(_require_api_key)])
 async def get_lecture(lecture_id: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Lecture).where(Lecture.id == lecture_id))
     lecture = result.scalar_one_or_none()
@@ -1353,7 +1378,7 @@ async def get_lecture(lecture_id: int, db: AsyncSession = Depends(get_db)):
     }
 
 
-@app.post("/lectures/{lecture_id}/archive")
+@app.post("/lectures/{lecture_id}/archive", dependencies=[Depends(_require_api_key)])
 async def archive_lecture(lecture_id: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Lecture).where(Lecture.id == lecture_id))
     lecture = result.scalar_one_or_none()
@@ -1362,7 +1387,7 @@ async def archive_lecture(lecture_id: int, db: AsyncSession = Depends(get_db)):
     return await _apply_archive_state(db, lecture, archive=True)
 
 
-@app.post("/lectures/{lecture_id}/unarchive")
+@app.post("/lectures/{lecture_id}/unarchive", dependencies=[Depends(_require_api_key)])
 async def unarchive_lecture(lecture_id: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Lecture).where(Lecture.id == lecture_id))
     lecture = result.scalar_one_or_none()
@@ -1371,7 +1396,7 @@ async def unarchive_lecture(lecture_id: int, db: AsyncSession = Depends(get_db))
     return await _apply_archive_state(db, lecture, archive=False)
 
 
-@app.post("/lectures/{lecture_id}/regenerate-notes/jobs", status_code=status.HTTP_202_ACCEPTED)
+@app.post("/lectures/{lecture_id}/regenerate-notes/jobs", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(_require_api_key)])
 async def start_regenerate_notes_job(lecture_id: int, db: AsyncSession = Depends(get_db)):
     await _cleanup_expired_jobs()
 
@@ -1391,7 +1416,7 @@ async def start_regenerate_notes_job(lecture_id: int, db: AsyncSession = Depends
     return _job_public_state(job)
 
 
-@app.get("/lectures/regenerate-notes/jobs/{job_id}")
+@app.get("/lectures/regenerate-notes/jobs/{job_id}", dependencies=[Depends(_require_api_key)])
 async def get_regenerate_notes_job(job_id: str):
     await _cleanup_expired_jobs()
     job = await _get_job_snapshot(job_id)
@@ -1401,7 +1426,11 @@ async def get_regenerate_notes_job(job_id: str):
 
 
 @app.get("/lectures/regenerate-notes/jobs/{job_id}/events")
-async def stream_regenerate_notes_job(job_id: str, request: Request):
+async def stream_regenerate_notes_job(
+    job_id: str,
+    request: Request,
+    _auth: None = Depends(_require_api_key_or_token),
+):
     await _cleanup_expired_jobs()
     job = await _get_job_snapshot(job_id)
     if not job:
@@ -1460,7 +1489,7 @@ async def stream_regenerate_notes_job(job_id: str, request: Request):
     )
 
 
-@app.post("/lectures/{lecture_id}/regenerate-notes")
+@app.post("/lectures/{lecture_id}/regenerate-notes", dependencies=[Depends(_require_api_key)])
 async def regenerate_notes(lecture_id: int, db: AsyncSession = Depends(get_db)):
     lecture_result = await db.execute(select(Lecture).where(Lecture.id == lecture_id))
     lecture = lecture_result.scalar_one_or_none()
