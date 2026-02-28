@@ -77,3 +77,13 @@ class EnrichedSlide(Base):
     key_takeaways      = Column(JSON, nullable=False)
 
     lecture = relationship("Lecture", back_populates="enriched_slides")
+
+
+class LectureSave(Base):
+    __tablename__ = "lecture_saves"
+    __table_args__ = (UniqueConstraint("user_id", "lecture_id"),)
+
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    user_id    = Column(String(255), nullable=False, index=True)
+    lecture_id = Column(Integer, ForeignKey("lectures.id", ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
