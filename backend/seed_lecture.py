@@ -1,6 +1,6 @@
 """
 Run from the backend/ directory:
-  python seed_lecture.py "DB-2026-VT-F3"
+  python seed_lecture.py "DB-lecture-12-2026"
 """
 import asyncio
 import json
@@ -13,7 +13,16 @@ from db import get_db, init_db
 from models import Alignment, EnrichedSlide, Lecture, Slide, TranscriptSegment
 from scripts.enrich import normalize_enriched_payload
 
-OUT = Path(__file__).parent.parent / "out"
+BACKEND_DIR = Path(__file__).parent
+OUT = BACKEND_DIR.parent / "out"
+GENERATED_DIR = BACKEND_DIR / "generated"
+
+
+def resolve_seed_pptx_path(name: str) -> str | None:
+    pptx_path = GENERATED_DIR / f"{name}.pptx"
+    if not pptx_path.exists():
+        return None
+    return str(pptx_path.relative_to(BACKEND_DIR))
 
 async def seed(name: str):
     await init_db()
@@ -27,10 +36,10 @@ async def seed(name: str):
     with open(OUT / "enhanced.json", encoding="utf-8") as f:
         enhanced = json.load(f)
 
-    pptx = OUT / "enhanced_presentation.pptx"
+    pptx_path = resolve_seed_pptx_path(name)
 
     async for db in get_db():
-        lecture = Lecture(name=name, is_demo=False, pptx_path=str(pptx) if pptx.exists() else None)
+        lecture = Lecture(name=name, is_demo=False, pptx_path=pptx_path)
         db.add(lecture)
         await db.flush()
 
@@ -61,5 +70,5 @@ async def seed(name: str):
         break
 
 if __name__ == "__main__":
-    name = sys.argv[1] if len(sys.argv) > 1 else "DB-2026-VT-F3"
+    name = sys.argv[1] if len(sys.argv) > 1 else "DB-lecture-12-2026"
     asyncio.run(seed(name))

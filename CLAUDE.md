@@ -23,7 +23,7 @@ npm run build                 # tsc -b && vite build → dist/
 npm run lint                  # ESLint check
 ```
 
-No automated test suite. Manual testing via `GET /demo` using sample data in `out/`.
+No automated test suite. Manual testing includes `GET /demo` against stored lecture `DB-lecture-12-2026`.
 
 ## Architecture
 
@@ -78,4 +78,4 @@ Model choice by stage:
 - Enrichment: Anthropic by default (`claude-haiku-4-5`), or Groq via `ENRICH_PROVIDER=groq` + `ENRICH_MODEL`
 
 ## Sample Data (`out/`)
-Swedish SQL/DB lecture artifacts: `slides.json`, `transcript.json`, `aligned.json`, `enhanced.json`, `enhanced_presentation.pptx`.
+Swedish SQL/DB lecture artifacts: `slides.json`, `transcript.json`, `aligned.json`, `enhanced.json`.

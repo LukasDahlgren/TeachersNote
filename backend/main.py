@@ -22,9 +22,17 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db import AsyncSessionLocal, get_db, init_db
+from media_download import (
+    RecordingSourceKind,
+    RemoteMediaDownloadError,
+    download_remote_media_to_path,
+    media_extension_from_url,
+    redact_url_for_logs,
+    resolve_recording_source,
+    validate_remote_media_url,
+)
 from models import Alignment, EnrichedSlide, Lecture, LectureSave, Slide, TranscriptSegment
 from pipeline import (
-    align,
     enrich_slide_notes,
     generate_presentation_from_enhanced,
     run_pipeline,
@@ -52,11 +60,12 @@ app.add_middleware(
 )
 
 BACKEND_DIR = Path(__file__).parent
-OUT_DIR = BACKEND_DIR.parent / "out"
 UPLOADS_DIR = BACKEND_DIR / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
 GENERATED_DIR = BACKEND_DIR / "generated"
 GENERATED_DIR.mkdir(exist_ok=True)
+SOURCE_PDFS_DIR = BACKEND_DIR / "source_pdfs"
+SOURCE_PDFS_DIR.mkdir(exist_ok=True)
 ARCHIVED_GENERATED_DIR = GENERATED_DIR / "archived"
 ARCHIVED_GENERATED_DIR.mkdir(exist_ok=True)
 
@@ -77,6 +86,7 @@ ACTIVE_UPLOAD_JOB_ID: str | None = None
 UPLOAD_JOB_LOCK = asyncio.Lock()
 DEFAULT_USER_ID = "local-dev-user"
 USER_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+DEMO_LECTURE_NAME = "DB-lecture-12-2026"
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
@@ -193,7 +203,7 @@ def _build_unique_generated_paths(stem: str) -> tuple[Path, Path, str]:
 
     while True:
         pptx_path = GENERATED_DIR / f"{candidate_stem}.pptx"
-        pdf_path = GENERATED_DIR / f"{candidate_stem}.pdf"
+        pdf_path = SOURCE_PDFS_DIR / f"{candidate_stem}.pdf"
         if not pptx_path.exists() and not pdf_path.exists():
             return pptx_path, pdf_path, candidate_stem
 
@@ -237,6 +247,29 @@ def _resolve_upload_naming(courseid: str, kind: str, lecture: str, year: str) ->
     return final_stem, pptx_path, saved_pdf_path
 
 
+def _resolve_recording_source_or_400(
+    *,
+    audio: UploadFile | None,
+    audio_url: str | None,
+) -> tuple[RecordingSourceKind, str | None]:
+    try:
+        return resolve_recording_source(audio_present=audio is not None, audio_url=audio_url)
+    except RemoteMediaDownloadError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _validate_audio_url_or_400(audio_url: str) -> str:
+    try:
+        return validate_remote_media_url(audio_url)
+    except RemoteMediaDownloadError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _audio_suffix_from_url(audio_url: str) -> str:
+    suffix = media_extension_from_url(audio_url)
+    return suffix if suffix else ".wav"
+
+
 def _path_is_within(path: Path, base_dir: Path) -> bool:
     try:
         path.relative_to(base_dir)
@@ -268,6 +301,13 @@ def _resolve_generated_download_path(filename: str) -> Path | None:
     if archived.exists() and archived.is_file():
         return archived
     return None
+
+
+def _resolve_pdf_download_path(filename: str) -> Path | None:
+    source_pdf = SOURCE_PDFS_DIR / filename
+    if source_pdf.exists() and source_pdf.is_file():
+        return source_pdf
+    return _resolve_generated_download_path(filename)
 
 
 def _build_collision_safe_destination(target_dir: Path, filename: str, lecture_id: int) -> Path:
@@ -317,6 +357,14 @@ def _lecture_file_urls(lecture: Lecture) -> dict[str, str | None]:
         "download_url": f"/download/{Path(lecture.pptx_path).name}" if lecture.pptx_path else None,
         "pdf_url": f"/pdf/{Path(lecture.pdf_path).name}" if lecture.pdf_path else None,
     }
+
+
+def _lecture_has_visible_pptx(lecture: Lecture) -> bool:
+    # Hide stale lectures that still have a DB row but no backing PPTX asset.
+    if not lecture.pptx_path:
+        return bool(lecture.is_demo)
+    pptx_path = _resolve_lecture_asset_path(lecture.pptx_path)
+    return pptx_path.exists() and pptx_path.is_file()
 
 
 def _lecture_summary_payload(lecture: Lecture, *, is_saved: bool) -> dict[str, Any]:
@@ -958,6 +1006,8 @@ async def _run_process_job(
     *,
     pdf_path: Path,
     audio_path: Path,
+    recording_source: RecordingSourceKind = "file",
+    audio_url: str | None = None,
     lecture_name: str,
     pptx_path: Path,
     saved_pdf_path: Path,
@@ -996,15 +1046,40 @@ async def _run_process_job(
         ).result()
 
     try:
-        await _update_upload_job(
-            job_id,
-            status=JOB_STATUS_RUNNING,
-            current_stage="upload",
-            progress_pct=10,
-            error=None,
-            event_name="progress",
-            message="Files uploaded. Starting processing pipeline...",
-        )
+        if recording_source == "url":
+            if not audio_url:
+                raise RuntimeError("Missing audio_url for URL recording source.")
+
+            redacted_url = redact_url_for_logs(audio_url)
+            await _update_upload_job(
+                job_id,
+                status=JOB_STATUS_RUNNING,
+                current_stage="upload",
+                progress_pct=10,
+                error=None,
+                event_name="progress",
+                message=f"Slides uploaded. Downloading recording from URL ({redacted_url})...",
+            )
+            await run_in_threadpool(download_remote_media_to_path, audio_url, audio_path)
+            await _update_upload_job(
+                job_id,
+                status=JOB_STATUS_RUNNING,
+                current_stage="upload",
+                progress_pct=18,
+                error=None,
+                event_name="log",
+                message="Recording URL downloaded. Starting processing pipeline...",
+            )
+        else:
+            await _update_upload_job(
+                job_id,
+                status=JOB_STATUS_RUNNING,
+                current_stage="upload",
+                progress_pct=10,
+                error=None,
+                event_name="progress",
+                message="Files uploaded. Starting processing pipeline...",
+            )
 
         result = await run_in_threadpool(
             run_pipeline,
@@ -1177,55 +1252,24 @@ def health():
 
 @app.get("/demo", dependencies=[Depends(_require_api_key)])
 async def demo(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Lecture).where(Lecture.is_demo == True).limit(1))
-    existing = result.scalar_one_or_none()
-
-    if existing:
-        return await lecture_to_response(db, existing.id)
-
-    slides_path = OUT_DIR / "slides.json"
-    transcript_path = OUT_DIR / "transcript.json"
-    aligned_path = OUT_DIR / "aligned.json"
-    enhanced_path = OUT_DIR / "enhanced.json"
-
-    if not slides_path.exists() or not transcript_path.exists():
-        raise HTTPException(status_code=404, detail="Sample data not found in out/")
-
-    with open(slides_path, encoding="utf-8") as f:
-        slides = json.load(f)
-    with open(transcript_path, encoding="utf-8") as f:
-        transcript = json.load(f)
-
-    if aligned_path.exists():
-        with open(aligned_path, encoding="utf-8") as f:
-            alignment = json.load(f)
-    else:
-        alignment = await run_in_threadpool(align, slides, transcript)
-        with open(aligned_path, "w", encoding="utf-8") as f:
-            json.dump(alignment, f, ensure_ascii=False, indent=2)
-
-    enhanced = []
-    if enhanced_path.exists():
-        with open(enhanced_path, encoding="utf-8") as f:
-            enhanced = json.load(f)
-
-    await save_lecture_to_db(
-        db=db,
-        name="demo",
-        slides=slides,
-        transcript=transcript,
-        alignment=alignment,
-        enhanced=enhanced,
-        pptx_path=None,
-        is_demo=True,
+    result = await db.execute(
+        select(Lecture)
+        .where(Lecture.name == DEMO_LECTURE_NAME)
+        .order_by(Lecture.created_at.desc())
     )
+    for lecture in result.scalars().all():
+        if _lecture_has_visible_pptx(lecture):
+            return await lecture_to_response(db, lecture.id)
 
-    return {"slides": slides, "transcript": transcript, "alignment": alignment, "enhanced": enhanced}
+    raise HTTPException(
+        status_code=404,
+        detail=f"Demo lecture '{DEMO_LECTURE_NAME}' not found with a visible PPTX asset.",
+    )
 
 
 @app.get("/pdf/{filename}", dependencies=[Depends(_require_api_key_or_token)])
 def serve_pdf(filename: str):
-    path = _resolve_generated_download_path(filename)
+    path = _resolve_pdf_download_path(filename)
     if not path:
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(path, media_type="application/pdf")
@@ -1246,7 +1290,8 @@ def download(filename: str):
 @app.post("/process/jobs", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(_require_api_key)])
 async def start_process_job(
     pdf: UploadFile = File(...),
-    audio: UploadFile = File(...),
+    audio: UploadFile | None = File(None),
+    audio_url: str | None = Form(None),
     courseid: str = Form(...),
     kind: str = Form("lecture"),
     lecture: str = Form(...),
@@ -1265,20 +1310,34 @@ async def start_process_job(
         )
 
     lecture_name, pptx_path, saved_pdf_path = _resolve_upload_naming(courseid, kind, lecture, year)
+    recording_source, resolved_audio_url = _resolve_recording_source_or_400(audio=audio, audio_url=audio_url)
+    validated_audio_url: str | None = None
+    if recording_source == "url":
+        if not resolved_audio_url:
+            raise HTTPException(status_code=400, detail="Missing audio_url for URL recording source.")
+        validated_audio_url = _validate_audio_url_or_400(resolved_audio_url)
 
     job = await _create_upload_job()
     job_id = str(job["job_id"])
     tmp_dir = UPLOADS_DIR / f"process-{job_id}"
     pdf_path = tmp_dir / "slides.pdf"
-    audio_suffix = Path(audio.filename).suffix if audio.filename else ".wav"
+    if recording_source == "file":
+        if audio is None:
+            raise HTTPException(status_code=400, detail="Missing audio file for file recording source.")
+        audio_suffix = Path(audio.filename).suffix if audio.filename else ".wav"
+    else:
+        audio_suffix = _audio_suffix_from_url(validated_audio_url or "")
     audio_path = tmp_dir / f"audio{audio_suffix}"
 
     try:
         tmp_dir.mkdir(parents=True, exist_ok=False)
         with open(pdf_path, "wb") as f:
             shutil.copyfileobj(pdf.file, f)
-        with open(audio_path, "wb") as f:
-            shutil.copyfileobj(audio.file, f)
+        if recording_source == "file":
+            if audio is None:
+                raise RuntimeError("Missing audio file during staging.")
+            with open(audio_path, "wb") as f:
+                shutil.copyfileobj(audio.file, f)
     except Exception as exc:
         await _update_upload_job(
             job_id,
@@ -1298,7 +1357,11 @@ async def start_process_job(
         progress_pct=0,
         error=None,
         event_name="progress",
-        message="Upload received and queued for processing.",
+        message=(
+            "Upload received and queued for processing."
+            if recording_source == "file"
+            else "Upload received and queued for processing. Recording will be downloaded from URL."
+        ),
     )
 
     asyncio.create_task(
@@ -1306,6 +1369,8 @@ async def start_process_job(
             job_id,
             pdf_path=pdf_path,
             audio_path=audio_path,
+            recording_source=recording_source,
+            audio_url=validated_audio_url,
             lecture_name=lecture_name,
             pptx_path=pptx_path,
             saved_pdf_path=saved_pdf_path,
@@ -1403,7 +1468,8 @@ async def stream_process_job(
 @app.post("/process", dependencies=[Depends(_require_api_key)])
 async def process(
     pdf: UploadFile = File(...),
-    audio: UploadFile = File(...),
+    audio: UploadFile | None = File(None),
+    audio_url: str | None = Form(None),
     courseid: str = Form(...),
     kind: str = Form("lecture"),
     lecture: str = Form(...),
@@ -1412,16 +1478,39 @@ async def process(
     user_id: str = Depends(get_current_user_id),
 ):
     lecture_name, pptx_path, saved_pdf_path = _resolve_upload_naming(courseid, kind, lecture, year)
+    recording_source, resolved_audio_url = _resolve_recording_source_or_400(audio=audio, audio_url=audio_url)
+    validated_audio_url: str | None = None
+    if recording_source == "url":
+        if not resolved_audio_url:
+            raise HTTPException(status_code=400, detail="Missing audio_url for URL recording source.")
+        validated_audio_url = _validate_audio_url_or_400(resolved_audio_url)
 
     with tempfile.TemporaryDirectory(dir=UPLOADS_DIR) as tmp:
         pdf_path = Path(tmp) / "slides.pdf"
-        audio_suffix = Path(audio.filename).suffix if audio.filename else ".wav"
+        if recording_source == "file":
+            if audio is None:
+                raise HTTPException(status_code=400, detail="Missing audio file for file recording source.")
+            audio_suffix = Path(audio.filename).suffix if audio.filename else ".wav"
+        else:
+            audio_suffix = _audio_suffix_from_url(validated_audio_url or "")
         audio_path = Path(tmp) / f"audio{audio_suffix}"
 
-        with open(pdf_path, "wb") as f:
-            shutil.copyfileobj(pdf.file, f)
-        with open(audio_path, "wb") as f:
-            shutil.copyfileobj(audio.file, f)
+        try:
+            with open(pdf_path, "wb") as f:
+                shutil.copyfileobj(pdf.file, f)
+            if recording_source == "file":
+                if audio is None:
+                    raise RuntimeError("Missing audio file during staging.")
+                with open(audio_path, "wb") as f:
+                    shutil.copyfileobj(audio.file, f)
+            else:
+                if not validated_audio_url:
+                    raise RuntimeError("Missing audio_url during staging.")
+                await run_in_threadpool(download_remote_media_to_path, validated_audio_url, audio_path)
+        except RemoteMediaDownloadError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to stage upload files: {exc}") from exc
 
         try:
             result = await run_in_threadpool(
@@ -1460,7 +1549,7 @@ async def list_lectures(
     user_id: str = Depends(get_current_user_id),
 ):
     result = await db.execute(select(Lecture).order_by(Lecture.created_at.desc()))
-    lectures = result.scalars().all()
+    lectures = [lecture for lecture in result.scalars().all() if _lecture_has_visible_pptx(lecture)]
     saved_ids = await _saved_lecture_ids_for_user(db, user_id, [int(lecture.id) for lecture in lectures])
     return [_lecture_summary_payload(lecture, is_saved=lecture.id in saved_ids) for lecture in lectures]
 
@@ -1476,7 +1565,7 @@ async def list_my_lectures(
         .where(LectureSave.user_id == user_id)
         .order_by(LectureSave.created_at.desc(), Lecture.created_at.desc())
     )
-    lectures = result.scalars().all()
+    lectures = [lecture for lecture in result.scalars().all() if _lecture_has_visible_pptx(lecture)]
     return [_lecture_summary_payload(lecture, is_saved=True) for lecture in lectures]
 
 
@@ -1487,6 +1576,8 @@ async def get_lecture(
     user_id: str = Depends(get_current_user_id),
 ):
     lecture = await get_lecture_or_404(db, lecture_id)
+    if not _lecture_has_visible_pptx(lecture):
+        raise HTTPException(status_code=404, detail="Lecture file not found")
 
     data = await lecture_to_response(db, lecture_id)
     return {

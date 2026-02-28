@@ -92,7 +92,7 @@ export default function Sidebar({
         </button>
         {demoMode && (
           <button className="sidebar-demo-run" onClick={onRunDemo}>
-            Run F2VT26 Demo
+            Run DB-lecture-12-2026 Demo
           </button>
         )}
       </div>

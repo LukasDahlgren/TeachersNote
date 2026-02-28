@@ -53,6 +53,12 @@ ENRICH_LOG_USAGE=true
 # ENRICH_MODEL=claude-haiku-4-5
 # ENRICH_PROVIDER=groq
 # ENRICH_MODEL=openai/gpt-oss-20b
+# Remote recording URL download limits
+REMOTE_MEDIA_MAX_BYTES=524288000
+REMOTE_MEDIA_CONNECT_TIMEOUT_SEC=10
+REMOTE_MEDIA_READ_TIMEOUT_SEC=120
+REMOTE_MEDIA_TOTAL_TIMEOUT_SEC=600
+REMOTE_MEDIA_ALLOWED_EXTENSIONS=.mp4,.mov,.webm,.wav,.m4a,.mp3
 ```
 
 ### Backend
@@ -95,7 +101,9 @@ Health check.
 
 ### `GET /demo`
 
-Returns processed data for the built-in Swedish SQL/DB lecture sample (`out/`). On first call, the data is persisted as a demo lecture in MySQL; subsequent calls return the stored record.
+Returns processed data for the stored demo lecture named `DB-lecture-12-2026`.
+The endpoint returns the newest lecture with that exact name and a visible PPTX asset.
+If no matching lecture exists, the endpoint returns `404`.
 
 ### `POST /process`
 
@@ -106,7 +114,8 @@ Run the full processing pipeline for an uploaded PDF and recording. The request 
 | Field | Type | Description |
 |---|---|---|
 | `pdf` | file | Slide deck as PDF |
-| `audio` | file | Audio/video recording (`.mp4`, `.mov`, `.webm`, `.wav`, `.m4a`, `.mp3`, etc.) |
+| `audio` | file | Audio/video recording (`.mp4`, `.mov`, `.webm`, `.wav`, `.m4a`, `.mp3`, etc.). Required when `audio_url` is not provided. |
+| `audio_url` | string | Direct HTTPS media URL to recording (`.mp4`, `.mov`, `.webm`, `.wav`, `.m4a`, `.mp3`). Required when `audio` is not provided. |
 | `courseid` | string | Required. Normalized to uppercase (`A-Z0-9-`) |
 | `kind` | string | Optional. Free text normalized to lowercase slug (`a-z0-9-`); defaults to `lecture` when omitted or blank |
 | `lecture` | string | Required. Normalized to alphanumeric plus dashes (casing preserved) |
@@ -117,14 +126,16 @@ Lecture names and generated assets follow:
 `<COURSEID>-<kind>-<lecture>-<year>`
 
 Examples:
-- default kind: `F2VT26-lecture-3-2026`
-- custom kind: `F2VT26-presentation-3-2026`
+- default kind: `DB-lecture-12-2026`
+- custom kind: `DB-presentation-12-2026`
 
-If a generated filename already exists in `backend/generated/`, suffixes `-2`, `-3`, ... are appended.
+If a generated filename already exists (PPTX in `backend/generated/` or source PDF in `backend/source_pdfs/`), suffixes `-2`, `-3`, ... are appended.
 
 Validation behavior:
 - `422` when required multipart fields are missing.
-- `400` when normalized `courseid`/`lecture` becomes empty, when non-blank `kind` normalizes to empty, or when `year` is not exactly 4 digits.
+- `400` when normalized `courseid`/`lecture` becomes empty, when non-blank `kind` normalizes to empty, when `year` is not exactly 4 digits, or when recording source validation fails.
+- Recording source must be exactly one of `audio` or `audio_url` (xor rule).
+- `audio_url` accepts direct media URLs only (not player pages). Query tokens are supported.
 
 **Pipeline steps**
 1. Parse slide text from PDF pages
@@ -134,7 +145,7 @@ Validation behavior:
 5. Enrich each slide via configurable provider/model (`ENRICH_PROVIDER` / `ENRICH_MODEL`) with bounded parallel workers and retries (strict JSON validation, truncation-aware retry for token-capped JSON responses, deterministic fallback if responses remain invalid)
 6. Generate enhanced PPTX with speaker notes
 7. Persist all data to MySQL
-8. Copy original PDF into `backend/generated/`
+8. Copy original PDF into `backend/source_pdfs/`
 
 **Response** — `200 OK`
 ```json
@@ -152,8 +163,8 @@ Validation behavior:
       "key_takeaways": ["...", "..."]
     }
   ],
-  "download_url": "/download/F2VT26-lecture-3-2026.pptx",
-  "pdf_url": "/pdf/F2VT26-lecture-3-2026.pdf"
+  "download_url": "/download/DB-lecture-12-2026.pptx",
+  "pdf_url": "/pdf/DB-lecture-12-2026.pdf"
 }
 ```
 
@@ -161,9 +172,9 @@ Validation behavior:
 
 ### `POST /process/jobs`
 
-Start an asynchronous upload processing job (PDF + audio/video). Returns immediately and processes in background.
+Start an asynchronous upload processing job (PDF + recording input). Returns immediately and processes in background.
 
-**Request** — `multipart/form-data` (same fields as `POST /process`: `pdf`, `audio`, `courseid`, optional `kind`, `lecture`, `year`)
+**Request** — `multipart/form-data` (same fields as `POST /process`: `pdf`, `audio` xor `audio_url`, `courseid`, optional `kind`, `lecture`, `year`)
 
 **Response** — `202 Accepted`
 ```json
@@ -200,20 +211,20 @@ Download a generated PPTX file.
 
 ### `GET /pdf/{filename}`
 
-Serve an uploaded source PDF copied into `backend/generated/`.
+Serve an uploaded source PDF copied into `backend/source_pdfs/` (with legacy fallback for older files in `backend/generated/`).
 
 ### `GET /lectures`
 
-List all stored lectures, newest first.
+List all stored lectures, newest first. Lectures with missing PPTX assets are excluded.
 
 **Response** — `200 OK`
 ```json
 [
   {
     "id": 42,
-    "name": "F2VT26-lecture-3-2026",
+    "name": "DB-lecture-12-2026",
     "is_demo": false,
-    "pptx_path": "generated/F2VT26-lecture-3-2026.pptx",
+    "pptx_path": "generated/DB-lecture-12-2026.pptx",
     "created_at": "2024-01-15T10:30:00"
   }
 ]
@@ -223,7 +234,7 @@ List all stored lectures, newest first.
 
 Retrieve full processed data for a stored lecture.
 
-**Error** — `404` if lecture is not found.
+**Error** — `404` if lecture is not found or its PPTX asset is missing.
 
 ### `POST /lectures/{lecture_id}/regenerate-notes`
 
@@ -299,7 +310,8 @@ backend/
 ├── pipeline.py          # Pipeline orchestration
 ├── db.py                # Async SQLAlchemy engine + session factory
 ├── models.py            # ORM models
-├── generated/           # Output PPTX/PDF files
+├── generated/           # Output PPTX files
+├── source_pdfs/         # Stored source PDFs for slide rendering/regeneration
 └── uploads/             # Temporary upload staging
 
 scripts/
@@ -330,7 +342,8 @@ frontend/src/
 - `transcript.json`
 - `aligned.json`
 - `enhanced.json`
-- `enhanced_presentation.pptx`
+
+Demo mode uses a stored lecture named `DB-lecture-12-2026`, backed by `backend/generated/DB-lecture-12-2026.pptx`.
 
 ---
 

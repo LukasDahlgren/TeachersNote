@@ -857,6 +857,41 @@ body { margin: 0; }
   color: #6b7280;
 }
 
+.recording-source {
+  margin-bottom: 1rem;
+}
+
+.recording-source-options {
+  display: flex;
+  gap: 0.75rem;
+}
+
+.recording-source-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.45rem 0.65rem;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  font-size: 0.85rem;
+  color: #374151;
+  background: #fff;
+}
+
+.recording-source-option input {
+  margin: 0;
+}
+
+.recording-url-input {
+  width: 100%;
+}
+
+.recording-url-hint {
+  margin-top: 0.4rem;
+  font-size: 0.75rem;
+  color: #6b7280;
+}
+
 .drop-zone-wrapper { margin-bottom: 1rem; }
 
 .drop-zone-label {

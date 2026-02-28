@@ -30,6 +30,10 @@ export interface UploadLectureNamingInput {
   year: string;
 }
 
+export type UploadRecordingInput =
+  | { type: "file"; file: File }
+  | { type: "url"; url: string };
+
 export interface ProcessResult {
   lecture_id?: number;
   slides: Slide[];

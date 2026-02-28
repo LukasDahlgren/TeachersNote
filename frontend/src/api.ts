@@ -9,6 +9,7 @@ import {
   type RegenerateNotesJobStatus,
   type RegenerateNotesResponse,
   type UploadLectureNamingInput,
+  type UploadRecordingInput,
   type UploadProcessJobEvent,
   type UploadProcessJobStartResponse,
   type UploadProcessJobStatus,
@@ -104,12 +105,16 @@ function parseEventPayload<T>(evt: Event): T | null {
 
 export async function processFiles(
   pdf: File,
-  audio: File,
+  recording: UploadRecordingInput,
   naming: UploadLectureNamingInput,
 ): Promise<ProcessResult> {
   const form = new FormData();
   form.append("pdf", pdf);
-  form.append("audio", audio);
+  if (recording.type === "file") {
+    form.append("audio", recording.file);
+  } else {
+    form.append("audio_url", recording.url);
+  }
   form.append("courseid", naming.courseid);
   form.append("kind", naming.kind);
   form.append("lecture", naming.lecture);
@@ -182,15 +187,15 @@ export interface DemoLectureSelection {
   validNotesCount: number;
 }
 
-export async function findBestLectureWithNotesByName(
-  nameQuery: string,
+export async function findBestLectureWithNotesByExactName(
+  lectureName: string,
 ): Promise<DemoLectureSelection | null> {
-  const normalizedQuery = nameQuery.trim().toLowerCase();
-  if (!normalizedQuery) return null;
+  const normalizedName = lectureName.trim().toLowerCase();
+  if (!normalizedName) return null;
 
   const lectures = await getLectures();
   const candidates = lectures
-    .filter((lecture) => lecture.name.toLowerCase().includes(normalizedQuery))
+    .filter((lecture) => lecture.name.trim().toLowerCase() === normalizedName)
     .sort((a, b) => {
       const timeA = Date.parse(a.created_at) || 0;
       const timeB = Date.parse(b.created_at) || 0;
@@ -290,12 +295,16 @@ export function subscribeRegenerateNotesEvents(
 
 export async function startProcessJob(
   pdf: File,
-  audio: File,
+  recording: UploadRecordingInput,
   naming: UploadLectureNamingInput,
 ): Promise<UploadProcessJobStartResponse> {
   const form = new FormData();
   form.append("pdf", pdf);
-  form.append("audio", audio);
+  if (recording.type === "file") {
+    form.append("audio", recording.file);
+  } else {
+    form.append("audio_url", recording.url);
+  }
   form.append("courseid", naming.courseid);
   form.append("kind", naming.kind);
   form.append("lecture", naming.lecture);

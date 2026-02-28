@@ -1,8 +1,8 @@
 import { useRef, useState } from "react";
-import { type UploadLectureNamingInput } from "../types";
+import { type UploadLectureNamingInput, type UploadRecordingInput } from "../types";
 
 interface Props {
-  onSubmit: (pdf: File, audio: File, naming: UploadLectureNamingInput) => void;
+  onSubmit: (pdf: File, recording: UploadRecordingInput, naming: UploadLectureNamingInput) => void;
   loading: boolean;
   demoMode: boolean;
   onRunDemo: () => void;
@@ -124,6 +124,8 @@ function DropZone({
 export default function UploadForm({ onSubmit, loading, demoMode, onRunDemo, progressPct, progressLabel }: Props) {
   const [pdfFile, setPdfFile] = useState<File | null>(null);
   const [audioFile, setAudioFile] = useState<File | null>(null);
+  const [recordingSource, setRecordingSource] = useState<"file" | "url">("file");
+  const [audioUrl, setAudioUrl] = useState("");
   const [courseid, setCourseid] = useState("");
   const [kind, setKind] = useState("lecture");
   const [lecture, setLecture] = useState("");
@@ -167,9 +169,35 @@ export default function UploadForm({ onSubmit, loading, demoMode, onRunDemo, pro
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!pdfFile || !audioFile) {
-      setError("Please select both a PDF and an audio file.");
+    if (!pdfFile) {
+      setError("Please select a PDF file for slides.");
       return;
+    }
+
+    let recording: UploadRecordingInput | null = null;
+    if (recordingSource === "file") {
+      if (!audioFile) {
+        setError("Please select an audio or video file.");
+        return;
+      }
+      recording = { type: "file", file: audioFile };
+    } else {
+      const nextAudioUrl = audioUrl.trim();
+      if (!nextAudioUrl) {
+        setError("Please provide a recording URL.");
+        return;
+      }
+      try {
+        const parsed = new URL(nextAudioUrl);
+        if (parsed.protocol !== "https:") {
+          setError("Recording URL must use HTTPS.");
+          return;
+        }
+      } catch {
+        setError("Please provide a valid recording URL.");
+        return;
+      }
+      recording = { type: "url", url: nextAudioUrl };
     }
 
     const nextCourseid = courseid.trim();
@@ -186,7 +214,7 @@ export default function UploadForm({ onSubmit, loading, demoMode, onRunDemo, pro
     }
 
     setError("");
-    onSubmit(pdfFile, audioFile, {
+    onSubmit(pdfFile, recording, {
       courseid: nextCourseid,
       kind: nextKind,
       lecture: nextLecture,
@@ -198,7 +226,7 @@ export default function UploadForm({ onSubmit, loading, demoMode, onRunDemo, pro
     <form className="upload-form" onSubmit={handleSubmit}>
       <h1 className="form-title">Lecture Summary</h1>
       <p className="form-subtitle">
-        Upload lecture slides (PDF) and an audio or video recording to generate an aligned transcript.
+        Upload lecture slides (PDF) and add a recording file or direct URL to generate an aligned transcript.
       </p>
       {demoMode && (
         <div className="form-demo-hint">
@@ -310,22 +338,76 @@ export default function UploadForm({ onSubmit, loading, demoMode, onRunDemo, pro
         onClear={() => { setPdfFile(null); if (pdfInputRef.current) pdfInputRef.current.value = ""; }}
       />
 
-      <DropZone
-        label="Video / Audio"
-        accept=".mp4,.mov,.webm,.wav,.m4a,.mp3"
-        file={audioFile}
-        dragOver={audioDragOver}
-        loading={loading}
-        icon={<AudioIcon />}
-        dropTitle="Drop audio/video here or click to browse"
-        dropHint="Drag and drop your recording"
-        dropAccepts="Accepts: .mp4 .mov .webm .wav .m4a .mp3"
-        inputRef={audioInputRef}
-        onDrop={handleAudioDrop}
-        onDragOver={setAudioDragOver}
-        onFileChange={file => { setError(""); setAudioFile(file); }}
-        onClear={() => { setAudioFile(null); if (audioInputRef.current) audioInputRef.current.value = ""; }}
-      />
+      <div className="recording-source">
+        <div className="drop-zone-label">Recording Source</div>
+        <div className="recording-source-options">
+          <label className="recording-source-option">
+            <input
+              type="radio"
+              name="recording-source"
+              value="file"
+              checked={recordingSource === "file"}
+              disabled={loading}
+              onChange={() => {
+                setError("");
+                setRecordingSource("file");
+              }}
+            />
+            Upload File
+          </label>
+          <label className="recording-source-option">
+            <input
+              type="radio"
+              name="recording-source"
+              value="url"
+              checked={recordingSource === "url"}
+              disabled={loading}
+              onChange={() => {
+                setError("");
+                setRecordingSource("url");
+              }}
+            />
+            Paste URL
+          </label>
+        </div>
+      </div>
+
+      {recordingSource === "file" ? (
+        <DropZone
+          label="Video / Audio"
+          accept=".mp4,.mov,.webm,.wav,.m4a,.mp3"
+          file={audioFile}
+          dragOver={audioDragOver}
+          loading={loading}
+          icon={<AudioIcon />}
+          dropTitle="Drop audio/video here or click to browse"
+          dropHint="Drag and drop your recording"
+          dropAccepts="Accepts: .mp4 .mov .webm .wav .m4a .mp3"
+          inputRef={audioInputRef}
+          onDrop={handleAudioDrop}
+          onDragOver={setAudioDragOver}
+          onFileChange={file => { setError(""); setAudioFile(file); }}
+          onClear={() => { setAudioFile(null); if (audioInputRef.current) audioInputRef.current.value = ""; }}
+        />
+      ) : (
+        <div className="drop-zone-wrapper">
+          <label className="drop-zone-label" htmlFor="audio-url-input">Recording URL</label>
+          <input
+            id="audio-url-input"
+            className="naming-input recording-url-input"
+            type="url"
+            value={audioUrl}
+            disabled={loading}
+            autoComplete="off"
+            onChange={(e) => {
+              setAudioUrl(e.target.value);
+              setError("");
+            }}
+            placeholder="https://example.org/lecture.mp4?token=..."
+          />
+          <div className="recording-url-hint">Use a direct media file URL (.mp4, .mov, .webm, .wav, .m4a, .mp3).</div>
+        </div>
+      )}
 
       {error && <p className="form-error">{error}</p>}
 
@@ -333,7 +415,14 @@ export default function UploadForm({ onSubmit, loading, demoMode, onRunDemo, pro
         <button
           type="submit"
           className="submit-btn"
-          disabled={loading || !pdfFile || !audioFile || !courseid.trim() || !lecture.trim() || !year.trim()}
+          disabled={
+            loading
+            || !pdfFile
+            || (recordingSource === "file" ? !audioFile : !audioUrl.trim())
+            || !courseid.trim()
+            || !lecture.trim()
+            || !year.trim()
+          }
         >
           {loading ? <span className="spinner spinner--dark" /> : "Process Lecture"}
         </button>

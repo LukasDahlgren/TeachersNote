@@ -13,7 +13,7 @@ import {
   startRegenerateNotesJob,
   subscribeProcessJobEvents,
   subscribeRegenerateNotesEvents,
-  findBestLectureWithNotesByName,
+  findBestLectureWithNotesByExactName,
   unarchiveLecture,
 } from "./api";
 import UploadForm from "./components/UploadForm";
@@ -30,6 +30,7 @@ import {
   type LectureSummary,
   type RegenerateNotesJobStatus,
   type UploadLectureNamingInput,
+  type UploadRecordingInput,
   type UploadProcessJobEvent,
   type UploadProcessJobStatus,
 } from "./types";
@@ -41,7 +42,7 @@ const REGENERATE_NOTES_AVAILABLE = (() => {
 })();
 const ACTIVE_PROCESS_JOB_STORAGE_KEY = "lecture-summary.active-process-job-id";
 const DEMO_MODE_STORAGE_KEY = "lectureSummary.demoMode";
-const DEMO_LECTURE_QUERY = "F2VT26";
+const DEMO_LECTURE_NAME = "DB-lecture-12-2026";
 const DEMO_REGEN_STEP_MS = 650;
 const DEMO_UPLOAD_STAGES: Array<{ label: string; stage: string; delayMs: number }> = [
   { label: "Validating files...", stage: "parse_slides", delayMs: 450 },
@@ -399,7 +400,7 @@ export default function App() {
     resetRegenerationUi();
     resetProcessUi(true);
     setSelectedId(null);
-    setProcessingLectureName(`${DEMO_LECTURE_QUERY} - Demo (2026)`);
+    setProcessingLectureName(`${DEMO_LECTURE_NAME} - Demo (2026)`);
     setMainView({ view: "upload", loading: true });
 
     try {
@@ -453,13 +454,13 @@ export default function App() {
 
       if (demoRunRef.current !== runId) return;
 
-      const selectedDemo = await findBestLectureWithNotesByName(DEMO_LECTURE_QUERY);
+      const selectedDemo = await findBestLectureWithNotesByExactName(DEMO_LECTURE_NAME);
       if (!selectedDemo) {
         setDemoSourceData(null);
         setMainView({
           view: "upload",
           loading: false,
-          error: "No F2VT26 lecture with notes found. Open normal mode to process one.",
+          error: `No lecture named ${DEMO_LECTURE_NAME} with notes was found. Open normal mode to process one.`,
         });
         return;
       }
@@ -513,7 +514,7 @@ export default function App() {
     void fetchLectures();
   }, [fetchLectures, resetProcessUi, resetRegenerationUi]);
 
-  async function handleSubmit(pdf: File, audio: File, naming: UploadLectureNamingInput) {
+  async function handleSubmit(pdf: File, recording: UploadRecordingInput, naming: UploadLectureNamingInput) {
     if (demoMode) {
       await handleRunDemo();
       return;
@@ -527,7 +528,7 @@ export default function App() {
     setProcessingLectureName(`${naming.courseid} - ${naming.lecture} (${naming.year})`);
     setMainView({ view: "upload", loading: true });
     try {
-      const job = await startProcessJob(pdf, audio, naming);
+      const job = await startProcessJob(pdf, recording, naming);
       setSelectedId(null);
       setProcessJob(job);
       window.localStorage.setItem(ACTIVE_PROCESS_JOB_STORAGE_KEY, job.job_id);
@@ -1014,7 +1015,7 @@ export default function App() {
         )}
 
         {demoMode && (
-          <div className="banner info">Demo Mode On — uses existing F2VT26 lecture data without API-key processing.</div>
+          <div className="banner info">Demo Mode On — uses existing DB-lecture-12-2026 lecture data without API-key processing.</div>
         )}
 
         <Routes>
