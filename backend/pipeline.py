@@ -1,14 +1,18 @@
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
 
 import anthropic
 from groq import Groq
 
-client = anthropic.Anthropic()
+alignment_client = anthropic.Anthropic()
 
 ProgressEmitter = Callable[[str, str, int], None]
 
@@ -17,16 +21,54 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from scripts.parse_slides import parse_slides
 from scripts.align import build_prompt, parse_response
 from scripts.enrich import (
+    DEFAULT_ENRICH_LOG_USAGE,
+    DEFAULT_ENRICH_MAX_ATTEMPTS,
+    DEFAULT_ENRICH_MAX_OUTPUT_TOKENS,
+    DEFAULT_ENRICH_MAX_TRANSCRIPT_WORDS,
+    DEFAULT_ENRICH_MAX_WORKERS,
     build_fallback_enrichment,
+    create_enrichment_client,
+    default_enrichment_model,
     enrich_slide_with_retry,
     is_enriched_payload_invalid,
     normalize_enriched_payload,
+    resolve_enrichment_provider,
 )
 from scripts.generate_presentation import generate as generate_pptx
 
+ENRICH_PROVIDER = resolve_enrichment_provider(os.getenv("ENRICH_PROVIDER"))
+ENRICH_MODEL = os.getenv("ENRICH_MODEL", "").strip() or default_enrichment_model(ENRICH_PROVIDER)
+ENRICH_MAX_WORKERS = DEFAULT_ENRICH_MAX_WORKERS
+ENRICH_MAX_TRANSCRIPT_WORDS = DEFAULT_ENRICH_MAX_TRANSCRIPT_WORDS
+ENRICH_MAX_OUTPUT_TOKENS = DEFAULT_ENRICH_MAX_OUTPUT_TOKENS
+ENRICH_MAX_ATTEMPTS = DEFAULT_ENRICH_MAX_ATTEMPTS
+ENRICH_LOG_USAGE = DEFAULT_ENRICH_LOG_USAGE
+enrichment_client = create_enrichment_client(ENRICH_PROVIDER)
 
-def enrich_slide_notes(slide: dict, transcript_text: str, max_attempts: int = 5, log_callback=None) -> dict:
-    return enrich_slide_with_retry(client, slide, transcript_text, max_attempts=max_attempts, log_callback=log_callback)
+
+def enrich_slide_notes(
+    slide: dict,
+    transcript_text: str,
+    max_attempts: int = ENRICH_MAX_ATTEMPTS,
+    log_callback=None,
+    *,
+    return_metrics: bool = False,
+) -> dict | tuple[dict, dict]:
+    enriched, metrics = enrich_slide_with_retry(
+        enrichment_client,
+        slide,
+        transcript_text,
+        provider=ENRICH_PROVIDER,
+        model=ENRICH_MODEL,
+        max_output_tokens=ENRICH_MAX_OUTPUT_TOKENS,
+        max_transcript_words=ENRICH_MAX_TRANSCRIPT_WORDS,
+        max_attempts=max_attempts,
+        log_usage=ENRICH_LOG_USAGE,
+        log_callback=log_callback,
+    )
+    if return_metrics:
+        return enriched, metrics
+    return enriched
 
 
 def generate_presentation_from_enhanced(
@@ -95,7 +137,7 @@ def align(
     print("🔗 Aligning transcript to slides via Claude...", flush=True)
     _emit_progress(emit, "align", "Aligning transcript to slides...", 55)
     prompt = build_prompt(slides, transcript)
-    message = client.messages.create(
+    message = alignment_client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=4096,
         messages=[{"role": "user", "content": prompt}],
@@ -125,7 +167,30 @@ def enrich(
 ) -> list[dict]:
     total = len(alignment)
     done_count = 0
-    print(f"✨ Enriching {total} slides via Claude (sequential with retry)...", flush=True)
+    done_lock = threading.Lock()
+    metrics_lock = threading.Lock()
+    stage_started = time.perf_counter()
+    usage_totals = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "retries": 0,
+        "fallbacks": 0,
+        "duration_ms": 0,
+    }
+    failure_reason_counts = {
+        "truncated_json": 0,
+        "empty_payload": 0,
+        "connection_error": 0,
+        "other_error": 0,
+    }
+
+    print(
+        f"✨ Enriching {total} slides via {ENRICH_PROVIDER}:{ENRICH_MODEL} "
+        f"(workers={ENRICH_MAX_WORKERS}, retries={ENRICH_MAX_ATTEMPTS}, "
+        f"max_output_tokens={ENRICH_MAX_OUTPUT_TOKENS}, max_transcript_words={ENRICH_MAX_TRANSCRIPT_WORDS})...",
+        flush=True,
+    )
     _emit_progress(emit, "enrich", f"Enriching {total} slides...", 70)
     slides_by_num = {s["slide"]: s for s in slides}
 
@@ -138,20 +203,43 @@ def enrich(
         )
 
         def slide_log(msg: str) -> None:
-            pct = 70 + int((done_count / total) * 20) if total > 0 else 90
+            with done_lock:
+                local_done = done_count
+            pct = 70 + int((local_done / total) * 20) if total > 0 else 90
             _emit_progress(emit, "enrich", msg, pct)
 
-        enriched = enrich_slide_notes(slide, text, max_attempts=5, log_callback=slide_log)
-        done_count += 1
-        print(f"  ✅ Slide {a['slide']} done ({done_count}/{total})", flush=True)
+        enriched, metrics = enrich_slide_notes(
+            slide,
+            text,
+            max_attempts=ENRICH_MAX_ATTEMPTS,
+            log_callback=slide_log,
+            return_metrics=True,
+        )
+        with done_lock:
+            done_count += 1
+            local_done = done_count
+        with metrics_lock:
+            usage_totals["input_tokens"] += int(metrics.get("input_tokens", 0))
+            usage_totals["output_tokens"] += int(metrics.get("output_tokens", 0))
+            usage_totals["total_tokens"] += int(metrics.get("total_tokens", 0))
+            usage_totals["retries"] += int(metrics.get("retries", 0))
+            usage_totals["duration_ms"] += int(metrics.get("duration_ms", 0))
+            if metrics.get("fallback_used"):
+                usage_totals["fallbacks"] += 1
+                reason = str(metrics.get("failure_reason", "other_error"))
+                if reason not in failure_reason_counts:
+                    reason = "other_error"
+                failure_reason_counts[reason] += 1
+
+        print(f"  ✅ Slide {a['slide']} done ({local_done}/{total})", flush=True)
         if total > 0:
-            pct = 70 + int((done_count / total) * 20)
+            pct = 70 + int((local_done / total) * 20)
         else:
             pct = 90
         _emit_progress(
             emit,
             "enrich",
-            f"Enriched slide {a['slide']} ({done_count}/{total}).",
+            f"Enriched slide {a['slide']} ({local_done}/{total}).",
             pct,
         )
         return {
@@ -162,10 +250,26 @@ def enrich(
             **enriched,
         }
 
-    results = [enrich_one(a) for a in alignment]
+    results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=ENRICH_MAX_WORKERS) as pool:
+        futures = [pool.submit(enrich_one, a) for a in alignment]
+        for future in as_completed(futures):
+            results.append(future.result())
+
     results.sort(key=lambda x: x["slide"])
-    print(f"✅ Enrichment done", flush=True)
-    _emit_progress(emit, "enrich", "Slide enrichment complete.", 90)
+    wall_duration_ms = int((time.perf_counter() - stage_started) * 1000)
+    summary = (
+        f"Slide enrichment complete. total_tokens={usage_totals['total_tokens']} "
+        f"(input={usage_totals['input_tokens']}, output={usage_totals['output_tokens']}), "
+        f"retries={usage_totals['retries']}, fallbacks={usage_totals['fallbacks']}, "
+        f"fallback_reasons=truncated_json:{failure_reason_counts['truncated_json']}"
+        f"|empty_payload:{failure_reason_counts['empty_payload']}"
+        f"|connection_error:{failure_reason_counts['connection_error']}"
+        f"|other_error:{failure_reason_counts['other_error']}, "
+        f"api_duration_ms={usage_totals['duration_ms']}, wall_duration_ms={wall_duration_ms}"
+    )
+    print(f"✅ {summary}", flush=True)
+    _emit_progress(emit, "enrich", summary, 90)
     return results
 
 

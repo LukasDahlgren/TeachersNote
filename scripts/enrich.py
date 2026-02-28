@@ -1,14 +1,52 @@
 import argparse
 import json
+import os
 import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 
-import anthropic
+try:
+    import anthropic
+except ImportError:  # pragma: no cover - exercised only in minimal local envs
+    anthropic = None  # type: ignore[assignment]
 
-client = anthropic.Anthropic()
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover - exercised only in minimal local envs
+    OpenAI = None  # type: ignore[assignment]
+
+
+def _env_truthy(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        parsed = int(raw.strip())
+    except ValueError:
+        return default
+    return max(minimum, parsed)
+
+
+DEFAULT_ENRICH_PROVIDER = os.getenv("ENRICH_PROVIDER", "anthropic").strip().lower() or "anthropic"
+DEFAULT_ENRICH_MODEL_OVERRIDE = os.getenv("ENRICH_MODEL", "").strip()
+DEFAULT_ENRICH_MODEL_ANTHROPIC = os.getenv("ENRICH_MODEL_ANTHROPIC", "claude-haiku-4-5").strip() or "claude-haiku-4-5"
+DEFAULT_ENRICH_MODEL_GROQ = os.getenv("ENRICH_MODEL_GROQ", "openai/gpt-oss-20b").strip() or "openai/gpt-oss-20b"
+DEFAULT_ENRICH_MAX_WORKERS = _env_int("ENRICH_MAX_WORKERS", 4, minimum=1)
+DEFAULT_ENRICH_MAX_TRANSCRIPT_WORDS = _env_int("ENRICH_MAX_TRANSCRIPT_WORDS", 700, minimum=1)
+DEFAULT_ENRICH_MAX_OUTPUT_TOKENS = _env_int("ENRICH_MAX_OUTPUT_TOKENS", 320, minimum=64)
+DEFAULT_ENRICH_MAX_ATTEMPTS = _env_int("ENRICH_MAX_ATTEMPTS", 4, minimum=1)
+DEFAULT_ENRICH_LOG_USAGE = _env_truthy("ENRICH_LOG_USAGE", True)
+
+SUPPORTED_ENRICH_PROVIDERS = {"anthropic", "groq"}
 
 SYSTEM_PROMPT = """Du är assistent som hjälper studenter att förstå föreläsningsinnehåll.
 Du får en föreläsningsbild (slide) och en transkription av vad föreläsaren sade under den bilden.
@@ -20,19 +58,19 @@ Din uppgift är att skapa berikade anteckningar på svenska som fångar:
 
 Svara ALLTID med ett JSON-objekt (inga kodblock, bara ren JSON) med dessa fält:
 {
-  "summary": "En mening som sammanfattar slidens ämne",
-  "slide_content": "Vad bilden visar (punktlista)",
-  "lecturer_additions": "Punktlista med en punkt per rad där varje rad börjar med '- ' och innehåller allt relevant från föreläsaren utöver bilden",
-  "key_takeaways": ["takeaway 1", "takeaway 2", "takeaway 3"]
+  "summary": "Exakt en mening som sammanfattar slidens ämne",
+  "slide_content": "3-5 punktlistor där varje rad börjar med '- '",
+  "lecturer_additions": "Max 6 punktlistor där varje rad börjar med '- ' och innehåller allt relevant från föreläsaren utöver bilden",
+  "key_takeaways": ["exakt tre takeaways"]
 }"""
 
 STRICT_SYSTEM_PROMPT = """Du måste svara med ENDAST ett giltigt JSON-objekt.
 Ingen inledande text, inga kodblock, inga extra nycklar.
 Använd exakt dessa nycklar:
 - summary (string)
-- slide_content (string)
-- lecturer_additions (string där varje rad börjar med '- ')
-- key_takeaways (array av strings)"""
+- slide_content (string med 3-5 punktlistor där varje rad börjar med '- ')
+- lecturer_additions (string med max 6 punktlistor där varje rad börjar med '- ')
+- key_takeaways (array med exakt 3 strings)"""
 
 KEY_ALIASES = {
     "summary": ("summary", "sammanfattning", "overview", "title"),
@@ -66,6 +104,164 @@ KEY_ALIASES = {
 }
 
 BULLET_PREFIX_RE = re.compile(r"^\s*(?:[-*•]\s+|\d+[.)]\s+)")
+
+
+class EnrichmentResponseError(ValueError):
+    def __init__(
+        self,
+        message: str,
+        usage: dict[str, int] | None = None,
+        *,
+        reason: str = "invalid_payload",
+    ):
+        super().__init__(message)
+        self.usage = usage or {}
+        self.reason = reason
+
+
+def resolve_enrichment_provider(provider: str | None = None) -> str:
+    candidate = (provider or DEFAULT_ENRICH_PROVIDER).strip().lower()
+    if candidate not in SUPPORTED_ENRICH_PROVIDERS:
+        supported = ", ".join(sorted(SUPPORTED_ENRICH_PROVIDERS))
+        raise ValueError(f"Unsupported ENRICH_PROVIDER={candidate!r}. Supported: {supported}")
+    return candidate
+
+
+def default_enrichment_model(provider: str) -> str:
+    if provider == "anthropic":
+        return DEFAULT_ENRICH_MODEL_ANTHROPIC
+    return DEFAULT_ENRICH_MODEL_GROQ
+
+
+def create_enrichment_client(provider: str | None = None) -> Any:
+    resolved = resolve_enrichment_provider(provider)
+    if resolved == "anthropic":
+        if anthropic is None:
+            raise RuntimeError("anthropic package is required for ENRICH_PROVIDER=anthropic")
+        return anthropic.Anthropic()
+
+    if OpenAI is None:
+        raise RuntimeError("openai package is required for ENRICH_PROVIDER=groq")
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY is required for ENRICH_PROVIDER=groq")
+    return OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+
+
+def truncate_transcript_for_prompt(transcript_text: str, max_words: int) -> str:
+    words = transcript_text.split()
+    if max_words <= 0:
+        return ""
+    if len(words) <= max_words:
+        return _collapse_whitespace(transcript_text)
+
+    head_words = max(1, int(max_words * 0.6))
+    if head_words >= max_words:
+        head_words = max_words - 1
+    tail_words = max_words - head_words
+    capped = words[:head_words] + words[-tail_words:]
+    return " ".join(capped)
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _usage_from_response(response: Any, provider: str) -> dict[str, int]:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+    if provider == "anthropic":
+        input_tokens = _safe_int(getattr(usage, "input_tokens", 0))
+        output_tokens = _safe_int(getattr(usage, "output_tokens", 0))
+    else:
+        input_tokens = _safe_int(getattr(usage, "prompt_tokens", 0))
+        output_tokens = _safe_int(getattr(usage, "completion_tokens", 0))
+
+    total_tokens = _safe_int(getattr(usage, "total_tokens", input_tokens + output_tokens))
+    if total_tokens == 0:
+        total_tokens = input_tokens + output_tokens
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    if anthropic is not None and isinstance(exc, anthropic.RateLimitError):
+        return True
+    return exc.__class__.__name__.lower() == "ratelimiterror"
+
+
+def _is_connection_error(exc: Exception) -> bool:
+    name = exc.__class__.__name__.lower()
+    if "connection" in name or "timeout" in name:
+        return True
+    message = str(exc).lower()
+    return "connection error" in message or "timeout" in message
+
+
+def _add_usage(acc: dict[str, int], usage: dict[str, int]) -> None:
+    acc["input_tokens"] += _safe_int(usage.get("input_tokens"))
+    acc["output_tokens"] += _safe_int(usage.get("output_tokens"))
+    acc["total_tokens"] += _safe_int(usage.get("total_tokens"))
+
+
+def _response_text_from_groq_completion(response: Any) -> str:
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return ""
+    message = getattr(choices[0], "message", None)
+    content = getattr(message, "content", "") if message is not None else ""
+    if isinstance(content, list):
+        # OpenAI-compatible SDKs may represent multimodal parts as a list.
+        parts = []
+        for part in content:
+            text = part.get("text") if isinstance(part, dict) else None
+            if text:
+                parts.append(str(text))
+        return "\n".join(parts).strip()
+    if content is None:
+        return ""
+    return str(content).strip()
+
+
+def _call_enrichment_model(
+    client: Any,
+    *,
+    provider: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    max_output_tokens: int,
+) -> tuple[str, dict[str, int]]:
+    if provider == "anthropic":
+        response = client.messages.create(
+            model=model,
+            max_tokens=max_output_tokens,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        raw = response.content[0].text.strip()
+        return raw, _usage_from_response(response, provider)
+
+    response = client.chat.completions.create(
+        model=model,
+        temperature=0,
+        max_tokens=max_output_tokens,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        response_format={"type": "json_object"},
+    )
+    raw = _response_text_from_groq_completion(response)
+    return raw, _usage_from_response(response, provider)
 
 
 def build_user_prompt(slide: dict, transcript_text: str) -> str:
@@ -310,68 +506,220 @@ def build_fallback_enrichment(slide: dict, transcript_text: str) -> dict:
 
 
 def enrich_slide(
-    client: anthropic.Anthropic,
+    client: Any,
     slide: dict,
     transcript_text: str,
+    provider: str,
+    model: str,
+    max_output_tokens: int,
     system_prompt: str = SYSTEM_PROMPT,
-) -> dict:
-    response = client.messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=1024,
-        system=system_prompt,
-        messages=[{"role": "user", "content": build_user_prompt(slide, transcript_text)}],
+) -> tuple[dict, dict[str, int]]:
+    user_prompt = build_user_prompt(slide, transcript_text)
+    raw, usage = _call_enrichment_model(
+        client,
+        provider=provider,
+        model=model,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        max_output_tokens=max_output_tokens,
     )
-    raw = response.content[0].text.strip()
     parsed = parse_enrichment_response(raw)
     if parsed is None:
-        raise ValueError(f"No JSON object found in enrichment response: {raw[:240]}")
+        raise EnrichmentResponseError(
+            f"No JSON object found in enrichment response: {raw[:240]}",
+            usage=usage,
+            reason="no_json",
+        )
 
     normalized = normalize_enriched_payload(parsed)
     if is_enriched_payload_invalid(normalized):
-        raise ValueError("Enrichment response parsed but all canonical fields were empty")
-    return normalized
+        raise EnrichmentResponseError(
+            "Enrichment response parsed but all canonical fields were empty",
+            usage=usage,
+            reason="empty_payload",
+        )
+    return normalized, usage
 
 
 def enrich_slide_with_retry(
-    client: anthropic.Anthropic,
+    client: Any,
     slide: dict,
     transcript_text: str,
-    max_attempts: int = 5,
+    *,
+    provider: str,
+    model: str,
+    max_output_tokens: int = DEFAULT_ENRICH_MAX_OUTPUT_TOKENS,
+    max_transcript_words: int = DEFAULT_ENRICH_MAX_TRANSCRIPT_WORDS,
+    max_attempts: int = DEFAULT_ENRICH_MAX_ATTEMPTS,
+    log_usage: bool = DEFAULT_ENRICH_LOG_USAGE,
     log_callback: Callable[[str], None] | None = None,
-) -> dict:
+) -> tuple[dict, dict[str, Any]]:
     last_error: Exception | None = None
+    attempts = 0
+    usage_total = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    raw_word_count = len(transcript_text.split())
+    prompt_transcript_text = truncate_transcript_for_prompt(transcript_text, max_transcript_words)
+    prompt_word_count = len(prompt_transcript_text.split())
+    started = time.perf_counter()
+    slide_num = slide.get("slide", "?")
+    truncation_retry_used = False
+    next_attempt_tokens: int | None = None
+    failure_reason = "none"
+
     for attempt in range(max_attempts):
+        attempts = attempt + 1
         system_prompt = SYSTEM_PROMPT if attempt == 0 else STRICT_SYSTEM_PROMPT
+        current_max_output_tokens = next_attempt_tokens or max_output_tokens
+        next_attempt_tokens = None
         try:
-            return enrich_slide(client, slide, transcript_text, system_prompt=system_prompt)
-        except anthropic.RateLimitError as exc:
+            enriched, usage = enrich_slide(
+                client,
+                slide,
+                prompt_transcript_text,
+                provider=provider,
+                model=model,
+                max_output_tokens=current_max_output_tokens,
+                system_prompt=system_prompt,
+            )
+            _add_usage(usage_total, usage)
+
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            metrics = {
+                "provider": provider,
+                "model": model,
+                "attempts": attempts,
+                "retries": max(0, attempts - 1),
+                "fallback_used": False,
+                "duration_ms": duration_ms,
+                "input_tokens": usage_total["input_tokens"],
+                "output_tokens": usage_total["output_tokens"],
+                "total_tokens": usage_total["total_tokens"],
+                "raw_transcript_words": raw_word_count,
+                "prompt_transcript_words": prompt_word_count,
+                "failure_reason": "none",
+            }
+            if log_usage:
+                msg = (
+                    f"📊 Slide {slide_num} usage: provider={provider} model={model} attempts={metrics['attempts']} "
+                    f"retries={metrics['retries']} input_tokens={metrics['input_tokens']} "
+                    f"output_tokens={metrics['output_tokens']} total_tokens={metrics['total_tokens']} "
+                    f"duration_ms={metrics['duration_ms']} fallback={metrics['fallback_used']}"
+                )
+                print(f"  {msg}", flush=True)
+                if log_callback:
+                    log_callback(msg)
+            return enriched, metrics
+        except EnrichmentResponseError as exc:
             last_error = exc
-            wait = 60 * (attempt + 1)
-            msg = f"⏳ Rate limited on slide {slide.get('slide', '?')}, waiting {wait}s..."
-            print(f"  {msg}", flush=True)
-            if log_callback:
-                log_callback(msg)
-            time.sleep(wait)
-        except Exception as exc:
-            last_error = exc
+            _add_usage(usage_total, exc.usage)
+            failure_reason = exc.reason
+            attempt_output_tokens = _safe_int(exc.usage.get("output_tokens", 0))
+            is_truncated_json = (
+                exc.reason == "no_json"
+                and attempt_output_tokens >= current_max_output_tokens
+            )
+
+            if is_truncated_json:
+                failure_reason = "truncated_json"
+                if not truncation_retry_used and attempt < max_attempts - 1:
+                    truncation_retry_used = True
+                    expanded = min(max_output_tokens * 2, 1200)
+                    if expanded > current_max_output_tokens:
+                        next_attempt_tokens = expanded
+                        msg = (
+                            f"⚠️ Truncated JSON detected on slide {slide_num} "
+                            f"(attempt {attempt + 1}/{max_attempts}), retrying with max_output_tokens={expanded}..."
+                        )
+                        print(f"  {msg}", flush=True)
+                        if log_callback:
+                            log_callback(msg)
+                        continue
+
             if attempt < max_attempts - 1:
                 wait = min(8, attempt + 1)
-                msg = f"⚠️ Invalid enrichment payload on slide {slide.get('slide', '?')} (attempt {attempt + 1}/{max_attempts}), retrying in {wait}s..."
+                msg = (
+                    f"⚠️ Invalid enrichment payload on slide {slide_num} "
+                    f"(attempt {attempt + 1}/{max_attempts}), retrying in {wait}s..."
+                )
                 print(f"  {msg}", flush=True)
                 if log_callback:
                     log_callback(msg)
                 time.sleep(wait)
             else:
                 break
+        except Exception as exc:
+            last_error = exc
+            failure_reason = "connection_error" if _is_connection_error(exc) else "other_error"
+            if _is_rate_limit_error(exc):
+                wait = 60 * (attempt + 1)
+                msg = f"⏳ Rate limited on slide {slide_num}, waiting {wait}s..."
+                print(f"  {msg}", flush=True)
+                if log_callback:
+                    log_callback(msg)
+                time.sleep(wait)
+            else:
+                if attempt < max_attempts - 1:
+                    wait = min(8, attempt + 1)
+                    msg = (
+                        f"⚠️ Invalid enrichment payload on slide {slide_num} "
+                        f"(attempt {attempt + 1}/{max_attempts}), retrying in {wait}s..."
+                    )
+                    print(f"  {msg}", flush=True)
+                    if log_callback:
+                        log_callback(msg)
+                    time.sleep(wait)
+                else:
+                    break
 
-    msg = f"⚠️ Falling back to deterministic notes for slide {slide.get('slide', '?')} after repeated errors"
+    msg = f"⚠️ Falling back to deterministic notes for slide {slide_num} after repeated errors"
     print(f"  {msg}: {last_error}", flush=True)
     if log_callback:
         log_callback(msg)
-    return build_fallback_enrichment(slide, transcript_text)
+    fallback = build_fallback_enrichment(slide, transcript_text)
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    if failure_reason not in {"truncated_json", "empty_payload", "connection_error", "other_error"}:
+        failure_reason = "other_error"
+    metrics = {
+        "provider": provider,
+        "model": model,
+        "attempts": max(1, attempts),
+        "retries": max(0, max(1, attempts) - 1),
+        "fallback_used": True,
+        "duration_ms": duration_ms,
+        "input_tokens": usage_total["input_tokens"],
+        "output_tokens": usage_total["output_tokens"],
+        "total_tokens": usage_total["total_tokens"],
+        "raw_transcript_words": raw_word_count,
+        "prompt_transcript_words": prompt_word_count,
+        "failure_reason": failure_reason,
+    }
+    if log_usage:
+        usage_msg = (
+            f"📊 Slide {slide_num} usage: provider={provider} model={model} attempts={metrics['attempts']} "
+            f"retries={metrics['retries']} input_tokens={metrics['input_tokens']} "
+            f"output_tokens={metrics['output_tokens']} total_tokens={metrics['total_tokens']} "
+            f"duration_ms={metrics['duration_ms']} fallback={metrics['fallback_used']} "
+            f"failure_reason={metrics['failure_reason']}"
+        )
+        print(f"  {usage_msg}", flush=True)
+        if log_callback:
+            log_callback(usage_msg)
+    return fallback, metrics
 
 
-def enrich(slides_path: str, aligned_path: str, transcript_path: str, output_path: str, max_workers: int = 8) -> None:
+def enrich(
+    slides_path: str,
+    aligned_path: str,
+    transcript_path: str,
+    output_path: str,
+    max_workers: int = DEFAULT_ENRICH_MAX_WORKERS,
+    max_attempts: int = DEFAULT_ENRICH_MAX_ATTEMPTS,
+    max_transcript_words: int = DEFAULT_ENRICH_MAX_TRANSCRIPT_WORDS,
+    max_output_tokens: int = DEFAULT_ENRICH_MAX_OUTPUT_TOKENS,
+    provider: str | None = None,
+    model: str | None = None,
+    log_usage: bool = DEFAULT_ENRICH_LOG_USAGE,
+) -> None:
     with open(slides_path, encoding="utf-8") as f:
         slides = json.load(f)
     with open(aligned_path, encoding="utf-8") as f:
@@ -398,12 +746,30 @@ def enrich(slides_path: str, aligned_path: str, transcript_path: str, output_pat
     if already_done:
         print(f"Resuming: {len(already_done)}/{total} slides already done, {len(pending)} remaining")
 
+    resolved_provider = resolve_enrichment_provider(provider)
+    resolved_model = (
+        model.strip()
+        if model and model.strip()
+        else (DEFAULT_ENRICH_MODEL_OVERRIDE or default_enrichment_model(resolved_provider))
+    )
+    enrich_client = create_enrichment_client(resolved_provider)
+
     def process(a: dict) -> None:
         slide = slides_by_num[a["slide"]]
         transcript_segs = segments[a["start_segment"]: a["end_segment"] + 1]
         transcript_text = " ".join(s["text"].strip() for s in transcript_segs)
 
-        enriched = enrich_slide_with_retry(client, slide, transcript_text)
+        enriched, _metrics = enrich_slide_with_retry(
+            enrich_client,
+            slide,
+            transcript_text,
+            provider=resolved_provider,
+            model=resolved_model,
+            max_output_tokens=max_output_tokens,
+            max_transcript_words=max_transcript_words,
+            max_attempts=max_attempts,
+            log_usage=log_usage,
+        )
         entry = {
             "slide": a["slide"],
             "original_text": slide["text"],
@@ -431,11 +797,69 @@ def enrich(slides_path: str, aligned_path: str, transcript_path: str, output_pat
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Enrich slides with lecturer transcript using Claude")
+    parser = argparse.ArgumentParser(description="Enrich slides with lecturer transcript using AI")
     parser.add_argument("--slides", required=True)
     parser.add_argument("--aligned", required=True)
     parser.add_argument("--transcript", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--workers", type=int, default=8, help="Parallel API workers (default 8)")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_ENRICH_MAX_WORKERS,
+        help=f"Parallel API workers (default {DEFAULT_ENRICH_MAX_WORKERS})",
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=DEFAULT_ENRICH_MAX_ATTEMPTS,
+        help=f"Retry attempts per slide (default {DEFAULT_ENRICH_MAX_ATTEMPTS})",
+    )
+    parser.add_argument(
+        "--max-transcript-words",
+        type=int,
+        default=DEFAULT_ENRICH_MAX_TRANSCRIPT_WORDS,
+        help=f"Max transcript words in enrichment prompt (default {DEFAULT_ENRICH_MAX_TRANSCRIPT_WORDS})",
+    )
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=DEFAULT_ENRICH_MAX_OUTPUT_TOKENS,
+        help=f"Max completion tokens per enrichment call (default {DEFAULT_ENRICH_MAX_OUTPUT_TOKENS})",
+    )
+    parser.add_argument(
+        "--provider",
+        choices=sorted(SUPPORTED_ENRICH_PROVIDERS),
+        default=DEFAULT_ENRICH_PROVIDER,
+        help=f"LLM provider for enrichment (default {DEFAULT_ENRICH_PROVIDER})",
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_ENRICH_MODEL_OVERRIDE,
+        help="Override model id for enrichment provider (default uses ENRICH_MODEL / ENRICH_MODEL_* env vars)",
+    )
+    parser.add_argument(
+        "--log-usage",
+        action="store_true",
+        default=DEFAULT_ENRICH_LOG_USAGE,
+        help="Log per-slide usage metrics (default follows ENRICH_LOG_USAGE)",
+    )
+    parser.add_argument(
+        "--no-log-usage",
+        action="store_false",
+        dest="log_usage",
+        help="Disable per-slide usage logging",
+    )
     args = parser.parse_args()
-    enrich(args.slides, args.aligned, args.transcript, args.output, max_workers=args.workers)
+    enrich(
+        args.slides,
+        args.aligned,
+        args.transcript,
+        args.output,
+        max_workers=args.workers,
+        max_attempts=args.max_attempts,
+        max_transcript_words=args.max_transcript_words,
+        max_output_tokens=args.max_output_tokens,
+        provider=args.provider,
+        model=args.model,
+        log_usage=args.log_usage,
+    )

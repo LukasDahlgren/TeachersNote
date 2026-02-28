@@ -817,7 +817,7 @@ async def generate_notes_for_slide(slide: dict, transcript_text: str) -> dict:
     if DISABLE_EXTERNAL_AI:
         return build_fallback_enrichment(slide, transcript_text)
 
-    notes = await run_in_threadpool(enrich_slide_notes, slide, transcript_text, 5)
+    notes = await run_in_threadpool(enrich_slide_notes, slide, transcript_text)
     if is_enriched_payload_invalid(notes):
         return build_fallback_enrichment(slide, transcript_text)
     return notes

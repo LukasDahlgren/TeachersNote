@@ -11,7 +11,7 @@ Full-stack lecture processing platform. Upload a PDF slide deck and an audio/vid
 | Backend | Python · FastAPI · SQLAlchemy (async) |
 | Database | MySQL · aiomysql |
 | Frontend | React 19 · TypeScript · Vite |
-| AI/LLM | Groq Whisper (`whisper-large-v3-turbo`) · Anthropic Claude Sonnet 4.6 (alignment) · Claude Haiku 4.5 (enrichment) |
+| AI/LLM | Groq Whisper (`whisper-large-v3-turbo`, transcription) · Anthropic Claude Sonnet 4.6 (alignment) · Enrichment: Anthropic Haiku 4.5 by default (`ENRICH_PROVIDER=anthropic`) or optional Groq model override (`ENRICH_PROVIDER`/`ENRICH_MODEL`) |
 | Media tooling | FFmpeg (audio normalization before transcription) |
 
 ---
@@ -35,10 +35,24 @@ DB_PORT=3306
 DB_USER=your_user
 DB_PASSWORD=your_password
 DB_NAME=lecturesummary
+API_KEY=your_api_key
 ANTHROPIC_API_KEY=sk-ant-...
 GROQ_API_KEY=gsk_...
 # Optional: disables all Anthropic/Groq calls for note regeneration jobs
 DISABLE_EXTERNAL_AI=false
+# Enrichment tuning (cost/speed)
+ENRICH_MAX_WORKERS=4
+# Recommended runtime overrides
+ENRICH_MAX_TRANSCRIPT_WORDS=500
+ENRICH_MAX_OUTPUT_TOKENS=900
+ENRICH_MAX_ATTEMPTS=4
+ENRICH_LOG_USAGE=true
+# Code defaults if unset: ENRICH_MAX_TRANSCRIPT_WORDS=700, ENRICH_MAX_OUTPUT_TOKENS=320
+# Optional provider/model override (default provider is anthropic)
+# ENRICH_PROVIDER=anthropic
+# ENRICH_MODEL=claude-haiku-4-5
+# ENRICH_PROVIDER=groq
+# ENRICH_MODEL=openai/gpt-oss-20b
 ```
 
 ### Backend
@@ -117,7 +131,7 @@ Validation behavior:
 2. Convert recording to mono 16k low-bitrate MP3 with FFmpeg
 3. Transcribe with Groq Whisper (`whisper-large-v3-turbo`)
 4. Align transcript segments to slides via Claude Sonnet 4.6
-5. Enrich each slide via Claude Haiku 4.5 (sequential processing with retry, strict JSON validation, deterministic fallback on malformed responses)
+5. Enrich each slide via configurable provider/model (`ENRICH_PROVIDER` / `ENRICH_MODEL`) with bounded parallel workers and retries (strict JSON validation, truncation-aware retry for token-capped JSON responses, deterministic fallback if responses remain invalid)
 6. Generate enhanced PPTX with speaker notes
 7. Persist all data to MySQL
 8. Copy original PDF into `backend/generated/`
@@ -290,8 +304,8 @@ backend/
 
 scripts/
 ├── parse_slides.py         # PDF -> text by page
-├── align.py                # Claude alignment prompt + parser
-├── enrich.py               # Claude enrichment prompt/worker
+├── align.py                # Claude Sonnet alignment prompt + parser
+├── enrich.py               # Provider-aware enrichment worker (Anthropic default, optional Groq)
 └── generate_presentation.py # PPTX generator (PDF pages + notes)
 
 frontend/src/
@@ -324,3 +338,16 @@ frontend/src/
 
 - CORS allows `http://localhost:5173` by default.
 - There is currently no automated test suite in the repo.
+
+### Model Choice
+
+- **Transcription**: Groq Whisper (`whisper-large-v3-turbo`)
+- **Alignment**: Anthropic Claude Sonnet 4.6 (`claude-sonnet-4-6`)
+- **Enrichment**: Anthropic Claude Haiku 4.5 (`claude-haiku-4-5`) by default, or Groq via env override
+
+Example enrichment provider override:
+
+```env
+ENRICH_PROVIDER=groq
+ENRICH_MODEL=openai/gpt-oss-20b
+```

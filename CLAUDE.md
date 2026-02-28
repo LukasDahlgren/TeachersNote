@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Full-stack lecture processing platform: extract PDF slide text, transcribe audio/video recordings via Groq Whisper, align transcript segments to slides via Claude, enrich slide notes via Claude, and generate enhanced PPTX output.
+Full-stack lecture processing platform: extract PDF slide text, transcribe audio/video recordings via Groq Whisper, align transcript segments to slides via Claude Sonnet, enrich slide notes via a configurable provider/model (Anthropic default), and generate enhanced PPTX output.
 
 ## Dev Commands
 
@@ -33,7 +33,7 @@ No automated test suite. Manual testing via `GET /demo` using sample data in `ou
 3. **Normalize audio** — FFmpeg converts to mono 16k low-bitrate MP3
 4. **Transcribe** — Groq Whisper (`whisper-large-v3-turbo`) in `pipeline.py` → segments
 5. **Align** — Claude Sonnet 4.6 via `scripts/align.py` helpers → segments mapped to slides
-6. **Enrich** — Claude Haiku 4.5 via `scripts/enrich.py` (sequential + retry in `pipeline.py`) → summaries + takeaways (Swedish prompts)
+6. **Enrich** — Configurable provider/model via `scripts/enrich.py` with parallel retry workers in `pipeline.py` (default: Anthropic `claude-haiku-4-5`; optional Groq override), truncation-aware retry, then deterministic fallback if still invalid → summaries + takeaways (Swedish prompts)
 7. **Generate** — `scripts/generate_presentation.py` → PPTX in `generated/`
 8. **Persist** — SQLAlchemy async → MySQL (lecture + slides + segments + alignment + enrichment)
 
@@ -53,7 +53,7 @@ No automated test suite. Manual testing via `GET /demo` using sample data in `ou
 ### Scripts (`scripts/`) — Critical import rules
 - **`parse_slides.py`** — Safe to import: `from scripts.parse_slides import parse_slides`
 - **`align.py`** — Use `build_prompt()` + `parse_response()` helpers from `pipeline.py`
-- **`enrich.py`** — Swedish language prompts; script supports concurrent workers, while backend pipeline currently processes sequentially to handle rate limits safely
+- **`enrich.py`** — Swedish language prompts; provider abstraction (`anthropic` or `groq`) + deterministic prompt truncation + usage logging
 
 ## Environment
 
@@ -62,7 +62,20 @@ Credentials are loaded from `backend/.env`:
 DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME   # MySQL connection
 ANTHROPIC_API_KEY                                   # Claude API
 GROQ_API_KEY                                        # Groq Whisper API
+API_KEY                                             # Required app API key
+ENRICH_MAX_WORKERS                                  # Optional; default 4
+ENRICH_MAX_TRANSCRIPT_WORDS                         # Recommended runtime: 500 (code default: 700)
+ENRICH_MAX_OUTPUT_TOKENS                            # Recommended runtime: 900 (code default: 320)
+ENRICH_MAX_ATTEMPTS                                 # Optional; default 4
+ENRICH_LOG_USAGE                                    # Optional; default true
+ENRICH_PROVIDER                                     # Optional; anthropic|groq (default anthropic)
+ENRICH_MODEL                                        # Optional model override (Anthropic default: claude-haiku-4-5)
 ```
+
+Model choice by stage:
+- Transcription: Groq Whisper (`whisper-large-v3-turbo`)
+- Alignment: Anthropic Claude Sonnet (`claude-sonnet-4-6`)
+- Enrichment: Anthropic by default (`claude-haiku-4-5`), or Groq via `ENRICH_PROVIDER=groq` + `ENRICH_MODEL`
 
 ## Sample Data (`out/`)
 Swedish SQL/DB lecture artifacts: `slides.json`, `transcript.json`, `aligned.json`, `enhanced.json`, `enhanced_presentation.pptx`.
