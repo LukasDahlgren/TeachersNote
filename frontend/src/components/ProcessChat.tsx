@@ -3,8 +3,16 @@ import type { UploadProcessJobStatus } from "../types";
 
 const PIPELINE_STAGES = ["parse_slides", "transcribe", "align", "enrich", "generate_pptx"] as const;
 
+const STAGE_DISPLAY_NAMES: Record<string, string> = {
+  parse_slides: "parsing...",
+  transcribe: "transcribing...",
+  align: "aligning...",
+  enrich: "enriching...",
+  generate_pptx: "generating...",
+};
+
 function formatStage(stage: string): string {
-  return stage.replace(/_/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
+  return STAGE_DISPLAY_NAMES[stage] || stage.replace(/_/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
 export interface ProcessChatEntry {
