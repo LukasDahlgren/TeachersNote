@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from db import get_db, init_db
 from models import Alignment, EnrichedSlide, Lecture, Slide, TranscriptSegment
+from pipeline import normalize_enriched_payload
 
 OUT = Path(__file__).parent.parent / "out"
 
@@ -41,12 +42,16 @@ async def seed(name: str):
             Alignment(lecture_id=lecture.id, slide_number=a["slide"], start_segment=a["start_segment"], end_segment=a["end_segment"])
             for a in alignment
         ])
-        enhanced_by_slide = {e["slide"]: e for e in enhanced}
+        enhanced_by_slide = {
+            int(e["slide"]): normalize_enriched_payload(e)
+            for e in enhanced
+            if isinstance(e, dict) and "slide" in e
+        }
         db.add_all([
             EnrichedSlide(
                 lecture_id=lecture.id, slide_number=slide_num,
-                summary=e.get("summary", ""), slide_content=e.get("slide_content", ""),
-                lecturer_additions=e.get("lecturer_additions", ""), key_takeaways=e.get("key_takeaways", []),
+                summary=e["summary"], slide_content=e["slide_content"],
+                lecturer_additions=e["lecturer_additions"], key_takeaways=e["key_takeaways"],
             )
             for slide_num, e in enhanced_by_slide.items()
         ])

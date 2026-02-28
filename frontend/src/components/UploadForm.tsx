@@ -1,8 +1,12 @@
 import { useRef, useState } from "react";
+import { type UploadLectureNamingInput } from "../types";
 
 interface Props {
-  onSubmit: (pdf: File, audio: File) => void;
+  onSubmit: (pdf: File, audio: File, naming: UploadLectureNamingInput) => void;
   loading: boolean;
+  demoMode: boolean;
+  onRunDemo: () => void;
+  loadingLabel?: string;
 }
 
 function formatBytes(bytes: number): string {
@@ -116,9 +120,13 @@ function DropZone({
   );
 }
 
-export default function UploadForm({ onSubmit, loading }: Props) {
+export default function UploadForm({ onSubmit, loading, demoMode, onRunDemo, loadingLabel }: Props) {
   const [pdfFile, setPdfFile] = useState<File | null>(null);
   const [audioFile, setAudioFile] = useState<File | null>(null);
+  const [courseid, setCourseid] = useState("");
+  const [kind, setKind] = useState("lecture");
+  const [lecture, setLecture] = useState("");
+  const [year, setYear] = useState("");
   const [pdfDragOver, setPdfDragOver] = useState(false);
   const [audioDragOver, setAudioDragOver] = useState(false);
   const [error, setError] = useState("");
@@ -153,8 +161,27 @@ export default function UploadForm({ onSubmit, loading }: Props) {
       setError("Please select both a PDF and an audio file.");
       return;
     }
+
+    const nextCourseid = courseid.trim();
+    const nextKind = kind.trim() || "lecture";
+    const nextLecture = lecture.trim();
+    const nextYear = year.trim();
+    if (!nextCourseid || !nextLecture || !nextYear) {
+      setError("Please fill in Course ID, Lecture, and Year.");
+      return;
+    }
+    if (!/^\d{4}$/.test(nextYear)) {
+      setError("Year must be exactly 4 digits.");
+      return;
+    }
+
     setError("");
-    onSubmit(pdfFile, audioFile);
+    onSubmit(pdfFile, audioFile, {
+      courseid: nextCourseid,
+      kind: nextKind,
+      lecture: nextLecture,
+      year: nextYear,
+    });
   }
 
   return (
@@ -163,6 +190,81 @@ export default function UploadForm({ onSubmit, loading }: Props) {
       <p className="form-subtitle">
         Upload lecture slides (PDF) and an audio or video recording to generate an aligned transcript.
       </p>
+      {demoMode && (
+        <div className="form-demo-hint">
+          Demo Mode is on. Processing and regeneration are simulated without API-key calls.
+        </div>
+      )}
+
+      <div className="naming-fields">
+        <div className="naming-field">
+          <label className="drop-zone-label" htmlFor="courseid-input">Course ID</label>
+          <input
+            id="courseid-input"
+            className="naming-input"
+            type="text"
+            value={courseid}
+            disabled={loading}
+            autoComplete="off"
+            onChange={(e) => {
+              setCourseid(e.target.value);
+              setError("");
+            }}
+            placeholder="IDSV, PROG2"
+          />
+        </div>
+        <div className="naming-field">
+          <label className="drop-zone-label" htmlFor="kind-input">Kind</label>
+          <input
+            id="kind-input"
+            className="naming-input"
+            type="text"
+            value={kind}
+            disabled={loading}
+            autoComplete="off"
+            onChange={(e) => {
+              setKind(e.target.value);
+              setError("");
+            }}
+            placeholder="lecture"
+          />
+        </div>
+        <div className="naming-field">
+          <label className="drop-zone-label" htmlFor="lecture-input">Lecture</label>
+          <input
+            id="lecture-input"
+            className="naming-input"
+            type="text"
+            value={lecture}
+            disabled={loading}
+            autoComplete="off"
+            onChange={(e) => {
+              setLecture(e.target.value);
+              setError("");
+            }}
+            placeholder="3"
+          />
+        </div>
+        <div className="naming-field">
+          <label className="drop-zone-label" htmlFor="year-input">Year</label>
+          <input
+            id="year-input"
+            className="naming-input"
+            type="text"
+            value={year}
+            disabled={loading}
+            autoComplete="off"
+            inputMode="numeric"
+            pattern="[0-9]{4}"
+            maxLength={4}
+            onChange={(e) => {
+              setYear(e.target.value);
+              setError("");
+            }}
+            placeholder="2026"
+          />
+        </div>
+      </div>
 
       <DropZone
         label="Slides (PDF)"
@@ -200,13 +302,28 @@ export default function UploadForm({ onSubmit, loading }: Props) {
 
       {error && <p className="form-error">{error}</p>}
 
-      <button
-        type="submit"
-        className="submit-btn"
-        disabled={loading || !pdfFile || !audioFile}
-      >
-        {loading ? <span className="spinner spinner--dark" /> : "Process Lecture"}
-      </button>
+      <div className="submit-actions">
+        <button
+          type="submit"
+          className="submit-btn"
+          disabled={loading || !pdfFile || !audioFile || !courseid.trim() || !lecture.trim() || !year.trim()}
+        >
+          {loading ? <span className="spinner spinner--dark" /> : "Process Lecture"}
+        </button>
+        {demoMode && (
+          <button
+            type="button"
+            className="submit-btn submit-btn-secondary"
+            onClick={onRunDemo}
+            disabled={loading}
+          >
+            {loading ? <span className="spinner spinner--dark" /> : "Run Demo"}
+          </button>
+        )}
+      </div>
+      {loading && loadingLabel && (
+        <p className="loading-label">{loadingLabel}</p>
+      )}
     </form>
   );
 }

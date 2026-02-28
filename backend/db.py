@@ -2,6 +2,7 @@ import logging
 import os
 
 from dotenv import load_dotenv
+from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 load_dotenv()
@@ -34,6 +35,16 @@ async def init_db() -> None:
     from models import Base
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_ensure_schema_compatibility)
+
+
+def _ensure_schema_compatibility(sync_conn) -> None:
+    inspector = inspect(sync_conn)
+    lecture_columns = {column["name"] for column in inspector.get_columns("lectures")}
+    if "is_archived" not in lecture_columns:
+        sync_conn.execute(
+            text("ALTER TABLE lectures ADD COLUMN is_archived BOOLEAN NOT NULL DEFAULT 0")
+        )
 
 
 async def get_db():

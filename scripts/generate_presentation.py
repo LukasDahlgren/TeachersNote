@@ -1,16 +1,17 @@
 import argparse
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 
 import fitz  # pymupdf
 from pptx import Presentation
 from pptx.util import Inches, Pt
-from pptx.enum.text import PP_ALIGN
 
 
 SLIDE_WIDTH = Inches(13.33)
 SLIDE_HEIGHT = Inches(7.5)
+BULLET_PREFIX_RE = re.compile(r"^\s*(?:[-*•]\s+|\d+[.)]\s+)")
 
 
 def pdf_to_images(pdf_path: str, dpi: int = 150) -> list[bytes]:
@@ -32,14 +33,49 @@ def pdf_to_images(pdf_path: str, dpi: int = 150) -> list[bytes]:
     return [img for _, img in sorted(results)]
 
 
+def _bulletize_text(text: str) -> list[str]:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return []
+
+    lines = [line.strip() for line in normalized.split("\n") if line.strip()]
+    if not lines:
+        return []
+
+    prefixed_items: list[str] = []
+    has_prefixed = False
+    for line in lines:
+        match = BULLET_PREFIX_RE.match(line)
+        if match:
+            has_prefixed = True
+            item = line[match.end():].strip()
+            if item:
+                prefixed_items.append(item)
+            continue
+        if has_prefixed and prefixed_items:
+            prefixed_items[-1] = f"{prefixed_items[-1]} {line}".strip()
+
+    if has_prefixed and prefixed_items:
+        return prefixed_items
+
+    if len(lines) > 1:
+        return lines
+
+    compact = " ".join(normalized.split())
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+|;\s+", compact) if p.strip()]
+    return parts or ([compact] if compact else [])
+
+
 def build_speaker_notes(entry: dict) -> str:
     lines = []
     lines.append(f"SAMMANFATTNING: {entry.get('summary', '')}")
     lines.append("")
     la = entry.get("lecturer_additions", "")
-    if la:
+    lecturer_bullets = _bulletize_text(la) if la else []
+    if lecturer_bullets:
         lines.append("FÖRELÄSARENS TILLÄGG:")
-        lines.append(la)
+        for item in lecturer_bullets:
+            lines.append(f"  • {item}")
         lines.append("")
     takeaways = entry.get("key_takeaways", [])
     if takeaways:

@@ -14,6 +14,7 @@ class Lecture(Base):
     id         = Column(Integer, primary_key=True, autoincrement=True)
     name       = Column(String(255), nullable=False)
     is_demo    = Column(Boolean, nullable=False, default=False)
+    is_archived = Column(Boolean, nullable=False, default=False)
     pptx_path  = Column(String(512), nullable=True)
     pdf_path   = Column(String(512), nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
