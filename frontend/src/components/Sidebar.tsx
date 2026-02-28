@@ -111,7 +111,7 @@ export default function Sidebar({
 
       <div className="sidebar-groups">
         <div className="sidebar-group sidebar-group--active">
-          <div className="sidebar-section-label">My Lectures</div>
+          <div className="sidebar-section-label">Saved lectures</div>
           <div className="sidebar-list sidebar-list--active">
             {loading && (
               <div className="sidebar-spinner">
