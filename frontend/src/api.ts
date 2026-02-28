@@ -16,9 +16,37 @@ import {
 
 const BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
 const API_KEY = import.meta.env.VITE_API_KEY ?? "";
+const USER_ID_STORAGE_KEY = "lecture-summary.user-id";
+const DEFAULT_USER_ID = "local-dev-user";
 
-function apiHeaders(extra?: Record<string, string>): Record<string, string> {
-  return { "X-API-Key": API_KEY, ...extra };
+function generateUserId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `user-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+}
+
+function getCurrentUserId(): string {
+  if (typeof window === "undefined") return DEFAULT_USER_ID;
+  const existing = window.localStorage.getItem(USER_ID_STORAGE_KEY)?.trim();
+  if (existing) return existing;
+  const next = generateUserId();
+  window.localStorage.setItem(USER_ID_STORAGE_KEY, next);
+  return next;
+}
+
+function withAuthHeaders(headers?: HeadersInit): Headers {
+  const next = new Headers(headers);
+  next.set("X-API-Key", API_KEY);
+  next.set("X-User-Id", getCurrentUserId());
+  return next;
+}
+
+async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  return fetch(`${BASE}${path}`, {
+    ...init,
+    headers: withAuthHeaders(init.headers),
+  });
 }
 
 export class ApiError extends Error {
@@ -69,14 +97,14 @@ export async function processFiles(
   form.append("kind", naming.kind);
   form.append("lecture", naming.lecture);
   form.append("year", naming.year);
-  const res = await fetch(`${BASE}/process`, { method: "POST", body: form, headers: apiHeaders() });
+  const res = await apiFetch("/process", { method: "POST", body: form });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
 export async function checkHealth(): Promise<boolean> {
   try {
-    const res = await fetch(`${BASE}/health`);
+    const res = await apiFetch("/health");
     return res.ok;
   } catch {
     return false;
@@ -84,31 +112,49 @@ export async function checkHealth(): Promise<boolean> {
 }
 
 export async function getLectures(): Promise<LectureSummary[]> {
-  const res = await fetch(`${BASE}/lectures`, { headers: apiHeaders() });
+  const res = await apiFetch("/lectures");
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function getMyLectures(): Promise<LectureSummary[]> {
+  const res = await apiFetch("/lectures/my");
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
 export async function getLecture(id: number): Promise<LectureDetail> {
-  const res = await fetch(`${BASE}/lectures/${id}`, { headers: apiHeaders() });
+  const res = await apiFetch(`/lectures/${id}`);
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
 export async function archiveLecture(id: number): Promise<ArchiveLectureResponse> {
-  const res = await fetch(`${BASE}/lectures/${id}/archive`, { method: "POST", headers: apiHeaders() });
+  const res = await apiFetch(`/lectures/${id}/archive`, { method: "POST" });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
 export async function unarchiveLecture(id: number): Promise<ArchiveLectureResponse> {
-  const res = await fetch(`${BASE}/lectures/${id}/unarchive`, { method: "POST", headers: apiHeaders() });
+  const res = await apiFetch(`/lectures/${id}/unarchive`, { method: "POST" });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function saveLecture(id: number): Promise<LectureSummary> {
+  const res = await apiFetch(`/lectures/${id}/save`, { method: "PUT" });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function unsaveLecture(id: number): Promise<LectureSummary> {
+  const res = await apiFetch(`/lectures/${id}/save`, { method: "DELETE" });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
 export async function getDemoLecture(): Promise<ProcessResult> {
-  const res = await fetch(`${BASE}/demo`, { headers: apiHeaders() });
+  const res = await apiFetch("/demo");
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -164,19 +210,19 @@ export async function findBestLectureWithNotesByName(
 }
 
 export async function regenerateLectureNotes(id: number): Promise<RegenerateNotesResponse> {
-  const res = await fetch(`${BASE}/lectures/${id}/regenerate-notes`, { method: "POST", headers: apiHeaders() });
+  const res = await apiFetch(`/lectures/${id}/regenerate-notes`, { method: "POST" });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
 export async function startRegenerateNotesJob(id: number): Promise<RegenerateNotesJobStartResponse> {
-  const res = await fetch(`${BASE}/lectures/${id}/regenerate-notes/jobs`, { method: "POST", headers: apiHeaders() });
+  const res = await apiFetch(`/lectures/${id}/regenerate-notes/jobs`, { method: "POST" });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
 export async function getRegenerateNotesJob(jobId: string): Promise<RegenerateNotesJobStatus> {
-  const res = await fetch(`${BASE}/lectures/regenerate-notes/jobs/${jobId}`, { headers: apiHeaders() });
+  const res = await apiFetch(`/lectures/regenerate-notes/jobs/${jobId}`);
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -237,7 +283,7 @@ export async function startProcessJob(
   form.append("kind", naming.kind);
   form.append("lecture", naming.lecture);
   form.append("year", naming.year);
-  const res = await fetch(`${BASE}/process/jobs`, { method: "POST", body: form, headers: apiHeaders() });
+  const res = await apiFetch("/process/jobs", { method: "POST", body: form });
   if (!res.ok) {
     const body = await readBody(res);
     const message = typeof body === "string"
@@ -249,7 +295,7 @@ export async function startProcessJob(
 }
 
 export async function getProcessJob(jobId: string): Promise<UploadProcessJobStatus> {
-  const res = await fetch(`${BASE}/process/jobs/${jobId}`, { headers: apiHeaders() });
+  const res = await apiFetch(`/process/jobs/${jobId}`);
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }

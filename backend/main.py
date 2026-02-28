@@ -12,16 +12,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Header, Query, Request, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
-from sqlalchemy import select
+from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db import AsyncSessionLocal, get_db, init_db
-from models import Alignment, EnrichedSlide, Lecture, Slide, TranscriptSegment
+from models import Alignment, EnrichedSlide, Lecture, LectureSave, Slide, TranscriptSegment
 from pipeline import (
     align,
     build_fallback_enrichment,
@@ -72,6 +73,8 @@ REGEN_JOB_LOCK = asyncio.Lock()
 UPLOAD_JOB_STORE: dict[str, dict[str, Any]] = {}
 ACTIVE_UPLOAD_JOB_ID: str | None = None
 UPLOAD_JOB_LOCK = asyncio.Lock()
+DEFAULT_USER_ID = "local-dev-user"
+USER_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
@@ -107,6 +110,22 @@ async def _require_api_key_or_token(
     if key == APP_API_KEY or token == APP_API_KEY:
         return
     raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+def _resolve_user_id(header_value: str | None) -> str:
+    value = (header_value or "").strip()
+    if not value:
+        return DEFAULT_USER_ID
+    if not USER_ID_PATTERN.fullmatch(value):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid X-User-Id header. Use 1-128 chars matching [A-Za-z0-9._:-].",
+        )
+    return value
+
+
+def get_current_user_id(x_user_id: str | None = Header(default=None, alias="X-User-Id")) -> str:
+    return _resolve_user_id(x_user_id)
 
 
 def _join_text(parts: list[str]) -> str:
@@ -288,6 +307,77 @@ def _lecture_file_urls(lecture: Lecture) -> dict[str, str | None]:
         "download_url": f"/download/{Path(lecture.pptx_path).name}" if lecture.pptx_path else None,
         "pdf_url": f"/pdf/{Path(lecture.pdf_path).name}" if lecture.pdf_path else None,
     }
+
+
+def _lecture_summary_payload(lecture: Lecture, *, is_saved: bool) -> dict[str, Any]:
+    return {
+        "id": lecture.id,
+        "name": lecture.name,
+        "is_demo": lecture.is_demo,
+        "is_archived": bool(lecture.is_archived),
+        "is_saved": is_saved,
+        "pptx_path": lecture.pptx_path,
+        "pdf_url": _lecture_file_urls(lecture)["pdf_url"],
+        "created_at": lecture.created_at.isoformat(),
+    }
+
+
+async def _saved_lecture_ids_for_user(
+    db: AsyncSession,
+    user_id: str,
+    lecture_ids: list[int],
+) -> set[int]:
+    if not lecture_ids:
+        return set()
+    result = await db.execute(
+        select(LectureSave.lecture_id).where(
+            LectureSave.user_id == user_id,
+            LectureSave.lecture_id.in_(lecture_ids),
+        )
+    )
+    return {int(lecture_id) for lecture_id in result.scalars().all()}
+
+
+async def _is_lecture_saved_for_user(db: AsyncSession, user_id: str, lecture_id: int) -> bool:
+    result = await db.execute(
+        select(LectureSave.id).where(
+            LectureSave.user_id == user_id,
+            LectureSave.lecture_id == lecture_id,
+        )
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def save_lecture_for_user(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    lecture_id: int,
+    commit: bool = True,
+) -> None:
+    if await _is_lecture_saved_for_user(db, user_id, lecture_id):
+        return
+    db.add(LectureSave(user_id=user_id, lecture_id=lecture_id))
+    if commit:
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+
+
+async def unsave_lecture_for_user(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    lecture_id: int,
+) -> None:
+    await db.execute(
+        delete(LectureSave).where(
+            LectureSave.user_id == user_id,
+            LectureSave.lecture_id == lecture_id,
+        )
+    )
+    await db.commit()
 
 
 def _archive_response_payload(lecture: Lecture) -> dict[str, Any]:
@@ -861,6 +951,7 @@ async def _run_process_job(
     lecture_name: str,
     pptx_path: Path,
     saved_pdf_path: Path,
+    user_id: str,
 ) -> None:
     loop = asyncio.get_running_loop()
     last_stage: str | None = None
@@ -935,6 +1026,7 @@ async def _run_process_job(
                 pptx_path=str(pptx_path.relative_to(BACKEND_DIR)),
                 pdf_path=str(saved_pdf_path.relative_to(BACKEND_DIR)),
                 is_demo=False,
+                saved_user_id=user_id,
             )
 
         await _update_upload_job(
@@ -976,6 +1068,7 @@ async def save_lecture_to_db(
     pptx_path: str | None,
     pdf_path: str | None = None,
     is_demo: bool = False,
+    saved_user_id: str | None = None,
 ) -> int:
     sanitized_enhanced = _sanitize_enhanced_entries(slides, transcript, alignment, enhanced)
 
@@ -1021,6 +1114,9 @@ async def save_lecture_to_db(
         )
         for slide_num, e in enhanced_by_slide.items()
     ])
+
+    if saved_user_id:
+        db.add(LectureSave(user_id=saved_user_id, lecture_id=lecture.id))
 
     await db.commit()
     return lecture.id
@@ -1145,6 +1241,7 @@ async def start_process_job(
     kind: str = Form("lecture"),
     lecture: str = Form(...),
     year: str = Form(...),
+    user_id: str = Depends(get_current_user_id),
 ):
     await _cleanup_expired_upload_jobs()
     active_job = await _get_active_upload_job()
@@ -1202,6 +1299,7 @@ async def start_process_job(
             lecture_name=lecture_name,
             pptx_path=pptx_path,
             saved_pdf_path=saved_pdf_path,
+            user_id=user_id,
         )
     )
 
@@ -1301,6 +1399,7 @@ async def process(
     lecture: str = Form(...),
     year: str = Form(...),
     db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
 ):
     lecture_name, pptx_path, saved_pdf_path = _resolve_upload_naming(courseid, kind, lecture, year)
 
@@ -1333,36 +1432,50 @@ async def process(
         pptx_path=str(pptx_path.relative_to(BACKEND_DIR)),
         pdf_path=str(saved_pdf_path.relative_to(BACKEND_DIR)),
         is_demo=False,
+        saved_user_id=user_id,
     )
 
     return {
         **result,
         "lecture_id": lecture_id,
         "is_archived": False,
+        "is_saved": True,
         "pdf_url": f"/pdf/{saved_pdf_path.name}",
     }
 
 
 @app.get("/lectures", dependencies=[Depends(_require_api_key)])
-async def list_lectures(db: AsyncSession = Depends(get_db)):
+async def list_lectures(
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
     result = await db.execute(select(Lecture).order_by(Lecture.created_at.desc()))
     lectures = result.scalars().all()
-    return [
-        {
-            "id": lec.id,
-            "name": lec.name,
-            "is_demo": lec.is_demo,
-            "is_archived": bool(lec.is_archived),
-            "pptx_path": lec.pptx_path,
-            "pdf_url": _lecture_file_urls(lec)["pdf_url"],
-            "created_at": lec.created_at.isoformat(),
-        }
-        for lec in lectures
-    ]
+    saved_ids = await _saved_lecture_ids_for_user(db, user_id, [int(lecture.id) for lecture in lectures])
+    return [_lecture_summary_payload(lecture, is_saved=lecture.id in saved_ids) for lecture in lectures]
+
+
+@app.get("/lectures/my", dependencies=[Depends(_require_api_key)])
+async def list_my_lectures(
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    result = await db.execute(
+        select(Lecture)
+        .join(LectureSave, LectureSave.lecture_id == Lecture.id)
+        .where(LectureSave.user_id == user_id)
+        .order_by(LectureSave.created_at.desc(), Lecture.created_at.desc())
+    )
+    lectures = result.scalars().all()
+    return [_lecture_summary_payload(lecture, is_saved=True) for lecture in lectures]
 
 
 @app.get("/lectures/{lecture_id}", dependencies=[Depends(_require_api_key)])
-async def get_lecture(lecture_id: int, db: AsyncSession = Depends(get_db)):
+async def get_lecture(
+    lecture_id: int,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
     result = await db.execute(select(Lecture).where(Lecture.id == lecture_id))
     lecture = result.scalar_one_or_none()
     if not lecture:
@@ -1374,8 +1487,39 @@ async def get_lecture(lecture_id: int, db: AsyncSession = Depends(get_db)):
         "lecture_id": lecture.id,
         "name": lecture.name,
         "is_archived": bool(lecture.is_archived),
+        "is_saved": await _is_lecture_saved_for_user(db, user_id, lecture_id),
         **_lecture_file_urls(lecture),
     }
+
+
+@app.put("/lectures/{lecture_id}/save", dependencies=[Depends(_require_api_key)])
+async def save_lecture(
+    lecture_id: int,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    result = await db.execute(select(Lecture).where(Lecture.id == lecture_id))
+    lecture = result.scalar_one_or_none()
+    if not lecture:
+        raise HTTPException(status_code=404, detail="Lecture not found")
+
+    await save_lecture_for_user(db, user_id=user_id, lecture_id=lecture_id)
+    return _lecture_summary_payload(lecture, is_saved=True)
+
+
+@app.delete("/lectures/{lecture_id}/save", dependencies=[Depends(_require_api_key)])
+async def unsave_lecture(
+    lecture_id: int,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    result = await db.execute(select(Lecture).where(Lecture.id == lecture_id))
+    lecture = result.scalar_one_or_none()
+    if not lecture:
+        raise HTTPException(status_code=404, detail="Lecture not found")
+
+    await unsave_lecture_for_user(db, user_id=user_id, lecture_id=lecture_id)
+    return _lecture_summary_payload(lecture, is_saved=False)
 
 
 @app.post("/lectures/{lecture_id}/archive", dependencies=[Depends(_require_api_key)])
