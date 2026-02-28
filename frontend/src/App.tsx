@@ -3,6 +3,7 @@ import { Navigate, Route, Routes, useLocation, useMatch, useNavigate } from "rea
 import {
   ApiError,
   archiveLecture,
+  buildAssetUrl,
   checkHealth,
   getLectures,
   getLecture,
@@ -20,7 +21,7 @@ import SlideViewer from "./components/SlideViewer";
 import TranscriptPanel from "./components/TranscriptPanel";
 import Sidebar from "./components/Sidebar";
 import ErrorBoundary from "./components/ErrorBoundary";
-import ProcessChat, { type ProcessChatEntry } from "./components/ProcessChat";
+import { type ProcessChatEntry } from "./components/ProcessChat";
 import Homepage from "./components/Homepage";
 import AllLecturesPlaceholder from "./components/AllLecturesPlaceholder";
 import {
@@ -33,7 +34,6 @@ import {
   type UploadProcessJobStatus,
 } from "./types";
 
-const BACKEND_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
 const REGENERATE_NOTES_AVAILABLE = (() => {
   const value = import.meta.env.VITE_ENABLE_REGENERATE_NOTES;
   if (typeof value !== "string") return false;
@@ -43,11 +43,11 @@ const ACTIVE_PROCESS_JOB_STORAGE_KEY = "lecture-summary.active-process-job-id";
 const DEMO_MODE_STORAGE_KEY = "lectureSummary.demoMode";
 const DEMO_LECTURE_QUERY = "F2VT26";
 const DEMO_REGEN_STEP_MS = 650;
-const DEMO_UPLOAD_STAGES: Array<{ label: string; delayMs: number }> = [
-  { label: "Validating files...", delayMs: 450 },
-  { label: "Parsing PDF...", delayMs: 900 },
-  { label: "Transcribing...", delayMs: 1400 },
-  { label: "Generating notes...", delayMs: 1100 },
+const DEMO_UPLOAD_STAGES: Array<{ label: string; stage: string; delayMs: number }> = [
+  { label: "Validating files...", stage: "parse_slides", delayMs: 450 },
+  { label: "Parsing PDF...", stage: "parse_slides", delayMs: 900 },
+  { label: "Transcribing...", stage: "transcribe", delayMs: 1400 },
+  { label: "Generating notes...", stage: "enrich", delayMs: 1100 },
 ];
 
 type LectureData = ProcessResult & { name?: string; lecture_id?: number };
@@ -61,12 +61,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     window.setTimeout(resolve, ms);
   });
-}
-
-function withBackendUrl(path?: string | null): string | undefined {
-  if (!path) return undefined;
-  if (path.startsWith("http://") || path.startsWith("https://")) return path;
-  return `${BACKEND_BASE}${path}`;
 }
 
 function formatProcessStage(stage: string): string {
@@ -87,6 +81,7 @@ export default function App() {
   const [archivePending, setArchivePending] = useState(false);
   const [archiveBanner, setArchiveBanner] = useState<{ kind: "success" | "error"; text: string } | null>(null);
   const [uploadLoadingLabel, setUploadLoadingLabel] = useState("");
+  const [processingLectureName, setProcessingLectureName] = useState<string | null>(null);
   const [demoSourceData, setDemoSourceData] = useState<(ProcessResult & { name: string; lecture_id: number }) | null>(null);
   const [demoMode, setDemoMode] = useState<boolean>(() => {
     if (typeof window === "undefined") return false;
@@ -171,6 +166,7 @@ export default function App() {
     setProcessChat([]);
     processLastEventIdRef.current = 0;
     setUploadLoadingLabel("");
+    setProcessingLectureName(null);
     if (clearPersisted) {
       window.localStorage.removeItem(ACTIVE_PROCESS_JOB_STORAGE_KEY);
     }
@@ -403,13 +399,56 @@ export default function App() {
     resetRegenerationUi();
     resetProcessUi(true);
     setSelectedId(null);
+    setProcessingLectureName(`${DEMO_LECTURE_QUERY} - Demo (2026)`);
     setMainView({ view: "upload", loading: true });
 
     try {
+      // Simulate progress through stages with increasing percentages
+      const stageProgressMap: Record<string, { start: number; end: number }> = {
+        "Validating files...": { start: 0, end: 10 },
+        "Parsing PDF...": { start: 10, end: 35 },
+        "Transcribing...": { start: 35, end: 75 },
+        "Generating notes...": { start: 75, end: 100 },
+      };
+
       for (const stage of DEMO_UPLOAD_STAGES) {
         if (demoRunRef.current !== runId) return;
-        setUploadLoadingLabel(stage.label);
-        await sleep(stage.delayMs);
+
+        const progressRange = stageProgressMap[stage.label];
+        const startProgress = progressRange?.start ?? 0;
+        const endProgress = progressRange?.end ?? 100;
+        const stepSize = (endProgress - startProgress) / Math.max(1, Math.ceil(stage.delayMs / 100));
+
+        // Animate progress during this stage
+        for (let progress = startProgress; progress <= endProgress; progress += stepSize) {
+          if (demoRunRef.current !== runId) return;
+          const currentProgress = Math.min(Math.round(progress), 100);
+          setProcessJob({
+            job_id: `demo-${Date.now()}`,
+            status: "running",
+            current_stage: stage.stage,
+            progress_pct: currentProgress,
+            lecture_id: null,
+            error: null,
+            updated_at: new Date().toISOString(),
+          });
+          setUploadLoadingLabel(`Processing: ${formatProcessStage(stage.stage)} (${currentProgress}%)`);
+          await sleep(100);
+        }
+
+        // Ensure we reach the end percentage
+        if (demoRunRef.current === runId) {
+          setProcessJob({
+            job_id: `demo-${Date.now()}`,
+            status: "running",
+            current_stage: stage.stage,
+            progress_pct: endProgress,
+            lecture_id: null,
+            error: null,
+            updated_at: new Date().toISOString(),
+          });
+          setUploadLoadingLabel(`Processing: ${formatProcessStage(stage.stage)} (${endProgress}%)`);
+        }
       }
 
       if (demoRunRef.current !== runId) return;
@@ -454,6 +493,7 @@ export default function App() {
     } finally {
       if (demoRunRef.current === runId) {
         setUploadLoadingLabel("");
+        setProcessJob(null);
         setMainView((prev) => (prev.view === "upload" ? { ...prev, loading: false } : prev));
       }
     }
@@ -484,6 +524,7 @@ export default function App() {
     setProcessChat([]);
     processLastEventIdRef.current = 0;
     setUploadLoadingLabel("");
+    setProcessingLectureName(`${naming.courseid} - ${naming.lecture} (${naming.year})`);
     setMainView({ view: "upload", loading: true });
     try {
       const job = await startProcessJob(pdf, audio, naming);
@@ -824,6 +865,12 @@ export default function App() {
     return `Regenerating notes: Slide ${position} of ${total}`;
   }, [regenJob, regeneratingNotes]);
 
+  const isWorkspaceRoute = location.pathname === "/workspace" || location.pathname.startsWith("/lectures/");
+  const isUploadActive = processJob?.status === "queued" || processJob?.status === "running";
+  const hasUploadLabel = uploadLoadingLabel.trim().length > 0;
+  const hasUploadEntries = processChat.length > 0;
+  const showUploadErrorLogs = isWorkspaceRoute && processJob?.status === "error" && hasUploadEntries;
+  const showSidebarUploadConsole = isUploadActive || hasUploadLabel || showUploadErrorLogs;
   const showBackendOfflineBanner = backendOnline === false && !(demoMode && demoSourceData);
   const workspaceContent = (
     <>
@@ -848,11 +895,9 @@ export default function App() {
             loading={mainView.loading}
             demoMode={demoMode}
             onRunDemo={handleRunDemo}
-            loadingLabel={uploadLoadingLabel}
+            progressPct={processJob?.progress_pct ?? null}
+            progressLabel={uploadLoadingLabel}
           />
-          {(processJob || processChat.length > 0) && (
-            <ProcessChat entries={processChat} job={processJob} />
-          )}
           {mainView.error && (
             <div className="banner error">{mainView.error}</div>
           )}
@@ -862,8 +907,8 @@ export default function App() {
       {mainView.view === "results" && activeSlideComputed && (() => {
         const { data, activeSlide, segments } = activeSlideComputed;
         const lectureId = mainView.lectureId ?? data.lecture_id;
-        const downloadHref = withBackendUrl(data.download_url);
-        const pdfUrl = withBackendUrl(data.pdf_url);
+        const downloadHref = buildAssetUrl(data.download_url);
+        const pdfUrl = buildAssetUrl(data.pdf_url);
 
         return (
           <div className="results">
@@ -949,6 +994,11 @@ export default function App() {
         demoMode={demoMode}
         onToggleDemo={handleToggleDemo}
         onRunDemo={handleRunDemo}
+        showUploadConsole={showSidebarUploadConsole}
+        uploadLoadingLabel={uploadLoadingLabel}
+        processJob={processJob}
+        processChat={processChat}
+        processingLectureName={processingLectureName}
       />
 
       <main className="main-content">

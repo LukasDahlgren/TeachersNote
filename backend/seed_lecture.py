@@ -8,9 +8,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from db import get_db, init_db
 from models import Alignment, EnrichedSlide, Lecture, Slide, TranscriptSegment
-from pipeline import normalize_enriched_payload
+from scripts.enrich import normalize_enriched_payload
 
 OUT = Path(__file__).parent.parent / "out"
 

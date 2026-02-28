@@ -126,19 +126,17 @@ def _extract_prefixed_bullets(text: str) -> list[str]:
         return []
 
     items: list[str] = []
-    has_prefixed_bullets = False
     for line in lines:
         match = BULLET_PREFIX_RE.match(line)
         if match:
-            has_prefixed_bullets = True
             item = line[match.end():].strip()
             if item:
                 items.append(item)
             continue
-        if has_prefixed_bullets and items:
+        if items:
             items[-1] = f"{items[-1]} {line}".strip()
 
-    return items if has_prefixed_bullets else []
+    return items
 
 
 def _split_text_to_bullets(text: str) -> list[str]:
@@ -383,7 +381,7 @@ def enrich(slides_path: str, aligned_path: str, transcript_path: str, output_pat
     try:
         with open(output_path, encoding="utf-8") as f:
             existing = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
         existing = []
 
     already_done = {e["slide"] for e in existing}

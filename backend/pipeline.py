@@ -2,7 +2,6 @@ import json
 import subprocess
 import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable
 
@@ -18,24 +17,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from scripts.parse_slides import parse_slides
 from scripts.align import build_prompt, parse_response
 from scripts.enrich import (
-    build_fallback_enrichment as _build_fallback_enrichment,
+    build_fallback_enrichment,
     enrich_slide_with_retry,
-    is_enriched_payload_invalid as _is_enriched_payload_invalid,
-    normalize_enriched_payload as _normalize_enriched_payload,
+    is_enriched_payload_invalid,
+    normalize_enriched_payload,
 )
 from scripts.generate_presentation import generate as generate_pptx
-
-
-def normalize_enriched_payload(payload: dict) -> dict:
-    return _normalize_enriched_payload(payload)
-
-
-def is_enriched_payload_invalid(payload: dict | None) -> bool:
-    return _is_enriched_payload_invalid(payload)
-
-
-def build_fallback_enrichment(slide: dict, transcript_text: str) -> dict:
-    return _build_fallback_enrichment(slide, transcript_text)
 
 
 def enrich_slide_notes(slide: dict, transcript_text: str, max_attempts: int = 5) -> dict:
@@ -170,10 +157,8 @@ def enrich(
             **enriched,
         }
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        results = list(pool.map(enrich_one, alignment))
-
-    results = sorted(results, key=lambda x: x["slide"])
+    results = [enrich_one(a) for a in alignment]
+    results.sort(key=lambda x: x["slide"])
     print(f"✅ Enrichment done", flush=True)
     _emit_progress(emit, "enrich", "Slide enrichment complete.", 90)
     return results
@@ -202,7 +187,7 @@ def run_pipeline(
     # Step 3: Align
     alignment = align(slides, transcript, emit=emit)
 
-    # Step 4: Enrich (parallel API calls)
+    # Step 4: Enrich
     enhanced = enrich(slides, transcript, alignment, emit=emit)
 
     # Step 5: Generate PPTX

@@ -49,6 +49,23 @@ async function apiFetch(path: string, init: RequestInit = {}): Promise<Response>
   });
 }
 
+export function buildAssetUrl(path?: string | null): string | undefined {
+  if (!path) return undefined;
+
+  const target = path.startsWith("http://") || path.startsWith("https://")
+    ? path
+    : `${BASE}${path}`;
+  if (!API_KEY) return target;
+
+  try {
+    const url = new URL(target, BASE);
+    url.searchParams.set("token", API_KEY);
+    return url.toString();
+  } catch {
+    return target;
+  }
+}
+
 export class ApiError extends Error {
   status: number;
   data: unknown;
@@ -130,13 +147,13 @@ export async function getLecture(id: number): Promise<LectureDetail> {
 }
 
 export async function archiveLecture(id: number): Promise<ArchiveLectureResponse> {
-  const res = await apiFetch(`/lectures/${id}/archive`, { method: "POST" });
+  const res = await apiFetch(`/lectures/${id}/archive?archive=true`, { method: "POST" });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
 export async function unarchiveLecture(id: number): Promise<ArchiveLectureResponse> {
-  const res = await apiFetch(`/lectures/${id}/unarchive`, { method: "POST" });
+  const res = await apiFetch(`/lectures/${id}/archive?archive=false`, { method: "POST" });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }

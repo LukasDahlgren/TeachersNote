@@ -6,7 +6,8 @@ interface Props {
   loading: boolean;
   demoMode: boolean;
   onRunDemo: () => void;
-  loadingLabel?: string;
+  progressPct?: number | null;
+  progressLabel?: string;
 }
 
 function formatBytes(bytes: number): string {
@@ -120,7 +121,7 @@ function DropZone({
   );
 }
 
-export default function UploadForm({ onSubmit, loading, demoMode, onRunDemo, loadingLabel }: Props) {
+export default function UploadForm({ onSubmit, loading, demoMode, onRunDemo, progressPct, progressLabel }: Props) {
   const [pdfFile, setPdfFile] = useState<File | null>(null);
   const [audioFile, setAudioFile] = useState<File | null>(null);
   const [courseid, setCourseid] = useState("");
@@ -133,27 +134,35 @@ export default function UploadForm({ onSubmit, loading, demoMode, onRunDemo, loa
   const pdfInputRef = useRef<HTMLInputElement>(null);
   const audioInputRef = useRef<HTMLInputElement>(null);
 
-  function handlePdfDrop(e: React.DragEvent) {
-    e.preventDefault();
-    setPdfDragOver(false);
-    const file = e.dataTransfer.files[0];
-    if (!file) return;
-    if (file.type !== "application/pdf" && !file.name.endsWith(".pdf")) {
-      setError("Please drop a PDF file for slides."); return;
-    }
-    setError(""); setPdfFile(file);
+  function makeDropHandler(
+    mimeCheck: (file: File) => boolean,
+    setFile: (file: File) => void,
+    setDragOver: (over: boolean) => void,
+    errorMsg: string,
+  ) {
+    return (e: React.DragEvent) => {
+      e.preventDefault();
+      setDragOver(false);
+      const file = e.dataTransfer.files[0];
+      if (!file) return;
+      if (!mimeCheck(file)) { setError(errorMsg); return; }
+      setError(""); setFile(file);
+    };
   }
 
-  function handleAudioDrop(e: React.DragEvent) {
-    e.preventDefault();
-    setAudioDragOver(false);
-    const file = e.dataTransfer.files[0];
-    if (!file) return;
-    if (!AUDIO_EXTENSIONS.test(file.name)) {
-      setError("Please drop an audio or video file (.mp4, .mov, .webm, .wav, .m4a, .mp3)."); return;
-    }
-    setError(""); setAudioFile(file);
-  }
+  const handlePdfDrop = makeDropHandler(
+    (f) => f.type === "application/pdf" || f.name.endsWith(".pdf"),
+    setPdfFile,
+    setPdfDragOver,
+    "Please drop a PDF file for slides.",
+  );
+
+  const handleAudioDrop = makeDropHandler(
+    (f) => AUDIO_EXTENSIONS.test(f.name),
+    setAudioFile,
+    setAudioDragOver,
+    "Please drop an audio or video file (.mp4, .mov, .webm, .wav, .m4a, .mp3).",
+  );
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -321,8 +330,19 @@ export default function UploadForm({ onSubmit, loading, demoMode, onRunDemo, loa
           </button>
         )}
       </div>
-      {loading && loadingLabel && (
-        <p className="loading-label">{loadingLabel}</p>
+
+      {loading && (
+        <div className="upload-progress">
+          <div className="upload-progress-bar">
+            <div
+              className="upload-progress-fill"
+              style={{ width: `${progressPct ?? 0}%` }}
+            />
+          </div>
+          {progressLabel && (
+            <span className="upload-progress-label">{progressLabel}</span>
+          )}
+        </div>
       )}
     </form>
   );

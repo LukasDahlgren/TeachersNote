@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { Document, Page } from "react-pdf";
+import { buildAssetUrl } from "../api";
 import type { LectureSummary } from "../types";
 import { ensurePdfWorker } from "../pdfWorker";
 
@@ -12,14 +13,6 @@ interface HomepageProps {
 interface LectureNameParts {
   courseId: string;
   lectureLabel: string;
-}
-
-const BACKEND_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
-
-function withBackendUrl(path?: string | null): string | undefined {
-  if (!path) return undefined;
-  if (path.startsWith("http://") || path.startsWith("https://")) return path;
-  return `${BACKEND_BASE}${path}`;
 }
 
 function stripExtension(value: string): string {
@@ -115,7 +108,7 @@ export default function Homepage({
           <div className="homepage-carousel" role="list">
             {filteredLectures.map((lecture) => {
               const { courseId, lectureLabel } = splitLectureName(lecture.name);
-              const pdfUrl = withBackendUrl(lecture.pdf_url);
+              const pdfUrl = buildAssetUrl(lecture.pdf_url);
 
               return (
                 <button

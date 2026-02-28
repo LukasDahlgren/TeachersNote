@@ -15,7 +15,8 @@ from sqlalchemy import select
 
 from db import AsyncSessionLocal, init_db
 from models import EnrichedSlide, Lecture
-from pipeline import generate_presentation_from_enhanced, normalize_enriched_payload
+from pipeline import generate_presentation_from_enhanced
+from scripts.enrich import normalize_enriched_payload
 
 BACKEND_DIR = Path(__file__).parent.resolve()
 

@@ -1,6 +1,12 @@
 import { useEffect, useRef } from "react";
 import type { UploadProcessJobStatus } from "../types";
 
+const PIPELINE_STAGES = ["parse_slides", "transcribe", "align", "enrich", "generate_pptx"] as const;
+
+function formatStage(stage: string): string {
+  return stage.replace(/_/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
 export interface ProcessChatEntry {
   eventId: number;
   type: "progress" | "log" | "done" | "error";
@@ -13,6 +19,9 @@ export interface ProcessChatEntry {
 interface Props {
   entries: ProcessChatEntry[];
   job: UploadProcessJobStatus | null;
+  variant?: "default" | "sidebar";
+  statusLabel?: string;
+  lectureName?: string | null;
 }
 
 function formatTimestamp(iso: string): string {
@@ -23,35 +32,49 @@ function formatTimestamp(iso: string): string {
   }
 }
 
-export default function ProcessChat({ entries, job }: Props) {
+export default function ProcessChat({ entries, job, variant = "default", statusLabel, lectureName }: Props) {
   const endRef = useRef<HTMLDivElement>(null);
+  const emptyMessage = statusLabel?.trim() || "Waiting for backend progress updates...";
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [entries]);
 
   return (
-    <section className="process-chat" aria-live="polite">
+    <section className={`process-chat${variant === "sidebar" ? " process-chat--sidebar" : ""}`} aria-live="polite">
       <div className="process-chat-header">
-        <span className="process-chat-title">Processing status</span>
-        <span className="process-chat-progress">{job?.progress_pct ?? 0}%</span>
+        <div className="process-chat-title-group">
+          {lectureName && <span className="process-chat-title">{lectureName}</span>}
+          <span className="process-chat-subtitle">
+            {job?.current_stage
+              ? (() => {
+                  const stepIndex = PIPELINE_STAGES.indexOf(job.current_stage as any);
+                  const stepLabel = stepIndex >= 0 ? `${stepIndex + 1}/${PIPELINE_STAGES.length}` : "";
+                  return `${formatStage(job.current_stage)}${stepLabel ? ` — ${stepLabel}` : ""} · ${job.progress_pct ?? 0}%`;
+                })()
+              : "Waiting..."
+            }
+          </span>
+        </div>
       </div>
-      <div className="process-chat-feed">
-        {entries.length === 0 ? (
-          <p className="process-chat-empty">Waiting for backend progress updates...</p>
-        ) : (
-          entries.map((entry) => (
-            <article key={entry.eventId} className={`process-chat-item process-chat-item--${entry.type}`}>
-              <div className="process-chat-meta">
-                <span>{entry.stage}</span>
-                <span>{formatTimestamp(entry.updatedAt)}</span>
-              </div>
-              <p className="process-chat-message">{entry.message}</p>
-            </article>
-          ))
-        )}
-        <div ref={endRef} />
-      </div>
+      {variant !== "sidebar" && (
+        <div className="process-chat-feed">
+          {entries.length === 0 ? (
+            <p className="process-chat-empty">{emptyMessage}</p>
+          ) : (
+            entries.map((entry) => (
+              <article key={entry.eventId} className={`process-chat-item process-chat-item--${entry.type}`}>
+                <div className="process-chat-meta">
+                  <span>{entry.stage}</span>
+                  <span>{formatTimestamp(entry.updatedAt)}</span>
+                </div>
+                <p className="process-chat-message">{entry.message}</p>
+              </article>
+            ))
+          )}
+          <div ref={endRef} />
+        </div>
+      )}
     </section>
   );
 }

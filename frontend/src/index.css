@@ -48,6 +48,10 @@ body { margin: 0; }
   padding: 0.75rem 0.75rem 0.5rem;
 }
 
+.sidebar-upload-console {
+  padding: 0 0.75rem 0.5rem;
+}
+
 .sidebar-new-btn {
   width: 100%;
   height: 36px;
@@ -166,7 +170,7 @@ body { margin: 0; }
   margin-bottom: 1px;
   border-left: 3px solid transparent;
 }
-.lecture-card:hover { background: #f3f4f6; color: #111827; }
+.lecture-card:hover:not(:disabled) { background: #f3f4f6; color: #111827; }
 .lecture-card.active {
   background: #f3f4f6;
   border-left-color: #d1d5db;
@@ -563,6 +567,13 @@ body { margin: 0; }
   overflow: hidden;
 }
 
+.process-chat--sidebar {
+  max-width: none;
+  margin: 0;
+  border-radius: 8px;
+  box-shadow: none;
+}
+
 .process-chat-header {
   display: flex;
   align-items: center;
@@ -573,6 +584,12 @@ body { margin: 0; }
   background: #fafafa;
 }
 
+.process-chat-title-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
 .process-chat-title {
   font-size: 0.8125rem;
   font-weight: 700;
@@ -581,10 +598,38 @@ body { margin: 0; }
   letter-spacing: 0.06em;
 }
 
+.process-chat-subtitle {
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: #6b7280;
+}
+
 .process-chat-progress {
   font-size: 0.8125rem;
   font-weight: 600;
   color: #1d4ed8;
+}
+
+.process-chat-latest-log {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid #f3f4f6;
+  background: #fff;
+}
+
+.process-chat-latest-log-label {
+  display: block;
+  font-size: 0.625rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 700;
+  color: #6b7280;
+}
+
+.process-chat-latest-log-text {
+  margin: 0.15rem 0 0;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  color: #1f2937;
 }
 
 .process-chat-feed {
@@ -594,6 +639,27 @@ body { margin: 0; }
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+}
+
+.process-chat--sidebar .process-chat-header {
+  padding: 0.55rem 0.75rem;
+}
+
+.process-chat--sidebar .process-chat-feed {
+  max-height: 170px;
+  padding: 0.55rem 0.75rem;
+}
+
+.process-chat--sidebar .process-chat-item {
+  padding: 0.45rem 0.55rem;
+}
+
+.process-chat--sidebar .process-chat-meta {
+  font-size: 0.64rem;
+}
+
+.process-chat--sidebar .process-chat-message {
+  font-size: 0.78rem;
 }
 
 .process-chat-empty {
@@ -755,6 +821,32 @@ body { margin: 0; }
 
 .form-error { color: #dc2626; font-size: 0.8125rem; margin: 0.25rem 0 0.75rem; }
 
+.upload-progress {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.upload-progress-bar {
+  height: 6px;
+  background: #e5e7eb;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.upload-progress-fill {
+  height: 100%;
+  background: #3b82f6;
+  border-radius: 3px;
+  transition: width 0.4s ease;
+}
+
+.upload-progress-label {
+  font-size: 0.8rem;
+  color: #6b7280;
+}
+
 .submit-btn {
   width: 100%;
   height: 48px;
@@ -787,12 +879,6 @@ body { margin: 0; }
 }
 .submit-btn-secondary:hover:not(:disabled) {
   background: #f3f4f6;
-}
-.loading-label {
-  margin: 0.5rem 0 0;
-  font-size: 0.8rem;
-  color: #6b7280;
-  text-align: center;
 }
 
 .spinner--dark {
@@ -938,6 +1024,36 @@ button.secondary:hover:not(:disabled) { background: #f0f0f0; }
   background: #f0f0f0;
 }
 
+.slide-pdf--error {
+  flex-direction: column;
+  justify-content: flex-start;
+  align-items: stretch;
+  gap: 0.75rem;
+}
+
+.slide-pdf-error {
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #991b1b;
+  border-radius: 6px;
+  padding: 0.6rem 0.75rem;
+  font-size: 0.84rem;
+  line-height: 1.4;
+}
+
+.slide-pdf-error-text {
+  margin: 0;
+  padding: 1rem;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  font-size: 0.82rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: 'Courier New', Courier, monospace;
+}
+
 .slide-pdf canvas {
   max-width: 100%;
   height: auto !important;
@@ -1069,6 +1185,16 @@ button.secondary:hover:not(:disabled) { background: #f0f0f0; }
   line-height: 1.5;
 }
 
+/* ── Error boundary ── */
+.error-boundary-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  gap: 1rem;
+}
+
 @media (max-width: 900px) {
   .app-shell {
     flex-direction: column;
@@ -1081,6 +1207,10 @@ button.secondary:hover:not(:disabled) { background: #f0f0f0; }
     border-right: none;
     border-bottom: 1px solid #e5e7eb;
     max-height: 320px;
+  }
+
+  .sidebar.sidebar--with-upload-console {
+    max-height: 440px;
   }
 
   .main-content {

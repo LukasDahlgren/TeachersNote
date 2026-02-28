@@ -25,12 +25,14 @@ from db import AsyncSessionLocal, get_db, init_db
 from models import Alignment, EnrichedSlide, Lecture, LectureSave, Slide, TranscriptSegment
 from pipeline import (
     align,
-    build_fallback_enrichment,
     enrich_slide_notes,
     generate_presentation_from_enhanced,
+    run_pipeline,
+)
+from scripts.enrich import (
+    build_fallback_enrichment,
     is_enriched_payload_invalid,
     normalize_enriched_payload,
-    run_pipeline,
 )
 
 
@@ -126,6 +128,14 @@ def _resolve_user_id(header_value: str | None) -> str:
 
 def get_current_user_id(x_user_id: str | None = Header(default=None, alias="X-User-Id")) -> str:
     return _resolve_user_id(x_user_id)
+
+
+async def get_lecture_or_404(db: AsyncSession, lecture_id: int) -> Lecture:
+    result = await db.execute(select(Lecture).where(Lecture.id == lecture_id))
+    lecture = result.scalar_one_or_none()
+    if not lecture:
+        raise HTTPException(status_code=404, detail="Lecture not found")
+    return lecture
 
 
 def _join_text(parts: list[str]) -> str:
@@ -1213,7 +1223,7 @@ async def demo(db: AsyncSession = Depends(get_db)):
     return {"slides": slides, "transcript": transcript, "alignment": alignment, "enhanced": enhanced}
 
 
-@app.get("/pdf/{filename}", dependencies=[Depends(_require_api_key)])
+@app.get("/pdf/{filename}", dependencies=[Depends(_require_api_key_or_token)])
 def serve_pdf(filename: str):
     path = _resolve_generated_download_path(filename)
     if not path:
@@ -1221,7 +1231,7 @@ def serve_pdf(filename: str):
     return FileResponse(path, media_type="application/pdf")
 
 
-@app.get("/download/{filename}", dependencies=[Depends(_require_api_key)])
+@app.get("/download/{filename}", dependencies=[Depends(_require_api_key_or_token)])
 def download(filename: str):
     path = _resolve_generated_download_path(filename)
     if not path:
@@ -1476,10 +1486,7 @@ async def get_lecture(
     db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_id),
 ):
-    result = await db.execute(select(Lecture).where(Lecture.id == lecture_id))
-    lecture = result.scalar_one_or_none()
-    if not lecture:
-        raise HTTPException(status_code=404, detail="Lecture not found")
+    lecture = await get_lecture_or_404(db, lecture_id)
 
     data = await lecture_to_response(db, lecture_id)
     return {
@@ -1498,10 +1505,7 @@ async def save_lecture(
     db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_id),
 ):
-    result = await db.execute(select(Lecture).where(Lecture.id == lecture_id))
-    lecture = result.scalar_one_or_none()
-    if not lecture:
-        raise HTTPException(status_code=404, detail="Lecture not found")
+    lecture = await get_lecture_or_404(db, lecture_id)
 
     await save_lecture_for_user(db, user_id=user_id, lecture_id=lecture_id)
     return _lecture_summary_payload(lecture, is_saved=True)
@@ -1513,41 +1517,27 @@ async def unsave_lecture(
     db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_id),
 ):
-    result = await db.execute(select(Lecture).where(Lecture.id == lecture_id))
-    lecture = result.scalar_one_or_none()
-    if not lecture:
-        raise HTTPException(status_code=404, detail="Lecture not found")
+    lecture = await get_lecture_or_404(db, lecture_id)
 
     await unsave_lecture_for_user(db, user_id=user_id, lecture_id=lecture_id)
     return _lecture_summary_payload(lecture, is_saved=False)
 
 
 @app.post("/lectures/{lecture_id}/archive", dependencies=[Depends(_require_api_key)])
-async def archive_lecture(lecture_id: int, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Lecture).where(Lecture.id == lecture_id))
-    lecture = result.scalar_one_or_none()
-    if not lecture:
-        raise HTTPException(status_code=404, detail="Lecture not found")
-    return await _apply_archive_state(db, lecture, archive=True)
-
-
-@app.post("/lectures/{lecture_id}/unarchive", dependencies=[Depends(_require_api_key)])
-async def unarchive_lecture(lecture_id: int, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Lecture).where(Lecture.id == lecture_id))
-    lecture = result.scalar_one_or_none()
-    if not lecture:
-        raise HTTPException(status_code=404, detail="Lecture not found")
-    return await _apply_archive_state(db, lecture, archive=False)
+async def set_archive_state(
+    lecture_id: int,
+    archive: bool = Query(default=True),
+    db: AsyncSession = Depends(get_db),
+):
+    lecture = await get_lecture_or_404(db, lecture_id)
+    return await _apply_archive_state(db, lecture, archive=archive)
 
 
 @app.post("/lectures/{lecture_id}/regenerate-notes/jobs", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(_require_api_key)])
 async def start_regenerate_notes_job(lecture_id: int, db: AsyncSession = Depends(get_db)):
     await _cleanup_expired_jobs()
 
-    lecture_result = await db.execute(select(Lecture).where(Lecture.id == lecture_id))
-    lecture = lecture_result.scalar_one_or_none()
-    if not lecture:
-        raise HTTPException(status_code=404, detail="Lecture not found")
+    await get_lecture_or_404(db, lecture_id)
 
     active_job = await _get_active_job_for_lecture(lecture_id)
     if active_job:
@@ -1635,10 +1625,7 @@ async def stream_regenerate_notes_job(
 
 @app.post("/lectures/{lecture_id}/regenerate-notes", dependencies=[Depends(_require_api_key)])
 async def regenerate_notes(lecture_id: int, db: AsyncSession = Depends(get_db)):
-    lecture_result = await db.execute(select(Lecture).where(Lecture.id == lecture_id))
-    lecture = lecture_result.scalar_one_or_none()
-    if not lecture:
-        raise HTTPException(status_code=404, detail="Lecture not found")
+    await get_lecture_or_404(db, lecture_id)
 
     context = await _load_regeneration_context(db, lecture_id)
     targets = _build_regeneration_targets(context["align_rows"], context["enriched_by_slide"])

@@ -1,5 +1,6 @@
 import type { KeyboardEvent } from "react";
-import type { LectureSummary } from "../types";
+import ProcessChat, { type ProcessChatEntry } from "./ProcessChat";
+import type { LectureSummary, UploadProcessJobStatus } from "../types";
 
 interface SidebarProps {
   lectures: LectureSummary[];
@@ -11,6 +12,11 @@ interface SidebarProps {
   demoMode: boolean;
   onToggleDemo: () => void;
   onRunDemo: () => void;
+  showUploadConsole: boolean;
+  uploadLoadingLabel: string;
+  processJob: UploadProcessJobStatus | null;
+  processChat: ProcessChatEntry[];
+  processingLectureName?: string | null;
 }
 
 function formatDate(iso: string): string {
@@ -31,6 +37,11 @@ export default function Sidebar({
   demoMode,
   onToggleDemo,
   onRunDemo,
+  showUploadConsole,
+  uploadLoadingLabel,
+  processJob,
+  processChat,
+  processingLectureName,
 }: SidebarProps) {
   const activeLectures = lectures.filter((lecture) => !lecture.is_archived);
   const archivedLectures = lectures.filter((lecture) => lecture.is_archived);
@@ -58,7 +69,7 @@ export default function Sidebar({
   }
 
   return (
-    <aside className="sidebar">
+    <aside className={`sidebar${showUploadConsole ? " sidebar--with-upload-console" : ""}`}>
       <div
         className="sidebar-logo"
         role="button"
@@ -85,6 +96,18 @@ export default function Sidebar({
           </button>
         )}
       </div>
+
+      {showUploadConsole && (
+        <div className="sidebar-upload-console">
+          <ProcessChat
+            entries={processChat}
+            job={processJob}
+            variant="sidebar"
+            statusLabel={uploadLoadingLabel}
+            lectureName={processingLectureName}
+          />
+        </div>
+      )}
 
       <div className="sidebar-groups">
         <div className="sidebar-group sidebar-group--active">

@@ -13,7 +13,7 @@ export default class ErrorBoundary extends Component<Props, State> {
   render() {
     if (this.state.hasError) {
       return (
-        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100vh", gap: "1rem" }}>
+        <div className="error-boundary-container">
           <p>Something went wrong.</p>
           <button onClick={() => window.location.reload()}>Reload</button>
         </div>
