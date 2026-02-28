@@ -131,6 +131,7 @@ export default function UploadForm({ onSubmit, loading, demoMode, onRunDemo, pro
   const [pdfDragOver, setPdfDragOver] = useState(false);
   const [audioDragOver, setAudioDragOver] = useState(false);
   const [error, setError] = useState("");
+  const [showHowItWorks, setShowHowItWorks] = useState(false);
   const pdfInputRef = useRef<HTMLInputElement>(null);
   const audioInputRef = useRef<HTMLInputElement>(null);
 
@@ -204,6 +205,23 @@ export default function UploadForm({ onSubmit, loading, demoMode, onRunDemo, pro
           Demo Mode is on. Processing and regeneration are simulated without API-key calls.
         </div>
       )}
+
+      <div className="form-info-box">
+        <button
+          type="button"
+          className="form-info-box-header"
+          onClick={() => setShowHowItWorks(!showHowItWorks)}
+          aria-expanded={showHowItWorks}
+        >
+          <span className="form-info-box-title">How it works</span>
+          <span className={`form-info-box-icon ${showHowItWorks ? "expanded" : ""}`}>▼</span>
+        </button>
+        {showHowItWorks && (
+          <div className="form-info-box-content">
+            Upload your lecture slides (PDF) and recording. Our system extracts the slide content, transcribes the audio, and aligns each transcript segment to the corresponding slide. Then it generates rich notes and takeaways for each slide.
+          </div>
+        )}
+      </div>
 
       <div className="naming-fields">
         <div className="naming-field">
