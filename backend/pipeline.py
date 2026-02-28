@@ -25,8 +25,8 @@ from scripts.enrich import (
 from scripts.generate_presentation import generate as generate_pptx
 
 
-def enrich_slide_notes(slide: dict, transcript_text: str, max_attempts: int = 5) -> dict:
-    return enrich_slide_with_retry(client, slide, transcript_text, max_attempts=max_attempts)
+def enrich_slide_notes(slide: dict, transcript_text: str, max_attempts: int = 5, log_callback=None) -> dict:
+    return enrich_slide_with_retry(client, slide, transcript_text, max_attempts=max_attempts, log_callback=log_callback)
 
 
 def generate_presentation_from_enhanced(
@@ -136,7 +136,12 @@ def enrich(
             seg["text"].strip()
             for seg in transcript[a["start_segment"]: a["end_segment"] + 1]
         )
-        enriched = enrich_slide_notes(slide, text, max_attempts=5)
+
+        def slide_log(msg: str) -> None:
+            pct = 70 + int((done_count / total) * 20) if total > 0 else 90
+            _emit_progress(emit, "enrich", msg, pct)
+
+        enriched = enrich_slide_notes(slide, text, max_attempts=5, log_callback=slide_log)
         done_count += 1
         print(f"  ✅ Slide {a['slide']} done ({done_count}/{total})", flush=True)
         if total > 0:

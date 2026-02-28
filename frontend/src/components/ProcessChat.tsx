@@ -56,7 +56,7 @@ export default function ProcessChat({ entries, job, variant = "default", statusL
           <span className="process-chat-subtitle">
             {job?.current_stage
               ? (() => {
-                  const stepIndex = PIPELINE_STAGES.indexOf(job.current_stage as any);
+                  const stepIndex = (PIPELINE_STAGES as readonly string[]).indexOf(job.current_stage);
                   const stepLabel = stepIndex >= 0 ? `${stepIndex + 1}/${PIPELINE_STAGES.length}` : "";
                   return `${formatStage(job.current_stage)}${stepLabel ? ` — ${stepLabel}` : ""} · ${job.progress_pct ?? 0}%`;
                 })()

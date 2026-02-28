@@ -4,7 +4,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
+from typing import Any, Callable
 
 import anthropic
 
@@ -337,6 +337,7 @@ def enrich_slide_with_retry(
     slide: dict,
     transcript_text: str,
     max_attempts: int = 5,
+    log_callback: Callable[[str], None] | None = None,
 ) -> dict:
     last_error: Exception | None = None
     for attempt in range(max_attempts):
@@ -346,24 +347,27 @@ def enrich_slide_with_retry(
         except anthropic.RateLimitError as exc:
             last_error = exc
             wait = 60 * (attempt + 1)
-            print(f"  ⏳ Rate limited on slide {slide.get('slide', '?')}, waiting {wait}s...", flush=True)
+            msg = f"⏳ Rate limited on slide {slide.get('slide', '?')}, waiting {wait}s..."
+            print(f"  {msg}", flush=True)
+            if log_callback:
+                log_callback(msg)
             time.sleep(wait)
         except Exception as exc:
             last_error = exc
             if attempt < max_attempts - 1:
                 wait = min(8, attempt + 1)
-                print(
-                    f"  ⚠️  Invalid enrichment payload on slide {slide.get('slide', '?')} (attempt {attempt + 1}/{max_attempts}), retrying in {wait}s...",
-                    flush=True,
-                )
+                msg = f"⚠️ Invalid enrichment payload on slide {slide.get('slide', '?')} (attempt {attempt + 1}/{max_attempts}), retrying in {wait}s..."
+                print(f"  {msg}", flush=True)
+                if log_callback:
+                    log_callback(msg)
                 time.sleep(wait)
             else:
                 break
 
-    print(
-        f"  ⚠️  Falling back to deterministic notes for slide {slide.get('slide', '?')} after repeated errors: {last_error}",
-        flush=True,
-    )
+    msg = f"⚠️ Falling back to deterministic notes for slide {slide.get('slide', '?')} after repeated errors"
+    print(f"  {msg}: {last_error}", flush=True)
+    if log_callback:
+        log_callback(msg)
     return build_fallback_enrichment(slide, transcript_text)
 
 

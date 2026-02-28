@@ -50,20 +50,38 @@ export default function Homepage({
   onOpenLecture,
 }: HomepageProps) {
   const [searchQuery, setSearchQuery] = useState("");
+  const [selectedCourseId, setSelectedCourseId] = useState<string | null>(null);
 
   const activeLectures = useMemo(
     () => lectures.filter((lecture) => !lecture.is_archived),
     [lectures],
   );
 
+  const uniqueCourseIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const lecture of activeLectures) {
+      const { courseId } = splitLectureName(lecture.name);
+      if (courseId !== stripExtension(lecture.name).replace(/\s+/g, " ").trim()) {
+        ids.add(courseId);
+      }
+    }
+    return [...ids].sort();
+  }, [activeLectures]);
+
   const normalizedQuery = searchQuery.trim().toLowerCase();
 
   const filteredLectures = useMemo(() => {
-    if (!normalizedQuery) return activeLectures;
-    return activeLectures.filter((lecture) => (
-      lecture.name.toLowerCase().includes(normalizedQuery)
-    ));
-  }, [activeLectures, normalizedQuery]);
+    let result = activeLectures;
+    if (selectedCourseId) {
+      result = result.filter(
+        (lecture) => splitLectureName(lecture.name).courseId === selectedCourseId,
+      );
+    }
+    if (!normalizedQuery) return result;
+    return result.filter((lecture) =>
+      lecture.name.toLowerCase().includes(normalizedQuery),
+    );
+  }, [activeLectures, selectedCourseId, normalizedQuery]);
 
   const showNoSearchResults = !loading && activeLectures.length > 0 && filteredLectures.length === 0;
   const placeholderCards = [1, 2, 3, 4];
@@ -79,6 +97,22 @@ export default function Homepage({
           onChange={(event) => setSearchQuery(event.target.value)}
         />
       </div>
+
+      {uniqueCourseIds.length >= 1 && (
+        <div className="homepage-filter-chips" role="group" aria-label="Filter by course">
+          {uniqueCourseIds.map((id) => (
+            <button
+              key={id}
+              type="button"
+              className={`homepage-filter-chip${selectedCourseId === id ? " homepage-filter-chip--active" : ""}`}
+              onClick={() => setSelectedCourseId(selectedCourseId === id ? null : id)}
+              aria-pressed={selectedCourseId === id}
+            >
+              {id}
+            </button>
+          ))}
+        </div>
+      )}
 
       <section className="homepage-section">
         <div className="homepage-section-heading">

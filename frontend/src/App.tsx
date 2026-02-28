@@ -21,7 +21,7 @@ import SlideViewer from "./components/SlideViewer";
 import TranscriptPanel from "./components/TranscriptPanel";
 import Sidebar from "./components/Sidebar";
 import ErrorBoundary from "./components/ErrorBoundary";
-import { type ProcessChatEntry } from "./components/ProcessChat";
+import ProcessChat, { type ProcessChatEntry } from "./components/ProcessChat";
 import Homepage from "./components/Homepage";
 import AllLecturesPlaceholder from "./components/AllLecturesPlaceholder";
 import {
@@ -898,6 +898,13 @@ export default function App() {
             progressPct={processJob?.progress_pct ?? null}
             progressLabel={uploadLoadingLabel}
           />
+          {mainView.loading && processJob && (
+            <ProcessChat
+              entries={processChat}
+              job={processJob}
+              lectureName={processingLectureName}
+            />
+          )}
           {mainView.error && (
             <div className="banner error">{mainView.error}</div>
           )}

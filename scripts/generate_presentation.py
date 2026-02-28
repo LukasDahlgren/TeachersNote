@@ -6,31 +6,42 @@ from io import BytesIO
 
 import fitz  # pymupdf
 from pptx import Presentation
+from pptx.dml.color import RGBColor
+from pptx.oxml.ns import qn
 from pptx.util import Inches, Pt
 
 
 SLIDE_WIDTH = Inches(13.33)
 SLIDE_HEIGHT = Inches(7.5)
+IMAGE_PANEL_WIDTH = Inches(8.0)
+NOTES_PANEL_LEFT = Inches(8.0)
+NOTES_PANEL_WIDTH = Inches(5.33)
+NOTES_PAD = Inches(0.18)
+NOTES_BG = RGBColor(0xF5, 0xF7, 0xFA)
+HEADER_COLOR = RGBColor(0x0F, 0x4C, 0x81)
+BODY_COLOR = RGBColor(0x22, 0x29, 0x36)
 BULLET_PREFIX_RE = re.compile(r"^\s*(?:[-*•]\s+|\d+[.)]\s+)")
 
 
-def pdf_to_images(pdf_path: str, dpi: int = 150) -> list[bytes]:
-    """Render each PDF page to PNG bytes in parallel."""
+def pdf_to_images(pdf_path: str, dpi: int = 150) -> list[tuple[bytes, float]]:
+    """Render each PDF page to PNG bytes in parallel; return (png_bytes, aspect_ratio)."""
     doc = fitz.open(pdf_path)
     try:
         zoom = dpi / 72
         matrix = fitz.Matrix(zoom, zoom)
         page_count = len(doc)
 
-        def render_page(idx: int) -> tuple[int, bytes]:
-            pix = doc[idx].get_pixmap(matrix=matrix)
-            return idx, pix.tobytes("png")
+        def render_page(idx: int) -> tuple[int, bytes, float]:
+            page = doc[idx]
+            aspect = page.rect.width / page.rect.height
+            pix = page.get_pixmap(matrix=matrix)
+            return idx, pix.tobytes("png"), aspect
 
         with ThreadPoolExecutor() as pool:
             results = list(pool.map(render_page, range(page_count)))
     finally:
         doc.close()
-    return [img for _, img in sorted(results)]
+    return [(img, asp) for _, img, asp in sorted(results)]
 
 
 def _bulletize_text(text: str) -> list[str]:
@@ -85,6 +96,89 @@ def build_speaker_notes(entry: dict) -> str:
     return "\n".join(lines)
 
 
+def _place_image(slide, img_bytes: bytes, aspect: float) -> None:
+    """Place the PDF page image in the left panel, scaled to fit, vertically centred."""
+    max_w = IMAGE_PANEL_WIDTH
+    max_h = SLIDE_HEIGHT
+    if aspect > max_w / max_h:
+        pic_w = max_w
+        pic_h = int(max_w / aspect)
+    else:
+        pic_h = max_h
+        pic_w = int(max_h * aspect)
+    top = (max_h - pic_h) // 2
+    slide.shapes.add_picture(BytesIO(img_bytes), 0, top, pic_w, pic_h)
+
+
+def _add_notes_panel(slide, entry: dict) -> None:
+    """Add a light right-panel textbox with structured notes sections."""
+    txBox = slide.shapes.add_textbox(NOTES_PANEL_LEFT, Inches(0), NOTES_PANEL_WIDTH, SLIDE_HEIGHT)
+
+    txBox.fill.solid()
+    txBox.fill.fore_color.rgb = NOTES_BG
+
+    tf = txBox.text_frame
+    tf.word_wrap = True
+
+    # Inner padding via body properties
+    bodyPr = tf._txBody.find(qn("a:bodyPr"))
+    if bodyPr is not None:
+        pad_str = str(int(NOTES_PAD))
+        bodyPr.set("lIns", pad_str)
+        bodyPr.set("rIns", pad_str)
+        bodyPr.set("tIns", pad_str)
+        bodyPr.set("bIns", pad_str)
+
+    def _add_header(label: str, first: bool = False) -> None:
+        p = tf.paragraphs[0] if first else tf.add_paragraph()
+        p.space_before = Pt(0) if first else Pt(4)
+        p.space_after = Pt(1)
+        run = p.add_run()
+        run.text = label
+        run.font.bold = True
+        run.font.size = Pt(10)
+        run.font.color.rgb = HEADER_COLOR
+
+    def _add_body(text: str) -> None:
+        p = tf.add_paragraph()
+        p.space_before = Pt(0)
+        p.space_after = Pt(1)
+        run = p.add_run()
+        run.text = text
+        run.font.size = Pt(8.5)
+        run.font.color.rgb = BODY_COLOR
+
+    def _add_bullet(text: str) -> None:
+        p = tf.add_paragraph()
+        p.space_before = Pt(0)
+        p.space_after = Pt(1)
+        run = p.add_run()
+        run.text = f"• {text}"
+        run.font.size = Pt(8.5)
+        run.font.color.rgb = BODY_COLOR
+
+    # Section 1: SAMMANFATTNING
+    summary = entry.get("summary", "").strip()
+    _add_header("SAMMANFATTNING", first=True)
+    if summary:
+        _add_body(summary)
+
+    # Section 2: FÖRELÄSARENS TILLÄGG
+    la = entry.get("lecturer_additions", "")
+    bullets = _bulletize_text(la) if la else []
+    if bullets:
+        _add_header("FÖRELÄSARENS TILLÄGG")
+        for b in bullets:
+            _add_bullet(b)
+
+    # Section 3: KEY TAKEAWAYS
+    takeaways = entry.get("key_takeaways", [])
+    if takeaways:
+        _add_header("KEY TAKEAWAYS")
+        for t in takeaways:
+            _add_bullet(t)
+
+
 def generate(pdf_path: str, enhanced_path: str, output_path: str) -> None:
     with open(enhanced_path, encoding="utf-8") as f:
         enhanced = json.load(f)
@@ -100,24 +194,17 @@ def generate(pdf_path: str, enhanced_path: str, output_path: str) -> None:
 
     blank_layout = prs.slide_layouts[6]  # completely blank layout
 
-    for i, img_bytes in enumerate(images, start=1):
+    for i, (img_bytes, aspect) in enumerate(images, start=1):
         slide = prs.slides.add_slide(blank_layout)
 
-        # Fill the entire slide with the PDF page image (in-memory, no temp file)
-        slide.shapes.add_picture(
-            BytesIO(img_bytes),
-            left=Inches(0),
-            top=Inches(0),
-            width=SLIDE_WIDTH,
-            height=SLIDE_HEIGHT,
-        )
+        _place_image(slide, img_bytes, aspect)
 
-        # Add speaker notes
         entry = enhanced_by_slide.get(i)
         if entry:
+            _add_notes_panel(slide, entry)
+            # Also keep speaker notes for compatibility
             notes_text = build_speaker_notes(entry)
-            notes_slide = slide.notes_slide
-            tf = notes_slide.notes_text_frame
+            tf = slide.notes_slide.notes_text_frame
             tf.text = notes_text
             for para in tf.paragraphs:
                 for run in para.runs:
