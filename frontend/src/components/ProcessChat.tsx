@@ -4,11 +4,11 @@ import type { UploadProcessJobStatus } from "../types";
 const PIPELINE_STAGES = ["parse_slides", "transcribe", "align", "enrich", "generate_pptx"] as const;
 
 const STAGE_DISPLAY_NAMES: Record<string, string> = {
-  parse_slides: "parsing...",
-  transcribe: "transcribing...",
-  align: "aligning...",
-  enrich: "enriching...",
-  generate_pptx: "generating...",
+  parse_slides: "Parsing slides...",
+  transcribe: "Transcribing...",
+  align: "Aligning transcript...",
+  enrich: "Generating notes...",
+  generate_pptx: "Generating presentation...",
 };
 
 function formatStage(stage: string): string {
