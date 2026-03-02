@@ -1,5 +1,11 @@
-import { useRef, useState } from "react";
-import { type UploadLectureNamingInput, type UploadRecordingInput } from "../types";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { getProfileCourseOptions } from "../api";
+import {
+  type Course,
+  type ProfileCourseOptions,
+  type UploadLectureNamingInput,
+  type UploadRecordingInput,
+} from "../types";
 
 interface Props {
   onSubmit: (pdf: File, recording: UploadRecordingInput, naming: UploadLectureNamingInput) => void;
@@ -52,6 +58,26 @@ function FileSelectedIcon() {
 
 const AUDIO_EXTENSIONS = /\.(mp4|mov|webm|wav|m4a|mp3)$/i;
 const URL_RECORDING_ENABLED = false;
+
+interface ProgramCourseGroupOption {
+  programId: number;
+  programLabel: string;
+  courses: Course[];
+}
+
+function normalizeCourseCode(value: string): string {
+  return value.trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function dedupeCoursesByCode(courses: Course[]): Course[] {
+  const byCode = new Map<string, Course>();
+  for (const course of courses) {
+    const key = normalizeCourseCode(course.code);
+    if (!key || byCode.has(key)) continue;
+    byCode.set(key, course);
+  }
+  return [...byCode.values()].sort((a, b) => a.code.localeCompare(b.code, undefined, { sensitivity: "base" }));
+}
 
 interface DropZoneProps {
   label: string;
@@ -127,6 +153,11 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
   const [recordingSource, setRecordingSource] = useState<"file" | "url">("file");
   const [audioUrl, setAudioUrl] = useState("");
   const [courseid, setCourseid] = useState("");
+  const [isCoursePickerOpen, setIsCoursePickerOpen] = useState(false);
+  const [expandedProgramIds, setExpandedProgramIds] = useState<number[]>([]);
+  const [profileOptions, setProfileOptions] = useState<ProfileCourseOptions | null>(null);
+  const [courseOptionsLoading, setCourseOptionsLoading] = useState(true);
+  const [courseOptionsError, setCourseOptionsError] = useState("");
   const [kind, setKind] = useState("lecture");
   const [lecture, setLecture] = useState("");
   const [year, setYear] = useState("");
@@ -134,9 +165,140 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
   const [audioDragOver, setAudioDragOver] = useState(false);
   const [error, setError] = useState("");
   const [showHowItWorks, setShowHowItWorks] = useState(false);
+  const coursePickerRef = useRef<HTMLDivElement>(null);
   const pdfInputRef = useRef<HTMLInputElement>(null);
   const audioInputRef = useRef<HTMLInputElement>(null);
   const effectiveRecordingSource: "file" | "url" = URL_RECORDING_ENABLED ? recordingSource : "file";
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadCourseOptions() {
+      setCourseOptionsLoading(true);
+      setCourseOptionsError("");
+      try {
+        const nextOptions = await getProfileCourseOptions();
+        if (cancelled) return;
+        setProfileOptions(nextOptions);
+      } catch (err) {
+        if (cancelled) return;
+        setProfileOptions(null);
+        setCourseOptionsError(err instanceof Error ? err.message : "Failed to load course options.");
+      } finally {
+        if (!cancelled) {
+          setCourseOptionsLoading(false);
+        }
+      }
+    }
+
+    void loadCourseOptions();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const programCourseGroups = useMemo<ProgramCourseGroupOption[]>(() => {
+    const fromApi = profileOptions?.program_course_groups ?? [];
+    const allCourses = dedupeCoursesByCode(profileOptions?.all_courses ?? []);
+    if (fromApi.length > 0) {
+      const grouped: ProgramCourseGroupOption[] = [];
+      const groupedCodes = new Set<string>();
+      for (const group of fromApi) {
+        const courses = dedupeCoursesByCode(group.courses ?? []);
+        for (const course of courses) {
+          groupedCodes.add(normalizeCourseCode(course.code));
+        }
+        if (courses.length === 0) continue;
+        grouped.push({
+          programId: group.program.id,
+          programLabel: `${group.program.name} (${group.program.code})`,
+          courses,
+        });
+      }
+
+      const ungrouped = allCourses.filter((course) => !groupedCodes.has(normalizeCourseCode(course.code)));
+      if (ungrouped.length > 0) {
+        grouped.push({
+          programId: -1,
+          programLabel: "Other active courses",
+          courses: ungrouped,
+        });
+      }
+      return grouped;
+    }
+
+    if (allCourses.length === 0) {
+      return [];
+    }
+    return [
+      {
+        programId: -1,
+        programLabel: "All courses",
+        courses: allCourses,
+      },
+    ];
+  }, [profileOptions]);
+
+  useEffect(() => {
+    if (!courseid) return;
+    const exists = programCourseGroups.some((group) => group.courses.some((course) => course.code === courseid));
+    if (!exists) {
+      setCourseid("");
+    }
+  }, [courseid, programCourseGroups]);
+
+  const selectedCourse = useMemo(() => {
+    for (const group of programCourseGroups) {
+      const match = group.courses.find((course) => course.code === courseid);
+      if (match) {
+        return { group, course: match };
+      }
+    }
+    return null;
+  }, [courseid, programCourseGroups]);
+
+  useEffect(() => {
+    if (!isCoursePickerOpen || courseOptionsLoading || programCourseGroups.length === 0) return;
+
+    const validProgramIds = new Set(programCourseGroups.map((group) => group.programId));
+    setExpandedProgramIds((prev) => {
+      const filtered = prev.filter((programId) => validProgramIds.has(programId));
+      if (filtered.length > 0) return filtered;
+      if (selectedCourse) return [selectedCourse.group.programId];
+      return [];
+    });
+  }, [courseOptionsLoading, isCoursePickerOpen, programCourseGroups, selectedCourse]);
+
+  useEffect(() => {
+    if (!isCoursePickerOpen) return;
+
+    function handleDocumentClick(event: MouseEvent) {
+      if (!coursePickerRef.current?.contains(event.target as Node)) {
+        setIsCoursePickerOpen(false);
+      }
+    }
+
+    document.addEventListener("mousedown", handleDocumentClick);
+    return () => {
+      document.removeEventListener("mousedown", handleDocumentClick);
+    };
+  }, [isCoursePickerOpen]);
+
+  useEffect(() => {
+    if (loading || courseOptionsLoading || programCourseGroups.length === 0) {
+      setIsCoursePickerOpen(false);
+    }
+  }, [courseOptionsLoading, loading, programCourseGroups]);
+
+  function toggleProgramGroup(programId: number) {
+    setExpandedProgramIds((prev) => (prev.includes(programId) ? [] : [programId]));
+  }
+
+  function handleSelectCourse(code: string) {
+    setCourseid(code);
+    setError("");
+    setIsCoursePickerOpen(false);
+  }
 
   function makeDropHandler(
     mimeCheck: (file: File) => boolean,
@@ -206,7 +368,7 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
     const nextLecture = lecture.trim();
     const nextYear = year.trim();
     if (!nextCourseid || !nextLecture || !nextYear) {
-      setError("Please fill in Course ID, Lecture, and Year.");
+      setError("Please fill in Course, Lecture, and Year.");
       return;
     }
     if (!/^\d{4}$/.test(nextYear)) {
@@ -260,21 +422,72 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
       </div>
 
       <div className="naming-fields">
-        <div className="naming-field">
-          <label className="drop-zone-label" htmlFor="courseid-input">Course ID</label>
-          <input
-            id="courseid-input"
-            className="naming-input"
-            type="text"
-            value={courseid}
-            disabled={loading}
-            autoComplete="off"
-            onChange={(e) => {
-              setCourseid(e.target.value);
-              setError("");
-            }}
-            placeholder="IDSV, PROG2"
-          />
+        <div className="naming-field naming-field--course">
+          <label className="drop-zone-label" htmlFor="courseid-input">Course</label>
+          <div className="course-picker" ref={coursePickerRef}>
+            <button
+              id="courseid-input"
+              type="button"
+              className={`course-picker-trigger${isCoursePickerOpen ? " course-picker-trigger--open" : ""}`}
+              disabled={loading || courseOptionsLoading || programCourseGroups.length === 0}
+              aria-haspopup="listbox"
+              aria-expanded={isCoursePickerOpen}
+              aria-controls="course-picker-menu"
+              onClick={() => setIsCoursePickerOpen((prev) => !prev)}
+            >
+              <span className={`course-picker-trigger-text${selectedCourse ? "" : " course-picker-trigger-text--placeholder"}`}>
+                {selectedCourse
+                  ? `${selectedCourse.course.name} (${selectedCourse.course.code})`
+                  : (courseOptionsLoading ? "Loading courses..." : "Select a course")}
+              </span>
+              <span className="course-picker-trigger-chevron">▾</span>
+            </button>
+
+            {isCoursePickerOpen && !courseOptionsLoading && programCourseGroups.length > 0 && (
+              <div id="course-picker-menu" className="course-picker-popover" role="listbox" aria-label="Course picker">
+                {programCourseGroups.map((group) => {
+                  const isExpanded = expandedProgramIds.includes(group.programId);
+                  return (
+                    <div key={group.programId} className="course-picker-group">
+                      <button
+                        type="button"
+                        className={`course-picker-group-btn${isExpanded ? " course-picker-group-btn--open" : ""}`}
+                        onClick={() => toggleProgramGroup(group.programId)}
+                        aria-expanded={isExpanded}
+                      >
+                        <span className="course-picker-group-label">{group.programLabel}</span>
+                        <span className="course-picker-group-chevron">▾</span>
+                      </button>
+
+                      {isExpanded && (
+                        <div className="course-picker-course-list">
+                          {group.courses.map((course) => (
+                            <button
+                              key={`${group.programId}-${course.id}`}
+                              type="button"
+                              className={`course-picker-course-btn${course.code === courseid ? " course-picker-course-btn--active" : ""}`}
+                              onClick={() => handleSelectCourse(course.code)}
+                            >
+                              <span className="course-picker-course-name">{course.name}</span>
+                              <span className="course-picker-course-code">{course.code}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+          {!courseOptionsLoading && programCourseGroups.length === 0 && !courseOptionsError && (
+            <p className="naming-field-hint naming-field-hint--error">
+              No catalog courses are available yet. Run catalog sync and refresh this page.
+            </p>
+          )}
+          {courseOptionsError && (
+            <p className="naming-field-hint naming-field-hint--error">{courseOptionsError}</p>
+          )}
         </div>
         <div className="naming-field">
           <label className="drop-zone-label" htmlFor="kind-input">Kind</label>
@@ -426,6 +639,7 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
           className="submit-btn"
           disabled={
             loading
+            || courseOptionsLoading
             || !pdfFile
             || (effectiveRecordingSource === "file" ? !audioFile : !audioUrl.trim())
             || !courseid.trim()

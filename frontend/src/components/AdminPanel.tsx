@@ -48,6 +48,10 @@ function normalizeGroupLabel(row: ProgramPlanRow): string {
   return row.group_type === "optional" ? "Optional" : "Mandatory";
 }
 
+function formatGroupType(groupType: ProgramPlanRow["group_type"]): string {
+  return groupType === "optional" ? "Optional" : "Mandatory";
+}
+
 export default function AdminPanel({ onBack }: AdminPanelProps) {
   const [activeTab, setActiveTab] = useState<AdminTab>("pending");
   const [pending, setPending] = useState<TeachersNoteSummary[]>([]);
@@ -355,25 +359,43 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
   );
 
   const groupedProgramPlan = useMemo(() => {
-    const byTerm = new Map<string, Map<string, ProgramPlanRow[]>>();
+    const byTerm = new Map<
+      string,
+      Map<ProgramPlanRow["group_type"], Map<string, ProgramPlanRow[]>>
+    >();
 
     for (const row of programPlanRows) {
       const term = normalizeTermLabel(row.term_label);
+      const groupType: ProgramPlanRow["group_type"] = row.group_type === "optional"
+        ? "optional"
+        : "mandatory";
       const group = normalizeGroupLabel(row);
 
       if (!byTerm.has(term)) {
         byTerm.set(term, new Map());
       }
-      const groupMap = byTerm.get(term)!;
+      const typeMap = byTerm.get(term)!;
+      if (!typeMap.has(groupType)) {
+        typeMap.set(groupType, new Map());
+      }
+      const groupMap = typeMap.get(groupType)!;
       if (!groupMap.has(group)) {
         groupMap.set(group, []);
       }
       groupMap.get(group)!.push(row);
     }
 
-    return Array.from(byTerm.entries()).map(([term, groups]) => ({
+    return Array.from(byTerm.entries()).map(([term, typeMap]) => ({
       term,
-      groups: Array.from(groups.entries()).map(([group, rows]) => ({ group, rows })),
+      groupTypes: (["mandatory", "optional"] as const)
+        .filter((groupType) => typeMap.has(groupType))
+        .map((groupType) => ({
+          groupType,
+          groups: Array.from(typeMap.get(groupType)!.entries()).map(([group, rows]) => ({
+            group,
+            rows,
+          })),
+        })),
     }));
   }, [programPlanRows]);
 
@@ -617,20 +639,25 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
                     {groupedProgramPlan.map((termGroup) => (
                       <div key={termGroup.term} className="admin-panel-plan-term">
                         <h4>{termGroup.term}</h4>
-                        {termGroup.groups.map((group) => (
-                          <div key={`${termGroup.term}-${group.group}`} className="admin-panel-plan-subgroup">
-                            <h5>{group.group}</h5>
-                            <ul>
-                              {group.rows.map((row) => (
-                                <li key={row.id}>
-                                  <span className="admin-panel-plan-course-name">{row.course_name_sv}</span>
-                                  <span className="admin-panel-plan-course-meta">
-                                    {row.course_code ? `${row.course_code} · ` : ""}
-                                    {row.group_type}
-                                  </span>
-                                </li>
-                              ))}
-                            </ul>
+                        {termGroup.groupTypes.map((typeGroup) => (
+                          <div key={`${termGroup.term}-${typeGroup.groupType}`} className="admin-panel-plan-subgroup">
+                            <h5>{formatGroupType(typeGroup.groupType)}</h5>
+                            {typeGroup.groups.map((group) => (
+                              <div key={`${termGroup.term}-${typeGroup.groupType}-${group.group}`}>
+                                <h6>{group.group}</h6>
+                                <ul>
+                                  {group.rows.map((row) => (
+                                    <li key={row.id}>
+                                      <span className="admin-panel-plan-course-name">{row.course_name_sv}</span>
+                                      <span className="admin-panel-plan-course-meta">
+                                        {row.course_code ? `${row.course_code} · ` : ""}
+                                        {row.group_type}
+                                      </span>
+                                    </li>
+                                  ))}
+                                </ul>
+                              </div>
+                            ))}
                           </div>
                         ))}
                       </div>

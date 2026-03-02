@@ -1,6 +1,7 @@
 import unittest
 from datetime import date
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 try:
     import catalog_sync as catalog_sync_module
@@ -174,6 +175,128 @@ class DryRunStateTests(unittest.TestCase):
         self.assertEqual(apply_result["SAFFK"]["name"], "Program A Updated")
         self.assertTrue(apply_result["SNEWP"]["is_active"])
         self.assertFalse(apply_result["SOLDX"]["is_active"])
+
+
+class _QueryResult:
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def scalars(self):
+        return self
+
+    def all(self):
+        return list(self._rows)
+
+    def __iter__(self):
+        return iter(self._rows)
+
+
+class _FakeAsyncSession:
+    def __init__(self, *, programs, courses, mappings):
+        self._programs = list(programs)
+        self._courses = list(courses)
+        self._mappings = list(mappings)
+        self.add_calls = []
+        self.flush_calls = 0
+        self.commit_calls = 0
+        self.rollback_calls = 0
+        self.executed_sql = []
+
+    async def execute(self, statement):
+        sql = str(statement).lower()
+        self.executed_sql.append(sql)
+        if "from program_courses" in sql:
+            return _QueryResult(self._mappings)
+        if "from programs" in sql:
+            return _QueryResult(self._programs)
+        if "from courses" in sql:
+            return _QueryResult(self._courses)
+        return _QueryResult([])
+
+    def add(self, obj):
+        self.add_calls.append(obj)
+
+    async def flush(self):
+        self.flush_calls += 1
+
+    async def commit(self):
+        self.commit_calls += 1
+
+    async def rollback(self):
+        self.rollback_calls += 1
+
+
+class RunCatalogSyncDryRunTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_catalog_sync_dry_run_does_not_mutate_db_session(self) -> None:
+        try:
+            import sqlalchemy  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("sqlalchemy is not installed in this test environment.")
+
+        standalone_rows = [
+            catalog_sync_module.StandaloneCourse(
+                snapshot_date="2026-03-01",
+                course_code="IB130N",
+                course_name_sv="Introduktion",
+                level="Grundnivå",
+                catalog_url="https://example.test/ib130n",
+                institution_name="Institutionen för data- och systemvetenskap",
+            )
+        ]
+        program_rows = [
+            catalog_sync_module.ProgramInfo(
+                snapshot_date="2026-03-01",
+                program_code="SAFFK",
+                program_name_sv="Program A",
+                level="Grundnivå",
+                catalog_url="https://example.test/saffk",
+                institution_name="Institutionen för data- och systemvetenskap",
+            )
+        ]
+        program_course_rows = [
+            catalog_sync_module.ProgramCourseEntry(
+                snapshot_date="2026-03-01",
+                program_code="SAFFK",
+                program_name_sv="Program A",
+                term_label="Termin 1",
+                group_type="mandatory",
+                group_label="Core",
+                course_code="IB130N",
+                course_name_sv="Introduktion",
+                course_url="https://example.test/ib130n",
+            )
+        ]
+        fake_db = _FakeAsyncSession(
+            programs=[SimpleNamespace(code="SOLDX", name="Legacy program", is_active=True)],
+            courses=[SimpleNamespace(code="IB999N", name="Legacy course", is_active=True)],
+            mappings=[("SOLDX", "IB999N")],
+        )
+
+        with patch.object(
+            catalog_sync_module.asyncio,
+            "to_thread",
+            new=AsyncMock(return_value=(standalone_rows, program_rows, program_course_rows, ["warning"])),
+        ):
+            result = await catalog_sync_module.run_catalog_sync(
+                fake_db,
+                snapshot_date=date(2026, 3, 1),
+                dry_run=True,
+                write_snapshot_files_to_disk=False,
+            )
+
+        self.assertTrue(result.dry_run)
+        self.assertEqual(result.snapshot_date, "2026-03-01")
+        self.assertEqual(result.programs_created, 1)
+        self.assertEqual(result.programs_deactivated, 1)
+        self.assertEqual(result.courses_created, 1)
+        self.assertEqual(result.courses_deactivated, 1)
+        self.assertEqual(result.mappings_added, 1)
+        self.assertEqual(result.mappings_removed, 1)
+        self.assertEqual(result.program_plan_rows_written, 1)
+        self.assertEqual(result.warnings, ["warning"])
+        self.assertEqual(fake_db.add_calls, [])
+        self.assertEqual(fake_db.flush_calls, 0)
+        self.assertEqual(fake_db.commit_calls, 0)
 
 
 if __name__ == "__main__":

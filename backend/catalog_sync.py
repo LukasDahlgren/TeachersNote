@@ -7,29 +7,64 @@ import time
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any, Iterable, TYPE_CHECKING
+from typing import Any, Iterable, Protocol, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 import importlib.util
 import sys
+from types import ModuleType
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 COLLECTOR_PATH = REPO_ROOT / "scripts" / "collect_idsv_catalog.py"
-_COLLECTOR_SPEC = importlib.util.spec_from_file_location("teachersnote_collect_idsv_catalog", COLLECTOR_PATH)
-if _COLLECTOR_SPEC is None or _COLLECTOR_SPEC.loader is None:
-    raise RuntimeError(f"Unable to load collector module from {COLLECTOR_PATH}")
-_COLLECTOR_MODULE = importlib.util.module_from_spec(_COLLECTOR_SPEC)
-sys.modules.setdefault(_COLLECTOR_SPEC.name, _COLLECTOR_MODULE)
-_COLLECTOR_SPEC.loader.exec_module(_COLLECTOR_MODULE)
+COLLECTOR_MODULE_NAME = "teachersnote_collect_idsv_catalog"
+DSV_INSTITUTION_NAME = "Institutionen för data- och systemvetenskap"
 
-DSV_INSTITUTION_NAME = _COLLECTOR_MODULE.DSV_INSTITUTION_NAME
-SourceProgram = _COLLECTOR_MODULE.CatalogProgram
-SourceProgramCourseEntry = _COLLECTOR_MODULE.ProgramCourseEntry
-SourceStandaloneCourse = _COLLECTOR_MODULE.StandaloneCourse
-collect_catalog_snapshot = _COLLECTOR_MODULE.collect_catalog_snapshot
-write_snapshot_files = _COLLECTOR_MODULE.write_snapshot_files
+
+class SourceStandaloneCourse(Protocol):
+    snapshot_date: str
+    course_code: str
+    course_name_sv: str
+    level: str
+    catalog_url: str
+    institution_name: str
+
+
+class SourceProgram(Protocol):
+    snapshot_date: str
+    program_code: str
+    program_name_sv: str
+    level: str
+    catalog_url: str
+    institution_name: str
+
+
+class SourceProgramCourseEntry(Protocol):
+    snapshot_date: str
+    program_code: str
+    program_name_sv: str
+    term_label: str
+    group_type: str
+    group_label: str
+    course_code: str | None
+    course_name_sv: str
+    course_url: str
+
+
+def _load_collector_module() -> ModuleType:
+    existing = sys.modules.get(COLLECTOR_MODULE_NAME)
+    if existing is not None:
+        return existing
+
+    spec = importlib.util.spec_from_file_location(COLLECTOR_MODULE_NAME, COLLECTOR_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load collector module from {COLLECTOR_PATH}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[COLLECTOR_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
 
 _ALLOWED_GROUP_TYPES = {"mandatory", "optional"}
 
@@ -400,7 +435,8 @@ def _collect_snapshot_sync(snapshot_date: str, write_files: bool) -> tuple[
     list[ProgramCourseEntry],
     list[str],
 ]:
-    snapshot = collect_catalog_snapshot(snapshot_date)
+    collector_module = _load_collector_module()
+    snapshot = collector_module.collect_catalog_snapshot(snapshot_date)
     warnings = list(snapshot.warnings)
 
     standalone_rows = normalize_standalone_courses(snapshot.standalone_courses, warnings)
@@ -409,7 +445,7 @@ def _collect_snapshot_sync(snapshot_date: str, write_files: bool) -> tuple[
 
     if write_files:
         out_dir = Path(os.getenv("CATALOG_SYNC_OUT_DIR", Path(__file__).resolve().parent.parent / "out"))
-        write_snapshot_files(snapshot, out_dir)
+        collector_module.write_snapshot_files(snapshot, out_dir)
 
     return standalone_rows, program_rows, program_course_rows, warnings
 
@@ -541,6 +577,7 @@ async def run_catalog_sync(
 
         scope_program_ids = list(program_id_by_code.values())
         if scope_program_ids:
+            # We intentionally replace plan rows for scoped programs with the current snapshot.
             await db.execute(
                 delete(ProgramCoursePlan).where(ProgramCoursePlan.program_id.in_(scope_program_ids))
             )

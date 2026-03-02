@@ -1989,6 +1989,29 @@ async def get_profile_course_options(
         select(Program).where(Program.is_active == True).order_by(Program.code.asc())
     )
     programs = programs_result.scalars().all()
+    grouped_courses_result = await db.execute(
+        select(Program, Course)
+        .join(ProgramCourse, ProgramCourse.program_id == Program.id)
+        .join(Course, ProgramCourse.course_id == Course.id)
+        .where(Program.is_active == True, Course.is_active == True)
+        .order_by(Program.code.asc(), Course.code.asc())
+    )
+    grouped_courses_rows = grouped_courses_result.all()
+    grouped_courses_by_program: dict[int, list[Course]] = {}
+    for mapped_program, mapped_course in grouped_courses_rows:
+        grouped_courses_by_program.setdefault(int(mapped_program.id), []).append(mapped_course)
+
+    program_course_groups: list[dict[str, Any]] = []
+    for item in programs:
+        grouped_courses = grouped_courses_by_program.get(int(item.id), [])
+        if not grouped_courses:
+            continue
+        program_course_groups.append(
+            {
+                "program": _program_payload(item),
+                "courses": [_course_payload(course) for course in grouped_courses],
+            }
+        )
 
     program: Program | None = None
     program_courses: list[Course] = []
@@ -2009,6 +2032,7 @@ async def get_profile_course_options(
         "programs": [_program_payload(item) for item in programs],
         "all_courses": [_course_payload(course) for course in all_courses],
         "program_courses": [_course_payload(course) for course in program_courses],
+        "program_course_groups": program_course_groups,
     }
 
 
@@ -2231,6 +2255,7 @@ async def sync_catalog(
             write_snapshot_files_to_disk=False,
         )
     except Exception as exc:
+        await db.rollback()
         LOGGER.exception("Catalog sync failed")
         raise HTTPException(status_code=500, detail=f"Catalog sync failed: {exc}") from exc
 

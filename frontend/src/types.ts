@@ -97,6 +97,10 @@ export interface ProfileCourseOptions {
   programs: Program[];
   all_courses: Course[];
   program_courses: Course[];
+  program_course_groups?: Array<{
+    program: Program;
+    courses: Course[];
+  }>;
 }
 
 export interface CatalogSyncRequest {
