@@ -40,7 +40,7 @@ DEFAULT_ENRICH_PROVIDER = os.getenv("ENRICH_PROVIDER", "anthropic").strip().lowe
 DEFAULT_ENRICH_MODEL_OVERRIDE = os.getenv("ENRICH_MODEL", "").strip()
 DEFAULT_ENRICH_MODEL_ANTHROPIC = os.getenv("ENRICH_MODEL_ANTHROPIC", "claude-haiku-4-5").strip() or "claude-haiku-4-5"
 DEFAULT_ENRICH_MODEL_GROQ = os.getenv("ENRICH_MODEL_GROQ", "openai/gpt-oss-20b").strip() or "openai/gpt-oss-20b"
-DEFAULT_ENRICH_MAX_WORKERS = _env_int("ENRICH_MAX_WORKERS", 4, minimum=1)
+DEFAULT_ENRICH_MAX_WORKERS = _env_int("ENRICH_MAX_WORKERS", 2, minimum=1)
 DEFAULT_ENRICH_MAX_TRANSCRIPT_WORDS = _env_int("ENRICH_MAX_TRANSCRIPT_WORDS", 700, minimum=1)
 DEFAULT_ENRICH_MAX_OUTPUT_TOKENS = _env_int("ENRICH_MAX_OUTPUT_TOKENS", 320, minimum=64)
 DEFAULT_ENRICH_MAX_ATTEMPTS = _env_int("ENRICH_MAX_ATTEMPTS", 4, minimum=1)
@@ -258,7 +258,7 @@ def _call_enrichment_model(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        response_format={"type": "json_object"},
+        extra_body={"thinking": {"type": "disabled"}},
     )
     raw = _response_text_from_groq_completion(response)
     return raw, _usage_from_response(response, provider)
@@ -425,6 +425,11 @@ def parse_enrichment_response(raw_text: str) -> dict | None:
     if not candidate:
         return None
 
+    # Strip <think>...</think> reasoning blocks (e.g. Qwen3 thinking mode)
+    candidate = re.sub(r"<think>.*?</think>", "", candidate, flags=re.DOTALL).strip()
+    if not candidate:
+        return None
+
     parsed = _json_to_dict(candidate)
     if parsed is not None:
         return parsed
@@ -587,7 +592,7 @@ def enrich_slide_with_retry(
 
     for attempt in range(max_attempts):
         attempts = attempt + 1
-        system_prompt = SYSTEM_PROMPT if attempt == 0 else STRICT_SYSTEM_PROMPT
+        system_prompt = STRICT_SYSTEM_PROMPT
         current_max_output_tokens = next_attempt_tokens or max_output_tokens
         next_attempt_tokens = None
         try:

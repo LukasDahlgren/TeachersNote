@@ -1,27 +1,21 @@
-import { useState, type KeyboardEvent } from "react";
+import { type KeyboardEvent } from "react";
 import ProcessChat, { type ProcessChatEntry } from "./ProcessChat";
 import type { TeachersNoteSummary, UploadProcessJobStatus } from "../types";
 
 interface SidebarProps {
   savedLectures: TeachersNoteSummary[];
-  archivedLectures: TeachersNoteSummary[];
-  deletedLectures: TeachersNoteSummary[];
   loading: boolean;
   selectedId: number | null;
   onSelect: (id: number) => void;
   onNewLecture: () => void;
   onGoHome: () => void;
-  onRestore: (id: number) => void;
   showUploadConsole: boolean;
   uploadLoadingLabel: string;
   processJob: UploadProcessJobStatus | null;
   processChat: ProcessChatEntry[];
   processingLectureName?: string | null;
-  isAdmin?: boolean;
   currentUserId?: string;
-  onOpenAdminPanel?: () => void;
-  onRegisterAdmin?: () => void;
-  onLogout?: () => void;
+  onOpenProfile?: () => void;
 }
 
 function formatDate(iso: string): string {
@@ -65,29 +59,19 @@ function formatLectureDisplayName(lecture: TeachersNoteSummary): string {
 
 export default function Sidebar({
   savedLectures,
-  archivedLectures,
-  deletedLectures,
   loading,
   selectedId,
   onSelect,
   onNewLecture,
   onGoHome,
-  onRestore,
   showUploadConsole,
   uploadLoadingLabel,
   processJob,
   processChat,
   processingLectureName,
-  isAdmin,
   currentUserId,
-  onOpenAdminPanel,
-  onRegisterAdmin,
-  onLogout,
+  onOpenProfile,
 }: SidebarProps) {
-  const [menuOpen, setMenuOpen] = useState(false);
-  const [archiveOpen, setArchiveOpen] = useState(false);
-  const [trashOpen, setTrashOpen] = useState(false);
-  const showDeletedSection = Boolean(isAdmin);
   const handleLogoKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
@@ -163,119 +147,15 @@ export default function Sidebar({
             {!loading && savedLectures.map((lecture) => renderLectureCard(lecture))}
           </div>
         </div>
-
-        {archiveOpen && (
-          <div className="sidebar-group sidebar-group--archived">
-            <div className="sidebar-section-header">
-              <span className="sidebar-section-header-label">Archived</span>
-              <button className="sidebar-section-close-btn" onClick={() => setArchiveOpen(false)}>✕</button>
-            </div>
-            <div className="sidebar-list sidebar-list--archived">
-              {!loading && archivedLectures.length === 0 && (
-                <p className="sidebar-empty">No archived lectures</p>
-              )}
-              {!loading && archivedLectures.map((lecture) => renderLectureCard(lecture))}
-            </div>
-          </div>
-        )}
-
-        {showDeletedSection && trashOpen && (
-          <div className="sidebar-group sidebar-group--deleted">
-            <div className="sidebar-section-header">
-              <span className="sidebar-section-header-label">Recently Deleted</span>
-              <button className="sidebar-section-close-btn" onClick={() => setTrashOpen(false)}>✕</button>
-            </div>
-            <div className="sidebar-list sidebar-list--deleted">
-              {!loading && deletedLectures.length === 0 && (
-                <p className="sidebar-empty">Nothing here</p>
-              )}
-              {!loading && deletedLectures.map((lecture) => (
-                <div key={lecture.id} className="lecture-card lecture-card--deleted">
-                  <span className="lecture-card-icon">🗑</span>
-                  <span className="lecture-card-body">
-                    <span className="lecture-card-name">{formatLectureDisplayName(lecture)}</span>
-                    <span className="lecture-card-date">{formatDate(lecture.created_at)}</span>
-                  </span>
-                  <button
-                    className="lecture-card-restore-btn"
-                    onClick={() => onRestore(lecture.id)}
-                    title="Restore lecture"
-                  >
-                    Restore
-                  </button>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
       </div>
 
       <div className="sidebar-bottom-menu">
         <button
           className="sidebar-menu-btn"
-          onClick={() => setMenuOpen((prev) => !prev)}
+          onClick={onOpenProfile}
         >
-          ☰ More
+          👤 Profile
         </button>
-        {menuOpen && (
-          <div className="sidebar-menu-popup">
-            <button
-              className="sidebar-menu-item"
-              onClick={() => {
-                setArchiveOpen((prev) => !prev);
-                setMenuOpen(false);
-              }}
-            >
-              <span className="sidebar-menu-item-label">📦 Archived</span>
-              <span className="sidebar-menu-item-count">{archivedLectures.length}</span>
-            </button>
-            {showDeletedSection && (
-              <button
-                className="sidebar-menu-item"
-                onClick={() => {
-                  setTrashOpen((prev) => !prev);
-                  setMenuOpen(false);
-                }}
-              >
-                <span className="sidebar-menu-item-label">🗑 Recently Deleted</span>
-                <span className="sidebar-menu-item-count">{deletedLectures.length}</span>
-              </button>
-            )}
-            {isAdmin && onOpenAdminPanel && (
-              <button
-                className="sidebar-menu-item"
-                onClick={() => {
-                  setMenuOpen(false);
-                  onOpenAdminPanel();
-                }}
-              >
-                <span className="sidebar-menu-item-label">⚙ Admin Panel</span>
-              </button>
-            )}
-            {isAdmin && onLogout && (
-              <button
-                className="sidebar-menu-item sidebar-menu-item--danger"
-                onClick={() => {
-                  setMenuOpen(false);
-                  onLogout();
-                }}
-              >
-                <span className="sidebar-menu-item-label">↩ Log out as admin</span>
-              </button>
-            )}
-            {!isAdmin && onRegisterAdmin && (
-              <button
-                className="sidebar-menu-item"
-                onClick={() => {
-                  setMenuOpen(false);
-                  onRegisterAdmin();
-                }}
-              >
-                <span className="sidebar-menu-item-label">🔓 Register as admin</span>
-              </button>
-            )}
-          </div>
-        )}
       </div>
     </aside>
   );

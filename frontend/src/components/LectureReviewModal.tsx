@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { approveLecture, buildAssetUrl, getLecture, rejectLecture } from "../api";
 import type { LectureDetail, TeachersNoteSummary } from "../types";
+import ConfirmDialog from "./ConfirmDialog";
 import SlideViewer from "./SlideViewer";
 import TranscriptPanel from "./TranscriptPanel";
 import "../LectureReviewModal.css";
@@ -17,6 +18,7 @@ export default function LectureReviewModal({ lecture, onApproved, onRejected, on
   const [loadError, setLoadError] = useState<string | null>(null);
   const [activeSlide, setActiveSlide] = useState(0);
   const [actionInFlight, setActionInFlight] = useState<"approve" | "reject" | null>(null);
+  const [confirmRejectOpen, setConfirmRejectOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -45,7 +47,6 @@ export default function LectureReviewModal({ lecture, onApproved, onRejected, on
   }
 
   async function handleReject() {
-    if (!window.confirm("Reject and delete this lecture?")) return;
     setActionInFlight("reject");
     try {
       await rejectLecture(lecture.id);
@@ -63,6 +64,14 @@ export default function LectureReviewModal({ lecture, onApproved, onRejected, on
   const pdfUrl = buildAssetUrl(data?.pdf_url);
 
   return (
+    <>
+    {confirmRejectOpen && (
+      <ConfirmDialog
+        message="Reject and delete this lecture?"
+        onConfirm={() => { setConfirmRejectOpen(false); void handleReject(); }}
+        onCancel={() => setConfirmRejectOpen(false)}
+      />
+    )}
     <div className="review-overlay" onClick={onClose}>
       <div className="review-modal" onClick={(e) => e.stopPropagation()}>
         <header className="review-header">
@@ -78,7 +87,7 @@ export default function LectureReviewModal({ lecture, onApproved, onRejected, on
             <button
               className="review-reject-btn"
               disabled={actionInFlight !== null || data === null}
-              onClick={() => void handleReject()}
+              onClick={() => setConfirmRejectOpen(true)}
             >
               {actionInFlight === "reject" ? "Rejecting…" : "Reject"}
             </button>
@@ -111,5 +120,6 @@ export default function LectureReviewModal({ lecture, onApproved, onRejected, on
         </div>
       </div>
     </div>
+    </>
   );
 }

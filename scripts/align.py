@@ -103,7 +103,7 @@ def build_prompt(
 
 def parse_response(response_text: str) -> list[dict]:
     # Extract JSON array from response (in case Claude adds surrounding text)
-    match = re.search(r"\[.*?\]", response_text, re.DOTALL)
+    match = re.search(r"\[.*\]", response_text, re.DOTALL)
     if not match:
         raise ValueError(f"No JSON array found in response:\n{response_text[:500]}")
     return json.loads(match.group())

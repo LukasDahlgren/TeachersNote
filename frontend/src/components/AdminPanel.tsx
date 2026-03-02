@@ -17,6 +17,8 @@ import {
   updateCourse,
   updateProgram,
 } from "../api";
+import ConfirmDialog from "./ConfirmDialog";
+import InputDialog from "./InputDialog";
 import LectureReviewModal from "./LectureReviewModal";
 import ProgramPicker from "./ProgramPicker";
 import RegenerateNotesModal from "./RegenerateNotesModal";
@@ -28,6 +30,15 @@ import type {
   RegenerateNotesJobStatus,
   TeachersNoteSummary,
 } from "../types";
+
+type DialogState =
+  | { type: "confirm-reject"; id: number }
+  | { type: "edit-program-name"; program: Program }
+  | { type: "edit-program-code"; program: Program }
+  | { type: "edit-course-name"; course: Course }
+  | { type: "edit-course-code"; course: Course }
+  | { type: "edit-course-display-code"; course: Course }
+  | null;
 
 interface AdminPanelProps {
   onBack: () => void;
@@ -71,12 +82,16 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [actionInFlight, setActionInFlight] = useState<string | null>(null);
+  const [dialog, setDialog] = useState<DialogState>(null);
 
   const [newProgramCode, setNewProgramCode] = useState("");
   const [newProgramName, setNewProgramName] = useState("");
   const [newCourseCode, setNewCourseCode] = useState("");
   const [newCourseDisplayCode, setNewCourseDisplayCode] = useState("");
   const [newCourseName, setNewCourseName] = useState("");
+
+  const [showCreateProgram, setShowCreateProgram] = useState(false);
+  const [showCreateCourse, setShowCreateCourse] = useState(false);
 
   const [selectedProgramId, setSelectedProgramId] = useState<number | null>(null);
   const [mappedCourseIds, setMappedCourseIds] = useState<Set<number>>(new Set());
@@ -88,6 +103,10 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
 
   const [programPlanRows, setProgramPlanRows] = useState<ProgramPlanRow[]>([]);
   const [loadingProgramPlan, setLoadingProgramPlan] = useState(false);
+
+  const [lectureSearch, setLectureSearch] = useState("");
+  const [courseSearch, setCourseSearch] = useState("");
+  const [programSearch, setProgramSearch] = useState("");
 
   async function load() {
     setLoading(true);
@@ -178,7 +197,6 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
   }
 
   async function handleReject(id: number) {
-    if (!window.confirm("Reject and delete this lecture?")) return;
     const key = `pending-reject-${id}`;
     setActionInFlight(key);
     try {
@@ -201,6 +219,7 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
       await createProgram({ code, name, is_active: true });
       setNewProgramCode("");
       setNewProgramName("");
+      setShowCreateProgram(false);
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create program.");
@@ -226,6 +245,7 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
       setNewCourseCode("");
       setNewCourseDisplayCode("");
       setNewCourseName("");
+      setShowCreateCourse(false);
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create course.");
@@ -234,8 +254,7 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
     }
   }
 
-  async function handleProgramRename(program: Program) {
-    const nextName = window.prompt("Program name", program.name)?.trim();
+  async function handleProgramRename(program: Program, nextName: string) {
     if (!nextName || nextName === program.name) return;
     const key = `program-rename-${program.id}`;
     setActionInFlight(key);
@@ -250,8 +269,7 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
     }
   }
 
-  async function handleProgramCode(program: Program) {
-    const nextCode = window.prompt("Program code", program.code)?.trim();
+  async function handleProgramCode(program: Program, nextCode: string) {
     if (!nextCode || nextCode === program.code) return;
     const key = `program-code-${program.id}`;
     setActionInFlight(key);
@@ -280,8 +298,7 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
     }
   }
 
-  async function handleCourseRename(course: Course) {
-    const nextName = window.prompt("Course name", course.name)?.trim();
+  async function handleCourseRename(course: Course, nextName: string) {
     if (!nextName || nextName === course.name) return;
     const key = `course-rename-${course.id}`;
     setActionInFlight(key);
@@ -296,8 +313,7 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
     }
   }
 
-  async function handleCourseCode(course: Course) {
-    const nextCode = window.prompt("CourseID", course.code)?.trim();
+  async function handleCourseCode(course: Course, nextCode: string) {
     if (!nextCode || nextCode === course.code) return;
     const key = `course-code-${course.id}`;
     setActionInFlight(key);
@@ -312,13 +328,7 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
     }
   }
 
-  async function handleCourseDisplayCode(course: Course) {
-    const nextDisplayCode = window.prompt(
-      "Course display code (leave blank to clear)",
-      course.display_code ?? "",
-    );
-    if (nextDisplayCode === null) return;
-
+  async function handleCourseDisplayCode(course: Course, nextDisplayCode: string) {
     const normalized = nextDisplayCode.trim();
     if (normalized === (course.display_code ?? "")) return;
 
@@ -455,8 +465,84 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
     }));
   }, [programPlanRows]);
 
+  const filteredLectures = useMemo(() => {
+    const q = lectureSearch.trim().toLowerCase();
+    if (!q) return approvedLectures;
+    return approvedLectures.filter((l) =>
+      l.name.toLowerCase().includes(q) ||
+      (l.course_display ?? "").toLowerCase().includes(q) ||
+      (l.course_id ?? "").toLowerCase().includes(q),
+    );
+  }, [approvedLectures, lectureSearch]);
+
+  const filteredCourses = useMemo(() => {
+    const q = courseSearch.trim().toLowerCase();
+    if (!q) return courses;
+    return courses.filter((c) =>
+      c.code.toLowerCase().includes(q) ||
+      (c.display_code ?? "").toLowerCase().includes(q) ||
+      c.name.toLowerCase().includes(q),
+    );
+  }, [courses, courseSearch]);
+
+  const filteredPrograms = useMemo(() => {
+    const q = programSearch.trim().toLowerCase();
+    if (!q) return programs;
+    return programs.filter((p) =>
+      p.code.toLowerCase().includes(q) ||
+      p.name.toLowerCase().includes(q),
+    );
+  }, [programs, programSearch]);
+
   return (
     <>
+    {dialog?.type === "confirm-reject" && (
+      <ConfirmDialog
+        message="Reject and delete this lecture?"
+        onConfirm={() => { const id = dialog.id; setDialog(null); void handleReject(id); }}
+        onCancel={() => setDialog(null)}
+      />
+    )}
+    {dialog?.type === "edit-program-name" && (
+      <InputDialog
+        label="Program name"
+        initialValue={dialog.program.name}
+        onConfirm={(v) => { const p = dialog.program; setDialog(null); void handleProgramRename(p, v.trim()); }}
+        onCancel={() => setDialog(null)}
+      />
+    )}
+    {dialog?.type === "edit-program-code" && (
+      <InputDialog
+        label="Program code"
+        initialValue={dialog.program.code}
+        onConfirm={(v) => { const p = dialog.program; setDialog(null); void handleProgramCode(p, v.trim()); }}
+        onCancel={() => setDialog(null)}
+      />
+    )}
+    {dialog?.type === "edit-course-name" && (
+      <InputDialog
+        label="Course name"
+        initialValue={dialog.course.name}
+        onConfirm={(v) => { const c = dialog.course; setDialog(null); void handleCourseRename(c, v.trim()); }}
+        onCancel={() => setDialog(null)}
+      />
+    )}
+    {dialog?.type === "edit-course-code" && (
+      <InputDialog
+        label="CourseID"
+        initialValue={dialog.course.code}
+        onConfirm={(v) => { const c = dialog.course; setDialog(null); void handleCourseCode(c, v.trim()); }}
+        onCancel={() => setDialog(null)}
+      />
+    )}
+    {dialog?.type === "edit-course-display-code" && (
+      <InputDialog
+        label="Course display code (leave blank to clear)"
+        initialValue={dialog.course.display_code ?? ""}
+        onConfirm={(v) => { const c = dialog.course; setDialog(null); void handleCourseDisplayCode(c, v); }}
+        onCancel={() => setDialog(null)}
+      />
+    )}
     <div className="admin-panel">
       <div className="admin-panel-header">
         <button className="admin-panel-back-btn" onClick={onBack}>← Back</button>
@@ -527,7 +613,7 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
                       <button
                         className="admin-panel-reject-btn"
                         disabled={actionInFlight === `pending-reject-${lecture.id}`}
-                        onClick={() => void handleReject(lecture.id)}
+                        onClick={() => setDialog({ type: "confirm-reject", id: lecture.id })}
                       >
                         Reject
                       </button>
@@ -547,41 +633,67 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
             <p className="admin-panel-empty">No approved lectures.</p>
           )}
           {approvedLectures.length > 0 && (
-            <table className="admin-panel-table">
-              <thead>
-                <tr>
-                  <th>Name</th>
-                  <th>Course</th>
-                  <th>Date</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {approvedLectures.map((lecture) => (
-                  <tr key={lecture.id}>
-                    <td>{lecture.name}</td>
-                    <td className="admin-panel-cell--muted">{lecture.course_display || lecture.course_id}</td>
-                    <td className="admin-panel-cell--muted">{formatDate(lecture.created_at)}</td>
-                    <td className="admin-panel-actions">
-                      <button
-                        className="admin-panel-secondary-btn"
-                        disabled={actionInFlight === `regen-${lecture.id}`}
-                        onClick={() => void handleRegenerateNotes(lecture.id)}
-                      >
-                        {actionInFlight === `regen-${lecture.id}` ? "Starting..." : "Regenerate notes"}
-                      </button>
-                    </td>
+            <>
+              <div className="admin-panel-search-row">
+                <input
+                  className="admin-panel-input"
+                  placeholder="Search lectures…"
+                  value={lectureSearch}
+                  onChange={(e) => setLectureSearch(e.target.value)}
+                />
+                {lectureSearch.trim() && (
+                  <span className="admin-panel-search-count">{filteredLectures.length} of {approvedLectures.length}</span>
+                )}
+              </div>
+              <table className="admin-panel-table">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Course</th>
+                    <th>Date</th>
+                    <th>Actions</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {filteredLectures.length === 0 && (
+                    <tr><td colSpan={4} className="admin-panel-cell--muted">No lectures match your search.</td></tr>
+                  )}
+                  {filteredLectures.map((lecture) => (
+                    <tr key={lecture.id}>
+                      <td>{lecture.name}</td>
+                      <td className="admin-panel-cell--muted">{lecture.course_display || lecture.course_id}</td>
+                      <td className="admin-panel-cell--muted">{formatDate(lecture.created_at)}</td>
+                      <td className="admin-panel-actions">
+                        <button
+                          className="admin-panel-secondary-btn"
+                          disabled={actionInFlight === `regen-${lecture.id}`}
+                          onClick={() => void handleRegenerateNotes(lecture.id)}
+                        >
+                          {actionInFlight === `regen-${lecture.id}` ? "Starting..." : "Regenerate notes"}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </>
           )}
         </section>
       )}
 
       {!loading && activeTab === "programs" && (
         <section className="admin-panel-section">
-          <h2 className="admin-panel-section-title">Programs</h2>
+          <h2 className="admin-panel-section-title">
+            Programs
+            <button
+              className="admin-panel-add-toggle-btn"
+              title={showCreateProgram ? "Cancel" : "Add program"}
+              onClick={() => setShowCreateProgram((v) => !v)}
+            >
+              {showCreateProgram ? "✕" : "+"}
+            </button>
+          </h2>
+          {showCreateProgram && (
           <div className="admin-panel-create-row">
             <input
               className="admin-panel-input"
@@ -603,6 +715,18 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
               {actionInFlight === "create-program" ? "Creating..." : "Create"}
             </button>
           </div>
+          )}
+          <div className="admin-panel-search-row">
+            <input
+              className="admin-panel-input"
+              placeholder="Search programs…"
+              value={programSearch}
+              onChange={(e) => setProgramSearch(e.target.value)}
+            />
+            {programSearch.trim() && (
+              <span className="admin-panel-search-count">{filteredPrograms.length} of {programs.length}</span>
+            )}
+          </div>
           <table className="admin-panel-table">
             <thead>
               <tr>
@@ -613,14 +737,17 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
               </tr>
             </thead>
             <tbody>
-              {programs.map((program) => (
+              {filteredPrograms.length === 0 && (
+                <tr><td colSpan={4} className="admin-panel-cell--muted">No programs match your search.</td></tr>
+              )}
+              {filteredPrograms.map((program) => (
                 <tr key={program.id}>
                   <td>{program.code}</td>
                   <td>{program.name}</td>
                   <td className="admin-panel-cell--muted">{program.is_active ? "Active" : "Inactive"}</td>
                   <td className="admin-panel-actions">
-                    <button className="admin-panel-secondary-btn" onClick={() => void handleProgramCode(program)}>Edit code</button>
-                    <button className="admin-panel-secondary-btn" onClick={() => void handleProgramRename(program)}>Rename</button>
+                    <button className="admin-panel-secondary-btn" onClick={() => setDialog({ type: "edit-program-code", program })}>Edit code</button>
+                    <button className="admin-panel-secondary-btn" onClick={() => setDialog({ type: "edit-program-name", program })}>Rename</button>
                     <button className="admin-panel-secondary-btn" onClick={() => void handleToggleProgram(program)}>
                       {program.is_active ? "Deactivate" : "Activate"}
                     </button>
@@ -634,7 +761,17 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
 
       {!loading && activeTab === "courses" && (
         <section className="admin-panel-section">
-          <h2 className="admin-panel-section-title">Courses</h2>
+          <h2 className="admin-panel-section-title">
+            Courses
+            <button
+              className="admin-panel-add-toggle-btn"
+              title={showCreateCourse ? "Cancel" : "Add course"}
+              onClick={() => setShowCreateCourse((v) => !v)}
+            >
+              {showCreateCourse ? "✕" : "+"}
+            </button>
+          </h2>
+          {showCreateCourse && (
           <div className="admin-panel-create-row">
             <input
               className="admin-panel-input"
@@ -662,6 +799,18 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
               {actionInFlight === "create-course" ? "Creating..." : "Create"}
             </button>
           </div>
+          )}
+          <div className="admin-panel-search-row">
+            <input
+              className="admin-panel-input"
+              placeholder="Search courses…"
+              value={courseSearch}
+              onChange={(e) => setCourseSearch(e.target.value)}
+            />
+            {courseSearch.trim() && (
+              <span className="admin-panel-search-count">{filteredCourses.length} of {courses.length}</span>
+            )}
+          </div>
           <table className="admin-panel-table">
             <thead>
               <tr>
@@ -673,16 +822,19 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
               </tr>
             </thead>
             <tbody>
-              {courses.map((course) => (
+              {filteredCourses.length === 0 && (
+                <tr><td colSpan={5} className="admin-panel-cell--muted">No courses match your search.</td></tr>
+              )}
+              {filteredCourses.map((course) => (
                 <tr key={course.id}>
                   <td>{course.code}</td>
                   <td>{course.display_code || "—"}</td>
                   <td>{course.name}</td>
                   <td className="admin-panel-cell--muted">{course.is_active ? "Active" : "Inactive"}</td>
                   <td className="admin-panel-actions">
-                    <button className="admin-panel-secondary-btn" onClick={() => void handleCourseCode(course)}>Edit CourseID</button>
-                    <button className="admin-panel-secondary-btn" onClick={() => void handleCourseDisplayCode(course)}>Edit display</button>
-                    <button className="admin-panel-secondary-btn" onClick={() => void handleCourseRename(course)}>Rename</button>
+                    <button className="admin-panel-secondary-btn" onClick={() => setDialog({ type: "edit-course-code", course })}>Edit CourseID</button>
+                    <button className="admin-panel-secondary-btn" onClick={() => setDialog({ type: "edit-course-display-code", course })}>Edit display</button>
+                    <button className="admin-panel-secondary-btn" onClick={() => setDialog({ type: "edit-course-name", course })}>Rename</button>
                     <button className="admin-panel-secondary-btn" onClick={() => void handleToggleCourse(course)}>
                       {course.is_active ? "Deactivate" : "Activate"}
                     </button>

@@ -1,5 +1,7 @@
 import {
   type ArchiveLectureResponse,
+  type AuthResponse,
+  type AuthUser,
   type CatalogSyncRequest,
   type CatalogSyncResult,
   type Course,
@@ -23,39 +25,24 @@ import {
 } from "./types";
 
 const BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
-const API_KEY = import.meta.env.VITE_API_KEY ?? "";
-const USER_ID_STORAGE_KEY = "teachers-note.user-id";
-const LEGACY_USER_ID_STORAGE_KEY = "lecture-summary.user-id";
-const DEFAULT_USER_ID = "local-dev-user";
+const TOKEN_STORAGE_KEY = "teachers-note.access-token";
 
-function generateUserId(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return `user-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+export function getStoredToken(): string | null {
+  return typeof window !== "undefined" ? window.localStorage.getItem(TOKEN_STORAGE_KEY) : null;
 }
 
-export function getCurrentUserId(): string {
-  if (typeof window === "undefined") return DEFAULT_USER_ID;
-  const existing = window.localStorage.getItem(USER_ID_STORAGE_KEY)?.trim();
-  if (existing) return existing;
+function setStoredToken(token: string): void {
+  window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
+}
 
-  const legacy = window.localStorage.getItem(LEGACY_USER_ID_STORAGE_KEY)?.trim();
-  if (legacy) {
-    window.localStorage.setItem(USER_ID_STORAGE_KEY, legacy);
-    window.localStorage.removeItem(LEGACY_USER_ID_STORAGE_KEY);
-    return legacy;
-  }
-
-  const next = generateUserId();
-  window.localStorage.setItem(USER_ID_STORAGE_KEY, next);
-  return next;
+export function clearStoredToken(): void {
+  window.localStorage.removeItem(TOKEN_STORAGE_KEY);
 }
 
 function withAuthHeaders(headers?: HeadersInit): Headers {
   const next = new Headers(headers);
-  next.set("X-API-Key", API_KEY);
-  next.set("X-User-Id", getCurrentUserId());
+  const token = getStoredToken();
+  if (token) next.set("Authorization", `Bearer ${token}`);
   return next;
 }
 
@@ -72,11 +59,12 @@ export function buildAssetUrl(path?: string | null): string | undefined {
   const target = path.startsWith("http://") || path.startsWith("https://")
     ? path
     : `${BASE}${path}`;
-  if (!API_KEY) return target;
+  const token = getStoredToken();
+  if (!token) return target;
 
   try {
     const url = new URL(target, BASE);
-    url.searchParams.set("token", API_KEY);
+    url.searchParams.set("token", token);
     return url.toString();
   } catch {
     return target;
@@ -142,7 +130,7 @@ export async function processFiles(
 
 export async function checkHealth(): Promise<boolean> {
   try {
-    const res = await apiFetch("/health");
+    const res = await fetch(`${BASE}/health`);
     return res.ok;
   } catch {
     return false;
@@ -292,7 +280,7 @@ export function subscribeRegenerateNotesEvents(
   jobId: string,
   handlers: RegenerateNotesEventHandlers,
 ): () => void {
-  const source = new EventSource(`${BASE}/lectures/regenerate-notes/jobs/${jobId}/events?token=${encodeURIComponent(API_KEY)}`);
+  const source = new EventSource(`${BASE}/lectures/regenerate-notes/jobs/${jobId}/events?token=${encodeURIComponent(getStoredToken() ?? "")}`);
   let closed = false;
 
   source.addEventListener("progress", (evt) => {
@@ -325,18 +313,46 @@ export function subscribeRegenerateNotesEvents(
   };
 }
 
-export async function registerAsAdmin(secret: string): Promise<{ status: string; user_id: string }> {
-  const res = await apiFetch("/admin/register", {
+export async function login(email: string, password: string): Promise<AuthResponse> {
+  const res = await fetch(`${BASE}/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ secret }),
+    body: JSON.stringify({ email, password }),
   });
   if (!res.ok) {
     const body = await readBody(res);
-    const message = (body as { detail?: string } | null)?.detail || `Request failed (${res.status})`;
+    const message = (body as { detail?: string } | null)?.detail || `Login failed (${res.status})`;
     throw new ApiError(res.status, message, body);
   }
+  const data: AuthResponse = await res.json();
+  setStoredToken(data.access_token);
+  return data;
+}
+
+export async function register(email: string, password: string, displayName?: string): Promise<AuthResponse> {
+  const res = await fetch(`${BASE}/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password, display_name: displayName }),
+  });
+  if (!res.ok) {
+    const body = await readBody(res);
+    const message = (body as { detail?: string } | null)?.detail || `Registration failed (${res.status})`;
+    throw new ApiError(res.status, message, body);
+  }
+  const data: AuthResponse = await res.json();
+  setStoredToken(data.access_token);
+  return data;
+}
+
+export async function getMe(): Promise<AuthUser> {
+  const res = await apiFetch("/auth/me");
+  if (!res.ok) throw new ApiError(res.status, "Not authenticated", null);
   return res.json();
+}
+
+export function logout(): void {
+  clearStoredToken();
 }
 
 export async function getPendingLectures(): Promise<TeachersNoteSummary[]> {
@@ -384,6 +400,12 @@ export async function updateProfileCourses(courseIds: number[]): Promise<Student
 
 export async function getProfileCourseOptions(): Promise<ProfileCourseOptions> {
   const res = await apiFetch("/profile/course-options", { cache: "no-store" });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function getPublicPrograms(): Promise<Program[]> {
+  const res = await apiFetch("/programs", { cache: "no-store" });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -546,7 +568,7 @@ export function subscribeProcessJobEvents(
   if (typeof options.lastEventId === "number" && options.lastEventId > 0) {
     params.set("last_event_id", String(options.lastEventId));
   }
-  params.set("token", API_KEY);
+  params.set("token", getStoredToken() ?? "");
   const source = new EventSource(`${BASE}/process/jobs/${jobId}/events?${params.toString()}`);
   let closed = false;
 

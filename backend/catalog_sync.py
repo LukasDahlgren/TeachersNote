@@ -17,7 +17,12 @@ import sys
 from types import ModuleType
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-COLLECTOR_PATH = REPO_ROOT / "scripts" / "collect_idsv_catalog.py"
+_APP_DIR = Path(__file__).resolve().parent
+COLLECTOR_PATH = (
+    _APP_DIR / "scripts" / "collect_idsv_catalog.py"
+    if (_APP_DIR / "scripts" / "collect_idsv_catalog.py").exists()
+    else REPO_ROOT / "scripts" / "collect_idsv_catalog.py"
+)
 COLLECTOR_MODULE_NAME = "teachersnote_collect_idsv_catalog"
 DSV_INSTITUTION_NAME = "Institutionen för data- och systemvetenskap"
 

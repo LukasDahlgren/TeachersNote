@@ -1,0 +1,20 @@
+[build]
+builder = "dockerfile"
+
+[[services]]
+name = "backend"
+source = "backend"
+dockerfile = "Dockerfile"
+
+[services.deploy]
+startCommand = "gunicorn main:app --worker-class uvicorn.workers.UvicornWorker --workers 1 --bind 0.0.0.0:$PORT --timeout 300"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+
+[[services]]
+name = "frontend"
+source = "frontend"
+dockerfile = "Dockerfile"
+
+[services.build]
+buildArgs = { VITE_API_URL = "$BACKEND_URL" }

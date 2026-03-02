@@ -1,4 +1,5 @@
 from datetime import datetime
+from uuid import uuid4
 
 from sqlalchemy import Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, JSON, SmallInteger, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, relationship
@@ -6,6 +7,18 @@ from sqlalchemy.orm import DeclarativeBase, relationship
 
 class Base(DeclarativeBase):
     pass
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+    uuid          = Column(String(36), nullable=False, unique=True, index=True, default=lambda: str(uuid4()))
+    email         = Column(String(255), nullable=False, unique=True, index=True)
+    password_hash = Column(String(255), nullable=False)
+    display_name  = Column(String(255), nullable=True)
+    is_active     = Column(Boolean, nullable=False, default=True)
+    created_at    = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
 class Lecture(Base):

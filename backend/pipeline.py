@@ -67,9 +67,14 @@ TRANSCRIBE_SAFE_BYTES = max(
     1_000_000,
     int(TRANSCRIBE_MAX_UPLOAD_BYTES * (TRANSCRIBE_CHUNK_HEADROOM_PCT / 100)),
 )
-ALIGN_MAX_TRANSCRIPT_SEGMENTS = _env_int("ALIGN_MAX_TRANSCRIPT_SEGMENTS", 900, minimum=100)
+ALIGN_MAX_TRANSCRIPT_SEGMENTS = _env_int("ALIGN_MAX_TRANSCRIPT_SEGMENTS", 450, minimum=100)
 ALIGN_MAX_SEGMENT_CHARS = _env_int("ALIGN_MAX_SEGMENT_CHARS", 180, minimum=40)
 ALIGN_MAX_SLIDE_CHARS = _env_int("ALIGN_MAX_SLIDE_CHARS", 1200, minimum=120)
+
+# Global semaphore caps total concurrent enrichment API calls across ALL running pipelines.
+# Raise this (and ENRICH_MAX_WORKERS) together when upgrading to a higher API tier.
+_ENRICH_GLOBAL_MAX_CONCURRENT = _env_int("ENRICH_GLOBAL_MAX_CONCURRENT", 3, minimum=1)
+_global_enrich_semaphore = threading.Semaphore(_ENRICH_GLOBAL_MAX_CONCURRENT)
 
 
 def enrich_slide_notes(
@@ -596,15 +601,16 @@ def enrich(
         print(f"  ⏳ Enriching slide {a['slide']} ({in_progress_done + 1}/{total})...", flush=True)
 
         def slide_log(msg: str) -> None:
-            print(f"  {msg}", flush=True)
+            pass  # enrich_slide_with_retry already prints internally; callback avoids duplicate output
 
-        enriched, metrics = enrich_slide_notes(
-            slide,
-            text,
-            max_attempts=ENRICH_MAX_ATTEMPTS,
-            log_callback=slide_log,
-            return_metrics=True,
-        )
+        with _global_enrich_semaphore:
+            enriched, metrics = enrich_slide_notes(
+                slide,
+                text,
+                max_attempts=ENRICH_MAX_ATTEMPTS,
+                log_callback=slide_log,
+                return_metrics=True,
+            )
         with done_lock:
             done_count += 1
             local_done = done_count

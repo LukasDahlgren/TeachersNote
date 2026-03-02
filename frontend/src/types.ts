@@ -201,6 +201,21 @@ export interface UploadProcessJobEvent extends UploadProcessJobStatus {
 
 export type UploadProcessJobStartResponse = UploadProcessJobStatus;
 
+export interface AuthUser {
+  id: number;
+  uuid: string;
+  email: string;
+  display_name: string | null;
+  is_admin: boolean;
+  created_at: string;
+}
+
+export interface AuthResponse {
+  access_token: string;
+  token_type: string;
+  user: AuthUser;
+}
+
 export function isEnrichedSlideInvalid(enriched?: EnrichedSlide | null): boolean {
   if (!enriched) return true;
   const summary = enriched.summary?.trim() ?? "";

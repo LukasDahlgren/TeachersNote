@@ -42,6 +42,25 @@ async def init_db() -> None:
 
 def _ensure_schema_compatibility(sync_conn) -> None:
     inspector = inspect(sync_conn)
+
+    sync_conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                uuid VARCHAR(36) NOT NULL UNIQUE,
+                email VARCHAR(255) NOT NULL UNIQUE,
+                password_hash VARCHAR(255) NOT NULL,
+                display_name VARCHAR(255) NULL,
+                is_active BOOLEAN NOT NULL DEFAULT 1,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                INDEX ix_users_uuid (uuid),
+                INDEX ix_users_email (email)
+            )
+            """
+        )
+    )
+
     lecture_columns = {column["name"] for column in inspector.get_columns("lectures")}
     if "is_archived" not in lecture_columns:
         sync_conn.execute(

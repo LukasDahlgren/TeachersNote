@@ -5,15 +5,15 @@ import {
   archiveLecture,
   buildAssetUrl,
   checkHealth,
-  getCurrentUserId,
   getDeletedLectures,
   getLectures,
   getLecture,
+  getMe,
   getMyLectures,
   getProfile,
   getProcessJob,
   getRegenerateNotesJob,
-  registerAsAdmin,
+  logout,
   restoreLecture,
   saveLecture,
   startProcessJob,
@@ -33,7 +33,11 @@ import { type ProcessChatEntry } from "./components/ProcessChat";
 import Homepage from "./components/Homepage";
 import AllLecturesPlaceholder from "./components/AllLecturesPlaceholder";
 import AdminPanel from "./components/AdminPanel";
+import LoginPage from "./components/LoginPage";
+import SignupPage from "./components/SignupPage";
+import ProfilePage from "./components/ProfilePage";
 import {
+  type AuthUser,
   type ProcessResult,
   type TeachersNoteSummary,
   type RegenerateNotesJobStatus,
@@ -46,8 +50,6 @@ import {
 
 const ACTIVE_PROCESS_JOB_STORAGE_KEY = "teachers-note.active-process-job-id";
 const LEGACY_ACTIVE_PROCESS_JOB_STORAGE_KEY = "lecture-summary.active-process-job-id";
-const IS_ADMIN_STORAGE_KEY = "teachers-note.is-admin";
-const LEGACY_IS_ADMIN_STORAGE_KEY = "lecture-summary.is-admin";
 const DEMO_LECTURE_NAME = "IB133N-lecture-14-2026";
 const PROCESS_DETAIL_RETRY_DELAYS_MS = [700, 1300, 2000];
 const PROCESS_STATUS_POLL_MS = 5000;
@@ -167,14 +169,11 @@ export default function App() {
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [deletePending, setDeletePending] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<{ id: number; name: string } | null>(null);
-  const [isAdmin, setIsAdmin] = useState(() =>
-    readStorageWithMigration(IS_ADMIN_STORAGE_KEY, LEGACY_IS_ADMIN_STORAGE_KEY) === "true"
-  );
-  const [showAdminModal, setShowAdminModal] = useState(false);
-  const [adminSecretInput, setAdminSecretInput] = useState("");
-  const [adminRegisterError, setAdminRegisterError] = useState<string | null>(null);
-  const [adminRegisterLoading, setAdminRegisterLoading] = useState(false);
-  const currentUserId = getCurrentUserId();
+  type AuthState = "loading" | "unauthenticated" | "authenticated";
+  const [authState, setAuthState] = useState<AuthState>("loading");
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authView, setAuthView] = useState<"login" | "signup">("login");
+  const isAdmin = authUser?.is_admin ?? false;
 
   const regenUnsubscribeRef = useRef<(() => void) | null>(null);
   const regenReconnectTimerRef = useRef<number | null>(null);
@@ -187,7 +186,6 @@ export default function App() {
   const processLastEventIdRef = useRef(0);
   const demoRegenRunRef = useRef(0);
   const demoRunRef = useRef(0);
-  const initialAdminRedirectHandledRef = useRef(false);
   const navigate = useNavigate();
   const location = useLocation();
   const lectureRouteMatch = useMatch("/lectures/:lectureId");
@@ -234,18 +232,24 @@ export default function App() {
 
   useEffect(() => {
     checkHealth().then(setBackendOnline);
-    void fetchLectures();
-    void fetchProfile();
-  }, [fetchLectures, fetchProfile]);
+  }, []);
 
   useEffect(() => {
-    if (initialAdminRedirectHandledRef.current) return;
-    initialAdminRedirectHandledRef.current = true;
+    if (authState !== "authenticated") return;
+    void fetchLectures();
+    void fetchProfile();
+  }, [authState, fetchLectures, fetchProfile]);
 
-    if (isAdmin && location.pathname === "/") {
-      navigate("/admin", { replace: true });
-    }
-  }, [isAdmin, location.pathname, navigate]);
+  useEffect(() => {
+    getMe()
+      .then((user) => {
+        setAuthUser(user);
+        setAuthState("authenticated");
+      })
+      .catch(() => {
+        setAuthState("unauthenticated");
+      });
+  }, []);
 
   const stopRegenerationSubscription = useCallback(() => {
     if (regenUnsubscribeRef.current) {
@@ -883,32 +887,20 @@ export default function App() {
     navigate("/");
   }, [navigate]);
 
-  const handleOpenAdminPanel = useCallback(() => {
-    navigate("/admin");
-  }, [navigate]);
+  const handleLogin = useCallback((user: AuthUser) => {
+    setAuthUser(user);
+    setAuthState("authenticated");
+  }, []);
 
   const handleLogout = useCallback(() => {
-    clearStorageWithLegacy(IS_ADMIN_STORAGE_KEY, LEGACY_IS_ADMIN_STORAGE_KEY);
-    setIsAdmin(false);
-    navigate("/");
-  }, [navigate]);
-
-  const handleRegisterAdmin = useCallback(async () => {
-    setAdminRegisterError(null);
-    setAdminRegisterLoading(true);
-    try {
-      await registerAsAdmin(adminSecretInput.trim());
-      window.localStorage.setItem(IS_ADMIN_STORAGE_KEY, "true");
-      setIsAdmin(true);
-      setShowAdminModal(false);
-      setAdminSecretInput("");
-      navigate("/admin");
-    } catch (err) {
-      setAdminRegisterError(err instanceof ApiError ? err.message : "Registration failed.");
-    } finally {
-      setAdminRegisterLoading(false);
-    }
-  }, [adminSecretInput, navigate]);
+    logout();
+    setAuthUser(null);
+    setAuthState("unauthenticated");
+    setLectures([]);
+    setSavedLectures([]);
+    setProfile(null);
+    setMainView({ view: "empty" });
+  }, []);
 
   useEffect(() => {
     if (location.pathname === "/workspace" && mainView.view === "empty") {
@@ -1362,29 +1354,44 @@ export default function App() {
     </>
   );
 
+  if (authState === "loading") {
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", fontFamily: "system-ui, sans-serif" }}>
+        Loading...
+      </div>
+    );
+  }
+  if (authState === "unauthenticated") {
+    return authView === "login" ? (
+      <LoginPage
+        onLogin={handleLogin}
+        onGoToSignup={() => setAuthView("signup")}
+      />
+    ) : (
+      <SignupPage
+        onSignup={handleLogin}
+        onGoToLogin={() => setAuthView("login")}
+      />
+    );
+  }
+
   return (
     <ErrorBoundary>
     <div className="app-shell">
       <Sidebar
         savedLectures={sidebarSavedLectures}
-        archivedLectures={sidebarArchivedLectures}
-        deletedLectures={deletedLectures}
         loading={lecturesLoading}
         selectedId={selectedId}
         onSelect={handleSelectLecture}
         onNewLecture={handleNewLecture}
         onGoHome={handleGoHome}
-        onRestore={handleRestoreLecture}
         showUploadConsole={showSidebarUploadConsole}
         uploadLoadingLabel={uploadLoadingLabel}
         processJob={processJob}
         processChat={processChat}
         processingLectureName={processingLectureName}
-        isAdmin={isAdmin}
-        currentUserId={currentUserId}
-        onOpenAdminPanel={handleOpenAdminPanel}
-        onRegisterAdmin={() => setShowAdminModal(true)}
-        onLogout={handleLogout}
+        currentUserId={authUser?.uuid ?? ""}
+        onOpenProfile={() => navigate("/profile")}
       />
 
       <main className={`main-content${isAdminRoute ? " main-content--admin" : ""}`}>
@@ -1443,6 +1450,22 @@ export default function App() {
             path="/admin"
             element={isAdmin ? <AdminPanel onBack={handleGoHome} /> : <Navigate to="/" replace />}
           />
+          <Route
+            path="/profile"
+            element={(
+              <ProfilePage
+                authUser={authUser!}
+                profile={profile}
+                isAdmin={isAdmin}
+                archivedLectures={sidebarArchivedLectures}
+                deletedLectures={deletedLectures}
+                onLogout={handleLogout}
+                onRestore={handleRestoreLecture}
+                onProfileChange={handleProfileChange}
+                onSelectLecture={handleSelectLecture}
+              />
+            )}
+          />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
@@ -1482,41 +1505,6 @@ export default function App() {
         </div>
       )}
 
-      {showAdminModal && (
-        <div className="modal-overlay" onClick={() => setShowAdminModal(false)}>
-          <div className="modal-box" onClick={(e) => e.stopPropagation()}>
-            <h2 className="modal-title">Register as Admin</h2>
-            <p className="modal-description">Enter the admin secret to gain admin access.</p>
-            <input
-              className="modal-input"
-              type="password"
-              placeholder="Admin secret"
-              value={adminSecretInput}
-              onChange={(e) => setAdminSecretInput(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") void handleRegisterAdmin(); }}
-              autoFocus
-            />
-            {adminRegisterError && (
-              <p className="modal-error">{adminRegisterError}</p>
-            )}
-            <div className="modal-actions">
-              <button
-                className="modal-btn modal-btn--secondary"
-                onClick={() => { setShowAdminModal(false); setAdminSecretInput(""); setAdminRegisterError(null); }}
-              >
-                Cancel
-              </button>
-              <button
-                className="modal-btn modal-btn--primary"
-                onClick={() => void handleRegisterAdmin()}
-                disabled={adminRegisterLoading || !adminSecretInput.trim()}
-              >
-                {adminRegisterLoading ? "Registering…" : "Register"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
     </ErrorBoundary>
   );

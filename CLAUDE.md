@@ -73,7 +73,8 @@ DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME   # MySQL connection
 ANTHROPIC_API_KEY                                   # Claude API
 GROQ_API_KEY                                        # Groq Whisper API
 API_KEY                                             # Required app API key
-ENRICH_MAX_WORKERS                                  # Optional; default 4 (keep at 4 — higher values hit Groq/Anthropic rate limits)
+ENRICH_MAX_WORKERS                                  # Optional; default 2 (raise together with ENRICH_GLOBAL_MAX_CONCURRENT when upgrading API tier)
+ENRICH_GLOBAL_MAX_CONCURRENT                        # Optional; default 3 — global cap on concurrent enrichment API calls across ALL pipelines
 ENRICH_MAX_TRANSCRIPT_WORDS                         # Recommended runtime: 500 (code default: 700)
 ENRICH_MAX_OUTPUT_TOKENS                            # Recommended runtime: 900 (code default: 320)
 ENRICH_MAX_ATTEMPTS                                 # Optional; default 4

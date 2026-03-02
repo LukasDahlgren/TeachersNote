@@ -12,12 +12,11 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Header, Query, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from pydantic import BaseModel
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from fastapi.security import APIKeyHeader
 from sqlalchemy import delete, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,6 +32,14 @@ from media_download import (
     resolve_recording_source,
     validate_remote_media_url,
 )
+from auth import (
+    create_access_token,
+    get_current_user,
+    get_current_user_from_query,
+    hash_password,
+    verify_password,
+    JWT_SECRET_KEY,
+)
 from models import (
     AdminUser,
     Alignment,
@@ -47,6 +54,7 @@ from models import (
     StudentCourse,
     StudentProfile,
     TranscriptSegment,
+    User,
 )
 from pipeline import (
     enrich_slide_notes,
@@ -68,9 +76,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+_origins_env = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173")
+ALLOWED_ORIGINS = [o.strip() for o in _origins_env.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -98,10 +109,8 @@ REGEN_JOB_STORE: dict[str, dict[str, Any]] = {}
 ACTIVE_REGEN_JOB_BY_LECTURE: dict[int, str] = {}
 REGEN_JOB_LOCK = asyncio.Lock()
 UPLOAD_JOB_STORE: dict[str, dict[str, Any]] = {}
-ACTIVE_UPLOAD_JOB_ID: str | None = None
+ACTIVE_UPLOAD_JOB_IDS: dict[str, str] = {}  # user_id → job_id
 UPLOAD_JOB_LOCK = asyncio.Lock()
-DEFAULT_USER_ID = "local-dev-user"
-USER_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 DEMO_LECTURE_NAME = "IB133N-lecture-14-2026"
 
 
@@ -116,48 +125,14 @@ DISABLE_EXTERNAL_AI = _env_truthy("DISABLE_EXTERNAL_AI", default=False)
 if DISABLE_EXTERNAL_AI:
     LOGGER.warning("DISABLE_EXTERNAL_AI=true: regeneration uses deterministic fallback notes only.")
 
-APP_API_KEY = os.getenv("API_KEY")
-if not APP_API_KEY:
+if not JWT_SECRET_KEY:
     raise RuntimeError(
-        "API_KEY environment variable is not set. Add it to backend/.env before starting the server."
+        "JWT_SECRET_KEY environment variable is not set. Add it to backend/.env before starting the server."
     )
 
 ADMIN_SECRET = os.getenv("ADMIN_SECRET")
 if not ADMIN_SECRET:
     LOGGER.warning("ADMIN_SECRET is not set. Admin registration will be disabled.")
-
-_API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
-
-
-def _require_api_key(key: str | None = Depends(_API_KEY_HEADER)) -> None:
-    if key != APP_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-
-
-async def _require_api_key_or_token(
-    key: str | None = Depends(_API_KEY_HEADER),
-    token: str | None = Query(default=None),
-) -> None:
-    """Used for SSE endpoints where EventSource cannot send custom headers."""
-    if key == APP_API_KEY or token == APP_API_KEY:
-        return
-    raise HTTPException(status_code=401, detail="Invalid or missing API key")
-
-
-def _resolve_user_id(header_value: str | None) -> str:
-    value = (header_value or "").strip()
-    if not value:
-        return DEFAULT_USER_ID
-    if not USER_ID_PATTERN.fullmatch(value):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid X-User-Id header. Use 1-128 chars matching [A-Za-z0-9._:-].",
-        )
-    return value
-
-
-def get_current_user_id(x_user_id: str | None = Header(default=None, alias="X-User-Id")) -> str:
-    return _resolve_user_id(x_user_id)
 
 
 async def _is_admin(user_id: str, db: AsyncSession) -> bool:
@@ -839,15 +814,15 @@ def _upload_sse_event(event_name: str, payload: dict[str, Any], event_id: int) -
 async def _cleanup_expired_upload_jobs() -> None:
     now = time.time()
     async with UPLOAD_JOB_LOCK:
-        global ACTIVE_UPLOAD_JOB_ID
         expired = [
             job_id
             for job_id, job in UPLOAD_JOB_STORE.items()
             if job["status"] in TERMINAL_JOB_STATUSES and (now - float(job["updated_at"])) > UPLOAD_JOB_TTL_SECONDS
         ]
         for job_id in expired:
-            if ACTIVE_UPLOAD_JOB_ID == job_id:
-                ACTIVE_UPLOAD_JOB_ID = None
+            uid = UPLOAD_JOB_STORE.get(job_id, {}).get("user_id")
+            if uid and ACTIVE_UPLOAD_JOB_IDS.get(uid) == job_id:
+                ACTIVE_UPLOAD_JOB_IDS.pop(uid, None)
             UPLOAD_JOB_STORE.pop(job_id, None)
 
 
@@ -859,23 +834,24 @@ async def _get_upload_job_snapshot(job_id: str) -> dict[str, Any] | None:
         return dict(job)
 
 
-async def _get_active_upload_job() -> dict[str, Any] | None:
+async def _get_active_upload_job(user_id: str) -> dict[str, Any] | None:
     async with UPLOAD_JOB_LOCK:
-        global ACTIVE_UPLOAD_JOB_ID
-        if not ACTIVE_UPLOAD_JOB_ID:
+        job_id = ACTIVE_UPLOAD_JOB_IDS.get(user_id)
+        if not job_id:
             return None
-        job = UPLOAD_JOB_STORE.get(ACTIVE_UPLOAD_JOB_ID)
+        job = UPLOAD_JOB_STORE.get(job_id)
         if not job or job["status"] in TERMINAL_JOB_STATUSES:
-            ACTIVE_UPLOAD_JOB_ID = None
+            ACTIVE_UPLOAD_JOB_IDS.pop(user_id, None)
             return None
         return dict(job)
 
 
-async def _create_upload_job() -> dict[str, Any]:
+async def _create_upload_job(user_id: str) -> dict[str, Any]:
     job_id = uuid.uuid4().hex
     now = time.time()
     job = {
         "job_id": job_id,
+        "user_id": user_id,
         "status": JOB_STATUS_QUEUED,
         "current_stage": "upload",
         "progress_pct": 0,
@@ -887,9 +863,8 @@ async def _create_upload_job() -> dict[str, Any]:
         "events": [],
     }
     async with UPLOAD_JOB_LOCK:
-        global ACTIVE_UPLOAD_JOB_ID
         UPLOAD_JOB_STORE[job_id] = job
-        ACTIVE_UPLOAD_JOB_ID = job_id
+        ACTIVE_UPLOAD_JOB_IDS[user_id] = job_id
     return dict(job)
 
 
@@ -901,7 +876,6 @@ async def _update_upload_job(
     **updates: Any,
 ) -> dict[str, Any] | None:
     async with UPLOAD_JOB_LOCK:
-        global ACTIVE_UPLOAD_JOB_ID
         job = UPLOAD_JOB_STORE.get(job_id)
         if not job:
             return None
@@ -930,8 +904,10 @@ async def _update_upload_job(
             if len(job["events"]) > 2000:
                 job["events"] = job["events"][-1000:]
 
-        if job["status"] in TERMINAL_JOB_STATUSES and ACTIVE_UPLOAD_JOB_ID == job_id:
-            ACTIVE_UPLOAD_JOB_ID = None
+        if job["status"] in TERMINAL_JOB_STATUSES:
+            uid = job.get("user_id")
+            if uid and ACTIVE_UPLOAD_JOB_IDS.get(uid) == job_id:
+                ACTIVE_UPLOAD_JOB_IDS.pop(uid, None)
 
         return dict(job)
 
@@ -1480,12 +1456,89 @@ async def lecture_to_response(db: AsyncSession, lecture_id: int) -> dict:
     }
 
 
+class AuthRegisterRequest(BaseModel):
+    email: str
+    password: str
+    display_name: str | None = None
+
+
+class AuthLoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+def _user_payload(user: User, *, is_admin: bool) -> dict[str, Any]:
+    return {
+        "id": user.id,
+        "uuid": user.uuid,
+        "email": user.email,
+        "display_name": user.display_name,
+        "is_admin": is_admin,
+        "created_at": user.created_at.isoformat(),
+    }
+
+
+@app.post("/auth/register", status_code=status.HTTP_201_CREATED)
+async def auth_register(body: AuthRegisterRequest, db: AsyncSession = Depends(get_db)):
+    if "@" not in body.email:
+        raise HTTPException(status_code=400, detail="Invalid email address.")
+    if len(body.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+
+    email = body.email.strip().lower()
+    existing = await db.execute(select(User).where(User.email == email))
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="An account with this email already exists.")
+
+    user = User(
+        email=email,
+        password_hash=hash_password(body.password),
+        display_name=(body.display_name or "").strip() or None,
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+
+    token = create_access_token(user.uuid)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": _user_payload(user, is_admin=False),
+    }
+
+
+@app.post("/auth/login")
+async def auth_login(body: AuthLoginRequest, db: AsyncSession = Depends(get_db)):
+    email = body.email.strip().lower()
+    result = await db.execute(select(User).where(User.email == email, User.is_active == True))
+    user = result.scalar_one_or_none()
+    if not user or not verify_password(body.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+    token = create_access_token(user.uuid)
+    is_admin = await _is_admin(user.uuid, db)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": _user_payload(user, is_admin=is_admin),
+    }
+
+
+@app.get("/auth/me")
+async def auth_me(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    is_admin = await _is_admin(current_user.uuid, db)
+    return _user_payload(current_user, is_admin=is_admin)
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
-@app.get("/demo", dependencies=[Depends(_require_api_key)])
+@app.get("/demo", dependencies=[Depends(get_current_user)])
 async def demo(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(Lecture)
@@ -1502,16 +1555,16 @@ async def demo(db: AsyncSession = Depends(get_db)):
     )
 
 
-@app.get("/pdf/{filename}", dependencies=[Depends(_require_api_key_or_token)])
-def serve_pdf(filename: str):
+@app.get("/pdf/{filename}")
+def serve_pdf(filename: str, _auth: User = Depends(get_current_user_from_query)):
     path = _resolve_pdf_download_path(filename)
     if not path:
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(path, media_type="application/pdf")
 
 
-@app.get("/download/{filename}", dependencies=[Depends(_require_api_key_or_token)])
-def download(filename: str):
+@app.get("/download/{filename}")
+def download(filename: str, _auth: User = Depends(get_current_user_from_query)):
     path = _resolve_generated_download_path(filename)
     if not path:
         raise HTTPException(status_code=404, detail="File not found")
@@ -1522,7 +1575,7 @@ def download(filename: str):
     )
 
 
-@app.post("/process/jobs", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(_require_api_key)])
+@app.post("/process/jobs", status_code=status.HTTP_202_ACCEPTED)
 async def start_process_job(
     pdf: UploadFile = File(...),
     audio: UploadFile | None = File(None),
@@ -1531,10 +1584,11 @@ async def start_process_job(
     kind: str = Form("lecture"),
     lecture: str = Form(...),
     year: str = Form(...),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     await _cleanup_expired_upload_jobs()
-    active_job = await _get_active_upload_job()
+    active_job = await _get_active_upload_job(user_id)
     if active_job:
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
@@ -1552,7 +1606,7 @@ async def start_process_job(
             raise HTTPException(status_code=400, detail="Missing audio_url for URL recording source.")
         validated_audio_url = _validate_audio_url_or_400(resolved_audio_url)
 
-    job = await _create_upload_job()
+    job = await _create_upload_job(user_id)
     job_id = str(job["job_id"])
     tmp_dir = UPLOADS_DIR / f"process-{job_id}"
     pdf_path = tmp_dir / "slides.pdf"
@@ -1620,7 +1674,7 @@ async def start_process_job(
     return _upload_job_public_state(snapshot)
 
 
-@app.get("/process/jobs/{job_id}", dependencies=[Depends(_require_api_key)])
+@app.get("/process/jobs/{job_id}", dependencies=[Depends(get_current_user)])
 async def get_process_job(job_id: str):
     await _cleanup_expired_upload_jobs()
     snapshot = await _get_upload_job_snapshot(job_id)
@@ -1634,7 +1688,7 @@ async def stream_process_job(
     job_id: str,
     request: Request,
     last_event_id: int | None = None,
-    _auth: None = Depends(_require_api_key_or_token),
+    _auth: User = Depends(get_current_user_from_query),
 ):
     await _cleanup_expired_upload_jobs()
     snapshot = await _get_upload_job_snapshot(job_id)
@@ -1701,7 +1755,7 @@ async def stream_process_job(
     )
 
 
-@app.post("/process", dependencies=[Depends(_require_api_key)])
+@app.post("/process")
 async def process(
     pdf: UploadFile = File(...),
     audio: UploadFile | None = File(None),
@@ -1711,8 +1765,9 @@ async def process(
     lecture: str = Form(...),
     year: str = Form(...),
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     lecture_name, pptx_path, saved_pdf_path, normalized_courseid = _resolve_upload_naming(courseid, kind, lecture, year)
     recording_source, resolved_audio_url = _resolve_recording_source_or_400(audio=audio, audio_url=audio_url)
     validated_audio_url: str | None = None
@@ -1783,11 +1838,12 @@ async def process(
     }
 
 
-@app.get("/lectures", dependencies=[Depends(_require_api_key)])
+@app.get("/lectures")
 async def list_lectures(
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     admin = await _is_admin(user_id, db)
     if admin:
         visibility_filter = Lecture.is_deleted == False
@@ -1814,11 +1870,12 @@ async def list_lectures(
     ]
 
 
-@app.get("/lectures/my", dependencies=[Depends(_require_api_key)])
+@app.get("/lectures/my")
 async def list_my_lectures(
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     admin = await _is_admin(user_id, db)
     query = (
         select(Lecture)
@@ -1849,11 +1906,12 @@ async def list_my_lectures(
     ]
 
 
-@app.get("/lectures/deleted", dependencies=[Depends(_require_api_key)])
+@app.get("/lectures/deleted")
 async def list_deleted_lectures(
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     await _require_admin_user_or_403(user_id=user_id, db=db)
     result = await db.execute(
         select(Lecture).where(Lecture.is_deleted == True).order_by(Lecture.created_at.desc())
@@ -1874,12 +1932,13 @@ async def list_deleted_lectures(
     ]
 
 
-@app.get("/lectures/{lecture_id}", dependencies=[Depends(_require_api_key)])
+@app.get("/lectures/{lecture_id}")
 async def get_lecture(
     lecture_id: int,
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     lecture = await get_lecture_or_404(db, lecture_id)
     admin = await _is_admin(user_id, db)
     assert_user_can_view_lecture(user_id=user_id, lecture=lecture, is_admin=admin)
@@ -1900,12 +1959,13 @@ async def get_lecture(
     }
 
 
-@app.put("/lectures/{lecture_id}/save", dependencies=[Depends(_require_api_key)])
+@app.put("/lectures/{lecture_id}/save")
 async def save_lecture(
     lecture_id: int,
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     lecture = await get_lecture_or_404(db, lecture_id)
     admin = await _is_admin(user_id, db)
     assert_user_can_view_lecture(user_id=user_id, lecture=lecture, is_admin=admin)
@@ -1919,12 +1979,13 @@ async def save_lecture(
     )
 
 
-@app.delete("/lectures/{lecture_id}/save", dependencies=[Depends(_require_api_key)])
+@app.delete("/lectures/{lecture_id}/save")
 async def unsave_lecture(
     lecture_id: int,
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     lecture = await get_lecture_or_404(db, lecture_id)
     admin = await _is_admin(user_id, db)
     assert_user_can_view_lecture(user_id=user_id, lecture=lecture, is_admin=admin)
@@ -1938,24 +1999,26 @@ async def unsave_lecture(
     )
 
 
-@app.post("/lectures/{lecture_id}/archive", dependencies=[Depends(_require_api_key)])
+@app.post("/lectures/{lecture_id}/archive")
 async def set_archive_state(
     lecture_id: int,
     archive: bool = Query(default=True),
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     await _require_admin_user_or_403(user_id=user_id, db=db)
     lecture = await get_lecture_or_404(db, lecture_id)
     return await _apply_archive_state(db, lecture, archive=archive)
 
 
-@app.post("/lectures/{lecture_id}/trash", dependencies=[Depends(_require_api_key)])
+@app.post("/lectures/{lecture_id}/trash")
 async def trash_lecture(
     lecture_id: int,
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     await _require_admin_user_or_403(user_id=user_id, db=db)
     lecture = await get_lecture_or_404(db, lecture_id)
     lecture.is_deleted = True
@@ -1963,12 +2026,13 @@ async def trash_lecture(
     return {"id": lecture.id, "is_deleted": True}
 
 
-@app.post("/lectures/{lecture_id}/restore", dependencies=[Depends(_require_api_key)])
+@app.post("/lectures/{lecture_id}/restore")
 async def restore_lecture(
     lecture_id: int,
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     await _require_admin_user_or_403(user_id=user_id, db=db)
     lecture = await get_lecture_or_404(db, lecture_id)
     lecture.is_deleted = False
@@ -2019,20 +2083,22 @@ class CatalogSyncRequest(BaseModel):
     dry_run: bool = False
 
 
-@app.get("/profile", dependencies=[Depends(_require_api_key)])
+@app.get("/profile")
 async def get_profile(
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     return await _load_profile_payload(db, user_id)
 
 
-@app.put("/profile/program", dependencies=[Depends(_require_api_key)])
+@app.put("/profile/program")
 async def set_profile_program(
     body: ProfileProgramUpdateRequest,
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     if body.program_id is not None:
         program = await _get_program_or_404(db, body.program_id)
         if not bool(program.is_active):
@@ -2044,12 +2110,13 @@ async def set_profile_program(
     return await _load_profile_payload(db, user_id)
 
 
-@app.put("/profile/courses", dependencies=[Depends(_require_api_key)])
+@app.put("/profile/courses")
 async def set_profile_courses(
     body: ProfileCoursesUpdateRequest,
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     requested_ids = list(dict.fromkeys(body.course_ids))
     if any(course_id <= 0 for course_id in requested_ids):
         raise HTTPException(status_code=400, detail="course_ids must contain positive integers.")
@@ -2076,11 +2143,12 @@ async def set_profile_courses(
     return await _load_profile_payload(db, user_id)
 
 
-@app.get("/profile/course-options", dependencies=[Depends(_require_api_key)])
+@app.get("/profile/course-options")
 async def get_profile_course_options(
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     admin = await _is_admin(user_id, db)
     profile_result = await db.execute(select(StudentProfile).where(StudentProfile.user_id == user_id))
     profile = profile_result.scalar_one_or_none()
@@ -2150,22 +2218,33 @@ async def get_profile_course_options(
     }
 
 
-@app.get("/admin/programs", dependencies=[Depends(_require_api_key)])
+@app.get("/programs")
+async def list_public_programs(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(Program).where(Program.is_active == True).order_by(Program.code.asc()))
+    return [_program_payload(program) for program in result.scalars().all()]
+
+
+@app.get("/admin/programs")
 async def list_programs(
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     await _require_admin_user_or_403(user_id=user_id, db=db)
     result = await db.execute(select(Program).order_by(Program.code.asc()))
     return [_program_payload(program) for program in result.scalars().all()]
 
 
-@app.post("/admin/programs", dependencies=[Depends(_require_api_key)])
+@app.post("/admin/programs")
 async def create_program(
     body: ProgramCreateRequest,
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     await _require_admin_user_or_403(user_id=user_id, db=db)
     code = _normalize_catalog_code(body.code)
     if not code:
@@ -2183,13 +2262,14 @@ async def create_program(
     return _program_payload(program)
 
 
-@app.patch("/admin/programs/{program_id}", dependencies=[Depends(_require_api_key)])
+@app.patch("/admin/programs/{program_id}")
 async def update_program(
     program_id: int,
     body: ProgramUpdateRequest,
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     await _require_admin_user_or_403(user_id=user_id, db=db)
     program = await _get_program_or_404(db, program_id)
 
@@ -2215,22 +2295,24 @@ async def update_program(
     return _program_payload(program)
 
 
-@app.get("/admin/courses", dependencies=[Depends(_require_api_key)])
+@app.get("/admin/courses")
 async def list_courses(
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     await _require_admin_user_or_403(user_id=user_id, db=db)
     result = await db.execute(select(Course).order_by(Course.code.asc()))
     return [_course_payload(course) for course in result.scalars().all()]
 
 
-@app.post("/admin/courses", dependencies=[Depends(_require_api_key)])
+@app.post("/admin/courses")
 async def create_course(
     body: CourseCreateRequest,
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     await _require_admin_user_or_403(user_id=user_id, db=db)
     code = _normalize_catalog_code(body.code)
     if not code:
@@ -2249,13 +2331,14 @@ async def create_course(
     return _course_payload(course)
 
 
-@app.patch("/admin/courses/{course_id}", dependencies=[Depends(_require_api_key)])
+@app.patch("/admin/courses/{course_id}")
 async def update_course(
     course_id: int,
     body: CourseUpdateRequest,
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     await _require_admin_user_or_403(user_id=user_id, db=db)
     course = await _get_course_or_404(db, course_id)
 
@@ -2283,12 +2366,13 @@ async def update_course(
     return _course_payload(course)
 
 
-@app.get("/admin/programs/{program_id}/courses", dependencies=[Depends(_require_api_key)])
+@app.get("/admin/programs/{program_id}/courses")
 async def list_program_courses(
     program_id: int,
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     await _require_admin_user_or_403(user_id=user_id, db=db)
     program = await _get_program_or_404(db, program_id)
     courses_result = await db.execute(
@@ -2304,13 +2388,14 @@ async def list_program_courses(
     }
 
 
-@app.put("/admin/programs/{program_id}/courses/{course_id}", dependencies=[Depends(_require_api_key)])
+@app.put("/admin/programs/{program_id}/courses/{course_id}")
 async def map_course_to_program(
     program_id: int,
     course_id: int,
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     await _require_admin_user_or_403(user_id=user_id, db=db)
     await _get_program_or_404(db, program_id)
     await _get_course_or_404(db, course_id)
@@ -2327,13 +2412,14 @@ async def map_course_to_program(
     return {"program_id": program_id, "course_id": course_id, "mapped": True}
 
 
-@app.delete("/admin/programs/{program_id}/courses/{course_id}", dependencies=[Depends(_require_api_key)])
+@app.delete("/admin/programs/{program_id}/courses/{course_id}")
 async def unmap_course_from_program(
     program_id: int,
     course_id: int,
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     await _require_admin_user_or_403(user_id=user_id, db=db)
     await _get_program_or_404(db, program_id)
     await _get_course_or_404(db, course_id)
@@ -2347,12 +2433,13 @@ async def unmap_course_from_program(
     return {"program_id": program_id, "course_id": course_id, "mapped": False}
 
 
-@app.post("/admin/catalog/sync", dependencies=[Depends(_require_api_key)])
+@app.post("/admin/catalog/sync")
 async def sync_catalog(
     body: CatalogSyncRequest,
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     await _require_admin_user_or_403(user_id=user_id, db=db)
 
     snapshot_day: date
@@ -2379,12 +2466,13 @@ async def sync_catalog(
     return result.to_dict()
 
 
-@app.get("/admin/programs/{program_id}/plan", dependencies=[Depends(_require_api_key)])
+@app.get("/admin/programs/{program_id}/plan")
 async def get_program_plan(
     program_id: int,
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     await _require_admin_user_or_403(user_id=user_id, db=db)
     program = await _get_program_or_404(db, program_id)
 
@@ -2400,12 +2488,13 @@ async def get_program_plan(
     }
 
 
-@app.post("/admin/register", dependencies=[Depends(_require_api_key)])
+@app.post("/admin/register")
 async def register_admin(
     body: AdminRegisterRequest,
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     if not ADMIN_SECRET:
         raise HTTPException(status_code=503, detail="Admin registration is disabled on this server.")
     if body.secret != ADMIN_SECRET:
@@ -2417,11 +2506,12 @@ async def register_admin(
     return {"status": "registered", "user_id": user_id}
 
 
-@app.get("/admin/pending", dependencies=[Depends(_require_api_key)])
+@app.get("/admin/pending")
 async def list_pending_lectures(
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     if not await _is_admin(user_id, db):
         raise HTTPException(status_code=403, detail="Admin access required.")
     result = await db.execute(
@@ -2444,12 +2534,13 @@ async def list_pending_lectures(
     ]
 
 
-@app.post("/lectures/{lecture_id}/approve", dependencies=[Depends(_require_api_key)])
+@app.post("/lectures/{lecture_id}/approve")
 async def approve_lecture(
     lecture_id: int,
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     if not await _is_admin(user_id, db):
         raise HTTPException(status_code=403, detail="Admin access required.")
     lecture = await get_lecture_or_404(db, lecture_id)
@@ -2463,12 +2554,13 @@ async def approve_lecture(
     )
 
 
-@app.post("/lectures/{lecture_id}/reject", dependencies=[Depends(_require_api_key)])
+@app.post("/lectures/{lecture_id}/reject")
 async def reject_lecture(
     lecture_id: int,
     db: AsyncSession = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user),
 ):
+    user_id = current_user.uuid
     if not await _is_admin(user_id, db):
         raise HTTPException(status_code=403, detail="Admin access required.")
     lecture = await get_lecture_or_404(db, lecture_id)
@@ -2477,8 +2569,12 @@ async def reject_lecture(
     return {"id": lecture.id, "rejected": True}
 
 
-@app.post("/lectures/{lecture_id}/regenerate-notes/jobs", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(_require_api_key)])
-async def start_regenerate_notes_job(lecture_id: int, db: AsyncSession = Depends(get_db)):
+@app.post("/lectures/{lecture_id}/regenerate-notes/jobs", status_code=status.HTTP_202_ACCEPTED)
+async def start_regenerate_notes_job(
+    lecture_id: int,
+    db: AsyncSession = Depends(get_db),
+    _auth: User = Depends(get_current_user),
+):
     await _cleanup_expired_jobs()
 
     await get_lecture_or_404(db, lecture_id)
@@ -2494,7 +2590,7 @@ async def start_regenerate_notes_job(lecture_id: int, db: AsyncSession = Depends
     return _job_public_state(job)
 
 
-@app.get("/lectures/regenerate-notes/jobs/{job_id}", dependencies=[Depends(_require_api_key)])
+@app.get("/lectures/regenerate-notes/jobs/{job_id}", dependencies=[Depends(get_current_user)])
 async def get_regenerate_notes_job(job_id: str):
     await _cleanup_expired_jobs()
     job = await _get_job_snapshot(job_id)
@@ -2507,7 +2603,7 @@ async def get_regenerate_notes_job(job_id: str):
 async def stream_regenerate_notes_job(
     job_id: str,
     request: Request,
-    _auth: None = Depends(_require_api_key_or_token),
+    _auth: User = Depends(get_current_user_from_query),
 ):
     await _cleanup_expired_jobs()
     job = await _get_job_snapshot(job_id)
@@ -2567,8 +2663,12 @@ async def stream_regenerate_notes_job(
     )
 
 
-@app.post("/lectures/{lecture_id}/regenerate-notes", dependencies=[Depends(_require_api_key)])
-async def regenerate_notes(lecture_id: int, db: AsyncSession = Depends(get_db)):
+@app.post("/lectures/{lecture_id}/regenerate-notes")
+async def regenerate_notes(
+    lecture_id: int,
+    db: AsyncSession = Depends(get_db),
+    _auth: User = Depends(get_current_user),
+):
     await get_lecture_or_404(db, lecture_id)
 
     context = await _load_regeneration_context(db, lecture_id)

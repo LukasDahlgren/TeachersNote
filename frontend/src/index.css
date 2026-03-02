@@ -1653,6 +1653,8 @@ button.course-picker-group-btn--open {
 
 .form-error { color: #dc2626; font-size: 0.8125rem; margin: 0.25rem 0 0.75rem; }
 
+.upload-wait-hint { font-size: 0.8125rem; color: #6b7280; margin: 0.5rem 0 0; }
+
 .upload-progress {
   margin-top: 12px;
   display: flex;
@@ -2451,6 +2453,29 @@ button.panel-tab:hover:not(:disabled) { background: #f0f0f0; color: #374151; }
   font-weight: 600;
   color: #374151;
   margin: 0 0 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.admin-panel-add-toggle-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  border: 1px solid #cbd5e1;
+  background: #f8fafc;
+  color: #374151;
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.15s, border-color 0.15s;
+}
+.admin-panel-add-toggle-btn:hover {
+  background: #e0e7ef;
+  border-color: #94a3b8;
 }
 .admin-panel-error {
   color: #dc2626;
@@ -2490,6 +2515,19 @@ button.panel-tab:hover:not(:disabled) { background: #f0f0f0; color: #374151; }
   grid-template-columns: minmax(140px, 180px) minmax(200px, 1fr) auto;
   gap: 0.55rem;
   margin-bottom: 0.85rem;
+}
+.admin-panel-search-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.85rem;
+}
+.admin-panel-search-row .admin-panel-input {
+  max-width: 300px;
+}
+.admin-panel-search-count {
+  font-size: 0.8rem;
+  color: #6b7280;
 }
 .admin-panel-input {
   height: 34px;
@@ -2744,3 +2782,412 @@ button.panel-tab:hover:not(:disabled) { background: #f0f0f0; color: #374151; }
     grid-template-columns: 1fr;
   }
 }
+
+/* ── Custom dialog (replaces window.confirm / window.prompt) ── */
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.dialog-box {
+  background: var(--bg-primary, #1a1a2e);
+  border: 1px solid var(--border-color, #2a2a4a);
+  border-radius: 10px;
+  padding: 1.5rem;
+  min-width: 300px;
+  max-width: 420px;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.dialog-message {
+  margin: 0;
+  font-size: 0.95rem;
+  color: var(--text-primary, #e2e8f0);
+  line-height: 1.5;
+}
+
+.dialog-label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-secondary, #a0aec0);
+}
+
+.dialog-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  border: 1px solid var(--border-color, #2a2a4a);
+  background: var(--bg-secondary, #0f0f23);
+  color: var(--text-primary, #e2e8f0);
+  font-size: 0.9rem;
+}
+
+.dialog-input:focus {
+  outline: none;
+  border-color: var(--accent-color, #6366f1);
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
+.dialog-btn {
+  padding: 0.45rem 1rem;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+
+.dialog-btn--cancel {
+  background: transparent;
+  border: 1px solid var(--border-color, #2a2a4a);
+  color: var(--text-secondary, #a0aec0);
+}
+
+.dialog-btn--cancel:hover {
+  background: var(--bg-secondary, #0f0f23);
+}
+
+.dialog-btn--confirm {
+  background: var(--accent-color, #6366f1);
+  color: #fff;
+}
+
+.dialog-btn--confirm:hover {
+  opacity: 0.9;
+}
+
+/* ── ProfilePage ──────────────────────────────────────── */
+.profile-page {
+  flex: 1;
+  overflow-y: auto;
+  background: #f8fafc;
+  min-height: 100vh;
+}
+
+.profile-page-inner {
+  max-width: 680px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem 4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.profile-back-btn {
+  align-self: flex-start;
+  background: none;
+  border: none;
+  color: #2563eb;
+  font-size: 0.875rem;
+  cursor: pointer;
+  padding: 0;
+}
+.profile-back-btn:hover { text-decoration: underline; }
+
+/* User card */
+.profile-card {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  background: white;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 1.25rem 1.5rem;
+}
+
+.profile-avatar {
+  flex-shrink: 0;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: #2563eb;
+  color: white;
+  font-size: 1.25rem;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.profile-card-info { display: flex; flex-direction: column; gap: 0.2rem; }
+.profile-display-name { font-size: 1.1rem; font-weight: 700; color: #0f172a; }
+.profile-email { font-size: 0.875rem; color: #475569; }
+.profile-joined { font-size: 0.75rem; color: #94a3b8; margin-top: 0.15rem; }
+
+/* Sections */
+.profile-section {
+  background: white;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.profile-section-title {
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #64748b;
+  margin: 0;
+  padding: 1rem 1.25rem 0.5rem;
+}
+
+/* Program block */
+.profile-program-block {
+  padding: 0 1.25rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.profile-program-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+}
+
+.profile-program-label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #64748b;
+  margin-bottom: 0.2rem;
+}
+
+.profile-program-value {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.profile-program-change-btn {
+  margin-left: auto;
+  height: 32px;
+  padding: 0 0.9rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: white;
+  color: #334155;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.profile-program-change-btn:hover { background: #f1f5f9; }
+
+.profile-program-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  padding-top: 0.25rem;
+}
+.profile-program-editor-label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #334155;
+}
+.profile-program-editor-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+.profile-program-save-btn {
+  height: 34px;
+  padding: 0 1rem;
+  border: none;
+  border-radius: 8px;
+  background: #0f172a;
+  color: white;
+  font-size: 0.8rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+.profile-program-save-btn:hover:not(:disabled) { background: #2563eb; }
+.profile-program-save-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.profile-program-cancel-btn {
+  height: 34px;
+  padding: 0 1rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: white;
+  color: #334155;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.profile-program-cancel-btn:hover:not(:disabled) { background: #f1f5f9; }
+.profile-program-cancel-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.profile-banner { margin: 0; font-size: 0.85rem; font-weight: 600; }
+.profile-banner--success { color: #166534; }
+.profile-banner--error { color: #b91c1c; }
+
+/* Courses */
+.profile-course-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 1.25rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.profile-course-item {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: 8px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+}
+.profile-course-code {
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: #475569;
+  min-width: 60px;
+}
+.profile-course-name {
+  font-size: 0.875rem;
+  color: #0f172a;
+}
+
+/* Collapsible headers (archive / trash) */
+.profile-collapsible-header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 1rem 1.25rem;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #0f172a;
+  text-align: left;
+}
+.profile-collapsible-header:hover { background: #f8fafc; }
+.profile-collapsible-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  border-radius: 10px;
+  background: #e2e8f0;
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: #475569;
+}
+.profile-collapsible-chevron { margin-left: auto; color: #94a3b8; font-size: 0.75rem; }
+
+/* Lecture list inside profile */
+.profile-lecture-list {
+  border-top: 1px solid #f1f5f9;
+  padding: 0.5rem 0.75rem 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.profile-lecture-item {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  width: 100%;
+  padding: 0.5rem 0.5rem;
+  background: none;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  text-align: left;
+  color: #0f172a;
+}
+.profile-lecture-item:hover:not(.profile-lecture-item--deleted) { background: #f1f5f9; }
+.profile-lecture-item--deleted { cursor: default; }
+.profile-lecture-icon { font-size: 1rem; flex-shrink: 0; }
+.profile-lecture-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  flex: 1;
+  min-width: 0;
+}
+.profile-lecture-name {
+  font-size: 0.875rem;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.profile-lecture-date { font-size: 0.75rem; color: #94a3b8; }
+
+.profile-restore-btn {
+  flex-shrink: 0;
+  height: 28px;
+  padding: 0 0.6rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: white;
+  color: #334155;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.profile-restore-btn:hover:not(:disabled) { background: #eff6ff; }
+.profile-restore-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.profile-empty {
+  margin: 0;
+  padding: 0.25rem 0.5rem;
+  color: #94a3b8;
+  font-size: 0.85rem;
+}
+
+/* Actions section */
+.profile-section--actions {
+  background: white;
+  padding: 1rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.profile-action-btn {
+  width: 100%;
+  padding: 0.6rem 1rem;
+  border-radius: 8px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+  border: none;
+}
+
+.profile-action-btn--admin {
+  background: #f1f5f9;
+  color: #0f172a;
+  border: 1px solid #e2e8f0;
+}
+.profile-action-btn--admin:hover { background: #e2e8f0; }
+
+.profile-action-btn--logout {
+  background: #fff1f2;
+  color: #be123c;
+  border: 1px solid #fecdd3;
+}
+.profile-action-btn--logout:hover { background: #ffe4e6; }

@@ -4,9 +4,6 @@ let workerConfigured = false;
 
 export function ensurePdfWorker(): void {
   if (workerConfigured) return;
-  pdfjs.GlobalWorkerOptions.workerSrc = new URL(
-    "pdfjs-dist/build/pdf.worker.min.mjs",
-    import.meta.url,
-  ).toString();
+  pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.js";
   workerConfigured = true;
 }

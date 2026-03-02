@@ -669,6 +669,10 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
       </div>
 
       {loading && (
+        <p className="upload-wait-hint">Processing may take a few minutes depending on the size of your recording.</p>
+      )}
+
+      {loading && (
         <div className="upload-progress">
           <div className="upload-progress-bar">
             <div
