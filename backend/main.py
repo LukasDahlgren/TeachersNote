@@ -8,20 +8,22 @@ import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Header, Query, Request, UploadFile, status
+from pydantic import BaseModel
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db import AsyncSessionLocal, get_db, init_db
+from catalog_sync import run_catalog_sync
 from media_download import (
     RecordingSourceKind,
     RemoteMediaDownloadError,
@@ -31,7 +33,21 @@ from media_download import (
     resolve_recording_source,
     validate_remote_media_url,
 )
-from models import Alignment, EnrichedSlide, Lecture, LectureSave, Slide, TranscriptSegment
+from models import (
+    AdminUser,
+    Alignment,
+    Course,
+    EnrichedSlide,
+    Lecture,
+    LectureSave,
+    Program,
+    ProgramCourse,
+    ProgramCoursePlan,
+    Slide,
+    StudentCourse,
+    StudentProfile,
+    TranscriptSegment,
+)
 from pipeline import (
     enrich_slide_notes,
     generate_presentation_from_enhanced,
@@ -106,6 +122,10 @@ if not APP_API_KEY:
         "API_KEY environment variable is not set. Add it to backend/.env before starting the server."
     )
 
+ADMIN_SECRET = os.getenv("ADMIN_SECRET")
+if not ADMIN_SECRET:
+    LOGGER.warning("ADMIN_SECRET is not set. Admin registration will be disabled.")
+
 _API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
@@ -140,12 +160,39 @@ def get_current_user_id(x_user_id: str | None = Header(default=None, alias="X-Us
     return _resolve_user_id(x_user_id)
 
 
+async def _is_admin(user_id: str, db: AsyncSession) -> bool:
+    result = await db.execute(select(AdminUser.id).where(AdminUser.user_id == user_id))
+    return result.scalar_one_or_none() is not None
+
+
 async def get_lecture_or_404(db: AsyncSession, lecture_id: int) -> Lecture:
     result = await db.execute(select(Lecture).where(Lecture.id == lecture_id))
     lecture = result.scalar_one_or_none()
     if not lecture:
         raise HTTPException(status_code=404, detail="Lecture not found")
     return lecture
+
+
+def can_view_lecture(*, user_id: str, lecture: Lecture, is_admin: bool) -> bool:
+    if is_admin:
+        return True
+    if bool(lecture.is_deleted):
+        return False
+    if bool(lecture.is_approved):
+        return True
+    return lecture.uploaded_by == user_id
+
+
+def assert_user_can_view_lecture(*, user_id: str, lecture: Lecture, is_admin: bool) -> None:
+    if can_view_lecture(user_id=user_id, lecture=lecture, is_admin=is_admin):
+        return
+    # Intentionally return 404 to avoid revealing lecture visibility state to non-admin users.
+    raise HTTPException(status_code=404, detail="Lecture not found")
+
+
+async def _require_admin_user_or_403(*, user_id: str, db: AsyncSession) -> None:
+    if not await _is_admin(user_id, db):
+        raise HTTPException(status_code=403, detail="Admin access required.")
 
 
 def _join_text(parts: list[str]) -> str:
@@ -168,6 +215,17 @@ def _normalize_courseid(raw: str) -> str:
         uppercase=True,
         invalid_chars_pattern=r"[^A-Z0-9-]",
     )
+
+
+def _normalize_catalog_code(raw: str) -> str:
+    return _normalize_courseid(raw)
+
+
+def _require_non_empty_name(raw: str, *, field_name: str) -> str:
+    name = raw.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name}: cannot be empty.")
+    return name
 
 
 def _normalize_lecture(raw: str) -> str:
@@ -211,7 +269,7 @@ def _build_unique_generated_paths(stem: str) -> tuple[Path, Path, str]:
         counter += 1
 
 
-def _resolve_upload_naming(courseid: str, kind: str, lecture: str, year: str) -> tuple[str, Path, Path]:
+def _resolve_upload_naming(courseid: str, kind: str, lecture: str, year: str) -> tuple[str, Path, Path, str]:
     raw_kind = (kind or "").strip()
     if not raw_kind:
         normalized_kind = "lecture"
@@ -244,7 +302,7 @@ def _resolve_upload_naming(courseid: str, kind: str, lecture: str, year: str) ->
 
     stem = _build_standard_stem(normalized_courseid, normalized_kind, normalized_lecture, normalized_year)
     pptx_path, saved_pdf_path, final_stem = _build_unique_generated_paths(stem)
-    return final_stem, pptx_path, saved_pdf_path
+    return final_stem, pptx_path, saved_pdf_path, normalized_courseid
 
 
 def _resolve_recording_source_or_400(
@@ -294,18 +352,18 @@ def _path_is_archived_generated(path: Path) -> bool:
 
 
 def _resolve_generated_download_path(filename: str) -> Path | None:
-    direct = GENERATED_DIR / filename
-    if direct.exists() and direct.is_file():
+    direct = (GENERATED_DIR / filename).resolve()
+    if _path_is_within(direct, GENERATED_DIR.resolve()) and direct.is_file():
         return direct
-    archived = ARCHIVED_GENERATED_DIR / filename
-    if archived.exists() and archived.is_file():
+    archived = (ARCHIVED_GENERATED_DIR / filename).resolve()
+    if _path_is_within(archived, ARCHIVED_GENERATED_DIR.resolve()) and archived.is_file():
         return archived
     return None
 
 
 def _resolve_pdf_download_path(filename: str) -> Path | None:
-    source_pdf = SOURCE_PDFS_DIR / filename
-    if source_pdf.exists() and source_pdf.is_file():
+    source_pdf = (SOURCE_PDFS_DIR / filename).resolve()
+    if _path_is_within(source_pdf, SOURCE_PDFS_DIR.resolve()) and source_pdf.is_file():
         return source_pdf
     return _resolve_generated_download_path(filename)
 
@@ -367,16 +425,72 @@ def _lecture_has_visible_pptx(lecture: Lecture) -> bool:
     return pptx_path.exists() and pptx_path.is_file()
 
 
-def _lecture_summary_payload(lecture: Lecture, *, is_saved: bool) -> dict[str, Any]:
+def _teachers_note_payload(lecture: Lecture, *, is_saved: bool) -> dict[str, Any]:
     return {
         "id": lecture.id,
         "name": lecture.name,
         "is_demo": lecture.is_demo,
         "is_archived": bool(lecture.is_archived),
+        "is_deleted": bool(lecture.is_deleted),
+        "is_approved": bool(lecture.is_approved),
+        "course_id": lecture.course_id,
+        "uploaded_by": lecture.uploaded_by,
         "is_saved": is_saved,
         "pptx_path": lecture.pptx_path,
         "pdf_url": _lecture_file_urls(lecture)["pdf_url"],
         "created_at": lecture.created_at.isoformat(),
+    }
+
+
+def _program_payload(program: Program) -> dict[str, Any]:
+    return {
+        "id": program.id,
+        "code": program.code,
+        "name": program.name,
+        "is_active": bool(program.is_active),
+        "created_at": program.created_at.isoformat(),
+        "updated_at": program.updated_at.isoformat(),
+    }
+
+
+def _course_payload(course: Course) -> dict[str, Any]:
+    return {
+        "id": course.id,
+        "code": course.code,
+        "name": course.name,
+        "is_active": bool(course.is_active),
+        "created_at": course.created_at.isoformat(),
+        "updated_at": course.updated_at.isoformat(),
+    }
+
+
+def _program_course_plan_payload(row: ProgramCoursePlan) -> dict[str, Any]:
+    snapshot_value = row.snapshot_date.isoformat() if row.snapshot_date else None
+    return {
+        "id": row.id,
+        "program_id": row.program_id,
+        "course_id": row.course_id,
+        "term_label": row.term_label,
+        "group_type": row.group_type,
+        "group_label": row.group_label,
+        "course_code": row.course_code,
+        "course_name_sv": row.course_name_sv,
+        "course_url": row.course_url,
+        "display_order": row.display_order,
+        "snapshot_date": snapshot_value,
+    }
+
+
+def _profile_payload(
+    *,
+    user_id: str,
+    program: Program | None,
+    selected_courses: list[Course],
+) -> dict[str, Any]:
+    return {
+        "user_id": user_id,
+        "program": _program_payload(program) if program else None,
+        "selected_courses": [_course_payload(course) for course in selected_courses],
     }
 
 
@@ -436,6 +550,58 @@ async def unsave_lecture_for_user(
         )
     )
     await db.commit()
+
+
+async def _get_program_or_404(db: AsyncSession, program_id: int) -> Program:
+    result = await db.execute(select(Program).where(Program.id == program_id))
+    program = result.scalar_one_or_none()
+    if not program:
+        raise HTTPException(status_code=404, detail="Program not found.")
+    return program
+
+
+async def _get_course_or_404(db: AsyncSession, course_id: int) -> Course:
+    result = await db.execute(select(Course).where(Course.id == course_id))
+    course = result.scalar_one_or_none()
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found.")
+    return course
+
+
+async def _get_or_create_student_profile(db: AsyncSession, user_id: str) -> StudentProfile:
+    result = await db.execute(select(StudentProfile).where(StudentProfile.user_id == user_id))
+    profile = result.scalar_one_or_none()
+    if profile:
+        return profile
+    profile = StudentProfile(user_id=user_id, program_id=None)
+    db.add(profile)
+    await db.commit()
+    return profile
+
+
+async def _load_profile_payload(db: AsyncSession, user_id: str) -> dict[str, Any]:
+    profile_result = await db.execute(select(StudentProfile).where(StudentProfile.user_id == user_id))
+    profile = profile_result.scalar_one_or_none()
+    if not profile:
+        return {
+            "user_id": user_id,
+            "program": None,
+            "selected_courses": [],
+        }
+
+    program: Program | None = None
+    if profile.program_id is not None:
+        program_result = await db.execute(select(Program).where(Program.id == profile.program_id))
+        program = program_result.scalar_one_or_none()
+
+    selected_result = await db.execute(
+        select(Course)
+        .join(StudentCourse, StudentCourse.course_id == Course.id)
+        .where(StudentCourse.user_id == user_id)
+        .order_by(Course.code.asc())
+    )
+    selected_courses = selected_result.scalars().all()
+    return _profile_payload(user_id=user_id, program=program, selected_courses=selected_courses)
 
 
 def _archive_response_payload(lecture: Lecture) -> dict[str, Any]:
@@ -1009,6 +1175,7 @@ async def _run_process_job(
     recording_source: RecordingSourceKind = "file",
     audio_url: str | None = None,
     lecture_name: str,
+    course_id: str | None,
     pptx_path: Path,
     saved_pdf_path: Path,
     user_id: str,
@@ -1110,8 +1277,10 @@ async def _run_process_job(
                 enhanced=result["enhanced"],
                 pptx_path=str(pptx_path.relative_to(BACKEND_DIR)),
                 pdf_path=str(saved_pdf_path.relative_to(BACKEND_DIR)),
+                course_id=course_id,
                 is_demo=False,
                 saved_user_id=user_id,
+                uploaded_by=user_id,
             )
 
         await _update_upload_job(
@@ -1152,12 +1321,22 @@ async def save_lecture_to_db(
     enhanced: list[dict],
     pptx_path: str | None,
     pdf_path: str | None = None,
+    course_id: str | None = None,
     is_demo: bool = False,
     saved_user_id: str | None = None,
+    uploaded_by: str | None = None,
 ) -> int:
     sanitized_enhanced = _sanitize_enhanced_entries(slides, transcript, alignment, enhanced)
 
-    lecture = Lecture(name=name, is_demo=is_demo, pptx_path=pptx_path, pdf_path=pdf_path)
+    lecture = Lecture(
+        name=name,
+        is_demo=is_demo,
+        is_approved=is_demo,  # Demo lectures are pre-approved; uploads require admin approval
+        course_id=course_id,
+        uploaded_by=uploaded_by,
+        pptx_path=pptx_path,
+        pdf_path=pdf_path,
+    )
     db.add(lecture)
     await db.flush()
 
@@ -1309,7 +1488,7 @@ async def start_process_job(
             },
         )
 
-    lecture_name, pptx_path, saved_pdf_path = _resolve_upload_naming(courseid, kind, lecture, year)
+    lecture_name, pptx_path, saved_pdf_path, normalized_courseid = _resolve_upload_naming(courseid, kind, lecture, year)
     recording_source, resolved_audio_url = _resolve_recording_source_or_400(audio=audio, audio_url=audio_url)
     validated_audio_url: str | None = None
     if recording_source == "url":
@@ -1372,6 +1551,7 @@ async def start_process_job(
             recording_source=recording_source,
             audio_url=validated_audio_url,
             lecture_name=lecture_name,
+            course_id=normalized_courseid,
             pptx_path=pptx_path,
             saved_pdf_path=saved_pdf_path,
             user_id=user_id,
@@ -1477,7 +1657,7 @@ async def process(
     db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_id),
 ):
-    lecture_name, pptx_path, saved_pdf_path = _resolve_upload_naming(courseid, kind, lecture, year)
+    lecture_name, pptx_path, saved_pdf_path, normalized_courseid = _resolve_upload_naming(courseid, kind, lecture, year)
     recording_source, resolved_audio_url = _resolve_recording_source_or_400(audio=audio, audio_url=audio_url)
     validated_audio_url: str | None = None
     if recording_source == "url":
@@ -1530,14 +1710,18 @@ async def process(
         enhanced=result["enhanced"],
         pptx_path=str(pptx_path.relative_to(BACKEND_DIR)),
         pdf_path=str(saved_pdf_path.relative_to(BACKEND_DIR)),
+        course_id=normalized_courseid,
         is_demo=False,
         saved_user_id=user_id,
+        uploaded_by=user_id,
     )
 
     return {
         **result,
         "lecture_id": lecture_id,
+        "course_id": normalized_courseid,
         "is_archived": False,
+        "is_approved": False,
         "is_saved": True,
         "pdf_url": f"/pdf/{saved_pdf_path.name}",
     }
@@ -1548,10 +1732,19 @@ async def list_lectures(
     db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_id),
 ):
-    result = await db.execute(select(Lecture).order_by(Lecture.created_at.desc()))
+    admin = await _is_admin(user_id, db)
+    if admin:
+        visibility_filter = Lecture.is_deleted == False
+    else:
+        # Show approved lectures to everyone, plus the uploader's own pending ones
+        visibility_filter = (Lecture.is_deleted == False) & or_(
+            Lecture.is_approved == True,
+            (Lecture.is_approved == False) & (Lecture.uploaded_by == user_id),
+        )
+    result = await db.execute(select(Lecture).where(visibility_filter).order_by(Lecture.created_at.desc()))
     lectures = [lecture for lecture in result.scalars().all() if _lecture_has_visible_pptx(lecture)]
     saved_ids = await _saved_lecture_ids_for_user(db, user_id, [int(lecture.id) for lecture in lectures])
-    return [_lecture_summary_payload(lecture, is_saved=lecture.id in saved_ids) for lecture in lectures]
+    return [_teachers_note_payload(lecture, is_saved=lecture.id in saved_ids) for lecture in lectures]
 
 
 @app.get("/lectures/my", dependencies=[Depends(_require_api_key)])
@@ -1559,14 +1752,37 @@ async def list_my_lectures(
     db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_id),
 ):
-    result = await db.execute(
+    admin = await _is_admin(user_id, db)
+    query = (
         select(Lecture)
         .join(LectureSave, LectureSave.lecture_id == Lecture.id)
         .where(LectureSave.user_id == user_id)
-        .order_by(LectureSave.created_at.desc(), Lecture.created_at.desc())
+        .where(Lecture.is_deleted == False)
     )
+    if not admin:
+        query = query.where(
+            or_(
+                Lecture.is_approved == True,
+                Lecture.uploaded_by == user_id,
+            )
+        )
+    result = await db.execute(query.order_by(LectureSave.created_at.desc(), Lecture.created_at.desc()))
     lectures = [lecture for lecture in result.scalars().all() if _lecture_has_visible_pptx(lecture)]
-    return [_lecture_summary_payload(lecture, is_saved=True) for lecture in lectures]
+    return [_teachers_note_payload(lecture, is_saved=True) for lecture in lectures]
+
+
+@app.get("/lectures/deleted", dependencies=[Depends(_require_api_key)])
+async def list_deleted_lectures(
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    await _require_admin_user_or_403(user_id=user_id, db=db)
+    result = await db.execute(
+        select(Lecture).where(Lecture.is_deleted == True).order_by(Lecture.created_at.desc())
+    )
+    lectures = result.scalars().all()
+    saved_ids = await _saved_lecture_ids_for_user(db, user_id, [int(lecture.id) for lecture in lectures])
+    return [_teachers_note_payload(lecture, is_saved=lecture.id in saved_ids) for lecture in lectures]
 
 
 @app.get("/lectures/{lecture_id}", dependencies=[Depends(_require_api_key)])
@@ -1576,6 +1792,8 @@ async def get_lecture(
     user_id: str = Depends(get_current_user_id),
 ):
     lecture = await get_lecture_or_404(db, lecture_id)
+    admin = await _is_admin(user_id, db)
+    assert_user_can_view_lecture(user_id=user_id, lecture=lecture, is_admin=admin)
     if not _lecture_has_visible_pptx(lecture):
         raise HTTPException(status_code=404, detail="Lecture file not found")
 
@@ -1584,6 +1802,7 @@ async def get_lecture(
         **data,
         "lecture_id": lecture.id,
         "name": lecture.name,
+        "course_id": lecture.course_id,
         "is_archived": bool(lecture.is_archived),
         "is_saved": await _is_lecture_saved_for_user(db, user_id, lecture_id),
         **_lecture_file_urls(lecture),
@@ -1597,9 +1816,11 @@ async def save_lecture(
     user_id: str = Depends(get_current_user_id),
 ):
     lecture = await get_lecture_or_404(db, lecture_id)
+    admin = await _is_admin(user_id, db)
+    assert_user_can_view_lecture(user_id=user_id, lecture=lecture, is_admin=admin)
 
     await save_lecture_for_user(db, user_id=user_id, lecture_id=lecture_id)
-    return _lecture_summary_payload(lecture, is_saved=True)
+    return _teachers_note_payload(lecture, is_saved=True)
 
 
 @app.delete("/lectures/{lecture_id}/save", dependencies=[Depends(_require_api_key)])
@@ -1609,9 +1830,11 @@ async def unsave_lecture(
     user_id: str = Depends(get_current_user_id),
 ):
     lecture = await get_lecture_or_404(db, lecture_id)
+    admin = await _is_admin(user_id, db)
+    assert_user_can_view_lecture(user_id=user_id, lecture=lecture, is_admin=admin)
 
     await unsave_lecture_for_user(db, user_id=user_id, lecture_id=lecture_id)
-    return _lecture_summary_payload(lecture, is_saved=False)
+    return _teachers_note_payload(lecture, is_saved=False)
 
 
 @app.post("/lectures/{lecture_id}/archive", dependencies=[Depends(_require_api_key)])
@@ -1619,9 +1842,481 @@ async def set_archive_state(
     lecture_id: int,
     archive: bool = Query(default=True),
     db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
 ):
+    await _require_admin_user_or_403(user_id=user_id, db=db)
     lecture = await get_lecture_or_404(db, lecture_id)
     return await _apply_archive_state(db, lecture, archive=archive)
+
+
+@app.post("/lectures/{lecture_id}/trash", dependencies=[Depends(_require_api_key)])
+async def trash_lecture(
+    lecture_id: int,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    await _require_admin_user_or_403(user_id=user_id, db=db)
+    lecture = await get_lecture_or_404(db, lecture_id)
+    lecture.is_deleted = True
+    await db.commit()
+    return {"id": lecture.id, "is_deleted": True}
+
+
+@app.post("/lectures/{lecture_id}/restore", dependencies=[Depends(_require_api_key)])
+async def restore_lecture(
+    lecture_id: int,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    await _require_admin_user_or_403(user_id=user_id, db=db)
+    lecture = await get_lecture_or_404(db, lecture_id)
+    lecture.is_deleted = False
+    await db.commit()
+    return {"id": lecture.id, "is_deleted": False}
+
+
+class AdminRegisterRequest(BaseModel):
+    secret: str
+
+
+class ProgramCreateRequest(BaseModel):
+    code: str
+    name: str
+    is_active: bool = True
+
+
+class ProgramUpdateRequest(BaseModel):
+    code: str | None = None
+    name: str | None = None
+    is_active: bool | None = None
+
+
+class CourseCreateRequest(BaseModel):
+    code: str
+    name: str
+    is_active: bool = True
+
+
+class CourseUpdateRequest(BaseModel):
+    code: str | None = None
+    name: str | None = None
+    is_active: bool | None = None
+
+
+class ProfileProgramUpdateRequest(BaseModel):
+    program_id: int | None = None
+
+
+class ProfileCoursesUpdateRequest(BaseModel):
+    course_ids: list[int]
+
+
+class CatalogSyncRequest(BaseModel):
+    snapshot_date: str | None = None
+    dry_run: bool = False
+
+
+@app.get("/profile", dependencies=[Depends(_require_api_key)])
+async def get_profile(
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    return await _load_profile_payload(db, user_id)
+
+
+@app.put("/profile/program", dependencies=[Depends(_require_api_key)])
+async def set_profile_program(
+    body: ProfileProgramUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    if body.program_id is not None:
+        program = await _get_program_or_404(db, body.program_id)
+        if not bool(program.is_active):
+            raise HTTPException(status_code=400, detail="Program is inactive.")
+
+    profile = await _get_or_create_student_profile(db, user_id)
+    profile.program_id = body.program_id
+    await db.commit()
+    return await _load_profile_payload(db, user_id)
+
+
+@app.put("/profile/courses", dependencies=[Depends(_require_api_key)])
+async def set_profile_courses(
+    body: ProfileCoursesUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    requested_ids = list(dict.fromkeys(body.course_ids))
+    if any(course_id <= 0 for course_id in requested_ids):
+        raise HTTPException(status_code=400, detail="course_ids must contain positive integers.")
+
+    if requested_ids:
+        result = await db.execute(
+            select(Course).where(Course.id.in_(requested_ids), Course.is_active == True)
+        )
+        active_courses = result.scalars().all()
+        active_ids = {int(course.id) for course in active_courses}
+        missing_ids = [course_id for course_id in requested_ids if course_id not in active_ids]
+        if missing_ids:
+            missing_str = ",".join(str(course_id) for course_id in missing_ids)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown or inactive course ids: {missing_str}",
+            )
+
+    await _get_or_create_student_profile(db, user_id)
+    await db.execute(delete(StudentCourse).where(StudentCourse.user_id == user_id))
+    for course_id in requested_ids:
+        db.add(StudentCourse(user_id=user_id, course_id=course_id))
+    await db.commit()
+    return await _load_profile_payload(db, user_id)
+
+
+@app.get("/profile/course-options", dependencies=[Depends(_require_api_key)])
+async def get_profile_course_options(
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    profile_result = await db.execute(select(StudentProfile).where(StudentProfile.user_id == user_id))
+    profile = profile_result.scalar_one_or_none()
+
+    all_courses_result = await db.execute(
+        select(Course).where(Course.is_active == True).order_by(Course.code.asc())
+    )
+    all_courses = all_courses_result.scalars().all()
+    programs_result = await db.execute(
+        select(Program).where(Program.is_active == True).order_by(Program.code.asc())
+    )
+    programs = programs_result.scalars().all()
+
+    program: Program | None = None
+    program_courses: list[Course] = []
+    if profile and profile.program_id is not None:
+        program_result = await db.execute(select(Program).where(Program.id == profile.program_id))
+        program = program_result.scalar_one_or_none()
+        if program:
+            program_courses_result = await db.execute(
+                select(Course)
+                .join(ProgramCourse, ProgramCourse.course_id == Course.id)
+                .where(ProgramCourse.program_id == program.id, Course.is_active == True)
+                .order_by(Course.code.asc())
+            )
+            program_courses = program_courses_result.scalars().all()
+
+    return {
+        "program": _program_payload(program) if program else None,
+        "programs": [_program_payload(item) for item in programs],
+        "all_courses": [_course_payload(course) for course in all_courses],
+        "program_courses": [_course_payload(course) for course in program_courses],
+    }
+
+
+@app.get("/admin/programs", dependencies=[Depends(_require_api_key)])
+async def list_programs(
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    await _require_admin_user_or_403(user_id=user_id, db=db)
+    result = await db.execute(select(Program).order_by(Program.code.asc()))
+    return [_program_payload(program) for program in result.scalars().all()]
+
+
+@app.post("/admin/programs", dependencies=[Depends(_require_api_key)])
+async def create_program(
+    body: ProgramCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    await _require_admin_user_or_403(user_id=user_id, db=db)
+    code = _normalize_catalog_code(body.code)
+    if not code:
+        raise HTTPException(status_code=400, detail="Invalid code: use A-Z, 0-9, or '-'.")
+    name = _require_non_empty_name(body.name, field_name="name")
+
+    program = Program(code=code, name=name, is_active=bool(body.is_active))
+    db.add(program)
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="Program code already exists.") from exc
+    await db.refresh(program)
+    return _program_payload(program)
+
+
+@app.patch("/admin/programs/{program_id}", dependencies=[Depends(_require_api_key)])
+async def update_program(
+    program_id: int,
+    body: ProgramUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    await _require_admin_user_or_403(user_id=user_id, db=db)
+    program = await _get_program_or_404(db, program_id)
+
+    if body.code is None and body.name is None and body.is_active is None:
+        raise HTTPException(status_code=400, detail="Provide at least one field to update.")
+
+    if body.code is not None:
+        code = _normalize_catalog_code(body.code)
+        if not code:
+            raise HTTPException(status_code=400, detail="Invalid code: use A-Z, 0-9, or '-'.")
+        program.code = code
+    if body.name is not None:
+        program.name = _require_non_empty_name(body.name, field_name="name")
+    if body.is_active is not None:
+        program.is_active = bool(body.is_active)
+
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="Program code already exists.") from exc
+    await db.refresh(program)
+    return _program_payload(program)
+
+
+@app.get("/admin/courses", dependencies=[Depends(_require_api_key)])
+async def list_courses(
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    await _require_admin_user_or_403(user_id=user_id, db=db)
+    result = await db.execute(select(Course).order_by(Course.code.asc()))
+    return [_course_payload(course) for course in result.scalars().all()]
+
+
+@app.post("/admin/courses", dependencies=[Depends(_require_api_key)])
+async def create_course(
+    body: CourseCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    await _require_admin_user_or_403(user_id=user_id, db=db)
+    code = _normalize_catalog_code(body.code)
+    if not code:
+        raise HTTPException(status_code=400, detail="Invalid code: use A-Z, 0-9, or '-'.")
+    name = _require_non_empty_name(body.name, field_name="name")
+
+    course = Course(code=code, name=name, is_active=bool(body.is_active))
+    db.add(course)
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="Course code already exists.") from exc
+    await db.refresh(course)
+    return _course_payload(course)
+
+
+@app.patch("/admin/courses/{course_id}", dependencies=[Depends(_require_api_key)])
+async def update_course(
+    course_id: int,
+    body: CourseUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    await _require_admin_user_or_403(user_id=user_id, db=db)
+    course = await _get_course_or_404(db, course_id)
+
+    if body.code is None and body.name is None and body.is_active is None:
+        raise HTTPException(status_code=400, detail="Provide at least one field to update.")
+
+    if body.code is not None:
+        code = _normalize_catalog_code(body.code)
+        if not code:
+            raise HTTPException(status_code=400, detail="Invalid code: use A-Z, 0-9, or '-'.")
+        course.code = code
+    if body.name is not None:
+        course.name = _require_non_empty_name(body.name, field_name="name")
+    if body.is_active is not None:
+        course.is_active = bool(body.is_active)
+
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="Course code already exists.") from exc
+    await db.refresh(course)
+    return _course_payload(course)
+
+
+@app.get("/admin/programs/{program_id}/courses", dependencies=[Depends(_require_api_key)])
+async def list_program_courses(
+    program_id: int,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    await _require_admin_user_or_403(user_id=user_id, db=db)
+    program = await _get_program_or_404(db, program_id)
+    courses_result = await db.execute(
+        select(Course)
+        .join(ProgramCourse, ProgramCourse.course_id == Course.id)
+        .where(ProgramCourse.program_id == program_id)
+        .order_by(Course.code.asc())
+    )
+    courses = courses_result.scalars().all()
+    return {
+        "program": _program_payload(program),
+        "courses": [_course_payload(course) for course in courses],
+    }
+
+
+@app.put("/admin/programs/{program_id}/courses/{course_id}", dependencies=[Depends(_require_api_key)])
+async def map_course_to_program(
+    program_id: int,
+    course_id: int,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    await _require_admin_user_or_403(user_id=user_id, db=db)
+    await _get_program_or_404(db, program_id)
+    await _get_course_or_404(db, course_id)
+
+    existing = await db.execute(
+        select(ProgramCourse).where(
+            ProgramCourse.program_id == program_id,
+            ProgramCourse.course_id == course_id,
+        )
+    )
+    if existing.scalar_one_or_none() is None:
+        db.add(ProgramCourse(program_id=program_id, course_id=course_id))
+        await db.commit()
+    return {"program_id": program_id, "course_id": course_id, "mapped": True}
+
+
+@app.delete("/admin/programs/{program_id}/courses/{course_id}", dependencies=[Depends(_require_api_key)])
+async def unmap_course_from_program(
+    program_id: int,
+    course_id: int,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    await _require_admin_user_or_403(user_id=user_id, db=db)
+    await _get_program_or_404(db, program_id)
+    await _get_course_or_404(db, course_id)
+    await db.execute(
+        delete(ProgramCourse).where(
+            ProgramCourse.program_id == program_id,
+            ProgramCourse.course_id == course_id,
+        )
+    )
+    await db.commit()
+    return {"program_id": program_id, "course_id": course_id, "mapped": False}
+
+
+@app.post("/admin/catalog/sync", dependencies=[Depends(_require_api_key)])
+async def sync_catalog(
+    body: CatalogSyncRequest,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    await _require_admin_user_or_403(user_id=user_id, db=db)
+
+    snapshot_day: date
+    if body.snapshot_date:
+        try:
+            snapshot_day = date.fromisoformat(body.snapshot_date)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="snapshot_date must be YYYY-MM-DD") from exc
+    else:
+        snapshot_day = date.today()
+
+    try:
+        result = await run_catalog_sync(
+            db,
+            snapshot_date=snapshot_day,
+            dry_run=bool(body.dry_run),
+            write_snapshot_files_to_disk=False,
+        )
+    except Exception as exc:
+        LOGGER.exception("Catalog sync failed")
+        raise HTTPException(status_code=500, detail=f"Catalog sync failed: {exc}") from exc
+
+    return result.to_dict()
+
+
+@app.get("/admin/programs/{program_id}/plan", dependencies=[Depends(_require_api_key)])
+async def get_program_plan(
+    program_id: int,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    await _require_admin_user_or_403(user_id=user_id, db=db)
+    program = await _get_program_or_404(db, program_id)
+
+    result = await db.execute(
+        select(ProgramCoursePlan)
+        .where(ProgramCoursePlan.program_id == program_id)
+        .order_by(ProgramCoursePlan.snapshot_date.desc(), ProgramCoursePlan.display_order.asc())
+    )
+    rows = result.scalars().all()
+    return {
+        "program": _program_payload(program),
+        "rows": [_program_course_plan_payload(row) for row in rows],
+    }
+
+
+@app.post("/admin/register", dependencies=[Depends(_require_api_key)])
+async def register_admin(
+    body: AdminRegisterRequest,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    if not ADMIN_SECRET:
+        raise HTTPException(status_code=503, detail="Admin registration is disabled on this server.")
+    if body.secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid admin secret.")
+    existing = await db.execute(select(AdminUser.id).where(AdminUser.user_id == user_id))
+    if existing.scalar_one_or_none() is None:
+        db.add(AdminUser(user_id=user_id))
+        await db.commit()
+    return {"status": "registered", "user_id": user_id}
+
+
+@app.get("/admin/pending", dependencies=[Depends(_require_api_key)])
+async def list_pending_lectures(
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    if not await _is_admin(user_id, db):
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    result = await db.execute(
+        select(Lecture)
+        .where(Lecture.is_approved == False, Lecture.is_deleted == False)
+        .order_by(Lecture.created_at.desc())
+    )
+    lectures = result.scalars().all()
+    return [_teachers_note_payload(lecture, is_saved=False) for lecture in lectures]
+
+
+@app.post("/lectures/{lecture_id}/approve", dependencies=[Depends(_require_api_key)])
+async def approve_lecture(
+    lecture_id: int,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    if not await _is_admin(user_id, db):
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    lecture = await get_lecture_or_404(db, lecture_id)
+    lecture.is_approved = True
+    await db.commit()
+    return _teachers_note_payload(lecture, is_saved=False)
+
+
+@app.post("/lectures/{lecture_id}/reject", dependencies=[Depends(_require_api_key)])
+async def reject_lecture(
+    lecture_id: int,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    if not await _is_admin(user_id, db):
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    lecture = await get_lecture_or_404(db, lecture_id)
+    lecture.is_deleted = True
+    await db.commit()
+    return {"id": lecture.id, "rejected": True}
 
 
 @app.post("/lectures/{lecture_id}/regenerate-notes/jobs", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(_require_api_key)])

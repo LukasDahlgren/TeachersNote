@@ -5,16 +5,25 @@ import {
   archiveLecture,
   buildAssetUrl,
   checkHealth,
+  getCurrentUserId,
+  getDeletedLectures,
   getLectures,
   getLecture,
+  getMyLectures,
+  getProfile,
   getProcessJob,
   getRegenerateNotesJob,
+  registerAsAdmin,
+  restoreLecture,
+  saveLecture,
   startProcessJob,
   startRegenerateNotesJob,
   subscribeProcessJobEvents,
   subscribeRegenerateNotesEvents,
   findBestLectureWithNotesByExactName,
+  trashLecture,
   unarchiveLecture,
+  unsaveLecture,
 } from "./api";
 import UploadForm from "./components/UploadForm";
 import SlideViewer from "./components/SlideViewer";
@@ -24,15 +33,17 @@ import ErrorBoundary from "./components/ErrorBoundary";
 import ProcessChat, { type ProcessChatEntry } from "./components/ProcessChat";
 import Homepage from "./components/Homepage";
 import AllLecturesPlaceholder from "./components/AllLecturesPlaceholder";
+import AdminPanel from "./components/AdminPanel";
 import {
   isEnrichedSlideInvalid,
   type ProcessResult,
-  type LectureSummary,
+  type TeachersNoteSummary,
   type RegenerateNotesJobStatus,
   type UploadLectureNamingInput,
   type UploadRecordingInput,
   type UploadProcessJobEvent,
   type UploadProcessJobStatus,
+  type StudentProfile,
 } from "./types";
 
 const REGENERATE_NOTES_AVAILABLE = (() => {
@@ -40,10 +51,14 @@ const REGENERATE_NOTES_AVAILABLE = (() => {
   if (typeof value !== "string") return false;
   return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
 })();
-const ACTIVE_PROCESS_JOB_STORAGE_KEY = "lecture-summary.active-process-job-id";
-const DEMO_MODE_STORAGE_KEY = "lectureSummary.demoMode";
+const ACTIVE_PROCESS_JOB_STORAGE_KEY = "teachers-note.active-process-job-id";
+const LEGACY_ACTIVE_PROCESS_JOB_STORAGE_KEY = "lecture-summary.active-process-job-id";
+const IS_ADMIN_STORAGE_KEY = "teachers-note.is-admin";
+const LEGACY_IS_ADMIN_STORAGE_KEY = "lecture-summary.is-admin";
 const DEMO_LECTURE_NAME = "DB-lecture-12-2026";
 const DEMO_REGEN_STEP_MS = 650;
+const PROCESS_DETAIL_RETRY_DELAYS_MS = [700, 1300, 2000];
+const PROCESS_STATUS_POLL_MS = 5000;
 const DEMO_UPLOAD_STAGES: Array<{ label: string; stage: string; delayMs: number }> = [
   { label: "Validating files...", stage: "parse_slides", delayMs: 450 },
   { label: "Parsing PDF...", stage: "parse_slides", delayMs: 900 },
@@ -51,12 +66,14 @@ const DEMO_UPLOAD_STAGES: Array<{ label: string; stage: string; delayMs: number 
   { label: "Generating notes...", stage: "enrich", delayMs: 1100 },
 ];
 
-type LectureData = ProcessResult & { name?: string; lecture_id?: number };
+type LectureData = ProcessResult & { name?: string; lecture_id?: number; is_saved?: boolean };
 
 type MainView =
   | { view: "empty" }
   | { view: "upload"; loading: boolean; error?: string }
   | { view: "results"; data: LectureData; activeSlide: number; lectureId?: number };
+type ProcessBanner = { kind: "success" | "error" | "info"; text: string };
+type LectureRefreshResult = { ok: true } | { ok: false; error: string };
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
@@ -68,31 +85,71 @@ function formatProcessStage(stage: string): string {
   return stage.replace(/_/g, " ");
 }
 
+function toErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function readStorageWithMigration(primaryKey: string, legacyKey: string): string | null {
+  const primary = window.localStorage.getItem(primaryKey)?.trim();
+  if (primary) return primary;
+
+  const legacy = window.localStorage.getItem(legacyKey)?.trim();
+  if (!legacy) return null;
+
+  window.localStorage.setItem(primaryKey, legacy);
+  window.localStorage.removeItem(legacyKey);
+  return legacy;
+}
+
+function clearStorageWithLegacy(primaryKey: string, legacyKey: string): void {
+  window.localStorage.removeItem(primaryKey);
+  window.localStorage.removeItem(legacyKey);
+}
+
 export default function App() {
   const [mainView, setMainView] = useState<MainView>({ view: "empty" });
   const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
-  const [lectures, setLectures] = useState<LectureSummary[]>([]);
+  const [lectures, setLectures] = useState<TeachersNoteSummary[]>([]);
+  const [savedLectures, setSavedLectures] = useState<TeachersNoteSummary[]>([]);
+  const [profile, setProfile] = useState<StudentProfile | null>(null);
+  const [profileLoading, setProfileLoading] = useState(true);
+  const [deletedLectures, setDeletedLectures] = useState<TeachersNoteSummary[]>([]);
   const [lecturesLoading, setLecturesLoading] = useState(true);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [processJob, setProcessJob] = useState<UploadProcessJobStatus | null>(null);
   const [processChat, setProcessChat] = useState<ProcessChatEntry[]>([]);
+  const [processBanner, setProcessBanner] = useState<ProcessBanner | null>(null);
+  const [lectureRefreshError, setLectureRefreshError] = useState<string | null>(null);
   const [regeneratingNotes, setRegeneratingNotes] = useState(false);
   const [regenBanner, setRegenBanner] = useState<{ kind: "success" | "error"; text: string } | null>(null);
   const [regenJob, setRegenJob] = useState<RegenerateNotesJobStatus | null>(null);
+  const [savePending, setSavePending] = useState(false);
+  const [saveBanner, setSaveBanner] = useState<{ kind: "success" | "error"; text: string } | null>(null);
   const [archivePending, setArchivePending] = useState(false);
   const [archiveBanner, setArchiveBanner] = useState<{ kind: "success" | "error"; text: string } | null>(null);
   const [uploadLoadingLabel, setUploadLoadingLabel] = useState("");
   const [processingLectureName, setProcessingLectureName] = useState<string | null>(null);
-  const [demoSourceData, setDemoSourceData] = useState<(ProcessResult & { name: string; lecture_id: number }) | null>(null);
-  const [demoMode, setDemoMode] = useState<boolean>(() => {
-    if (typeof window === "undefined") return false;
-    return window.localStorage.getItem(DEMO_MODE_STORAGE_KEY) === "true";
-  });
+  const [demoPreviewActive, setDemoPreviewActive] = useState(false);
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [deletePending, setDeletePending] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<{ id: number; name: string } | null>(null);
+  const [isAdmin, setIsAdmin] = useState(() =>
+    readStorageWithMigration(IS_ADMIN_STORAGE_KEY, LEGACY_IS_ADMIN_STORAGE_KEY) === "true"
+  );
+  const [showAdminModal, setShowAdminModal] = useState(false);
+  const [adminSecretInput, setAdminSecretInput] = useState("");
+  const [adminRegisterError, setAdminRegisterError] = useState<string | null>(null);
+  const [adminRegisterLoading, setAdminRegisterLoading] = useState(false);
+  const currentUserId = getCurrentUserId();
 
   const regenUnsubscribeRef = useRef<(() => void) | null>(null);
   const regenReconnectTimerRef = useRef<number | null>(null);
   const processUnsubscribeRef = useRef<(() => void) | null>(null);
   const processReconnectTimerRef = useRef<number | null>(null);
+  const processPollingTimerRef = useRef<number | null>(null);
+  const processPollingInFlightRef = useRef(false);
+  const processActiveJobIdRef = useRef<string | null>(null);
+  const processTerminalHandledRef = useRef<Set<string>>(new Set());
   const processLastEventIdRef = useRef(0);
   const demoRegenRunRef = useRef(0);
   const demoRunRef = useRef(0);
@@ -101,27 +158,50 @@ export default function App() {
   const lectureRouteMatch = useMatch("/lectures/:lectureId");
   const lectureRouteIdParam = lectureRouteMatch?.params.lectureId ?? null;
 
-  const fetchLectures = useCallback(async () => {
+  const fetchLectures = useCallback(async (): Promise<LectureRefreshResult> => {
     setLecturesLoading(true);
     try {
-      const data = await getLectures();
-      setLectures(data);
-    } catch {
-      // silently fail — sidebar shows empty
+      const [catalog, saved] = await Promise.all([getLectures(), getMyLectures()]);
+      let deleted: TeachersNoteSummary[] = [];
+      if (isAdmin) {
+        try {
+          deleted = await getDeletedLectures();
+        } catch (err) {
+          console.warn("Failed to refresh deleted lectures list:", toErrorMessage(err));
+        }
+      }
+      setLectures(catalog);
+      setSavedLectures(saved);
+      setDeletedLectures(deleted);
+      setLectureRefreshError(null);
+      return { ok: true };
+    } catch (err) {
+      const message = toErrorMessage(err);
+      setLectureRefreshError(message);
+      console.warn("Failed to refresh lectures list:", message);
+      return { ok: false, error: message };
     } finally {
       setLecturesLoading(false);
+    }
+  }, [isAdmin]);
+
+  const fetchProfile = useCallback(async () => {
+    setProfileLoading(true);
+    try {
+      const nextProfile = await getProfile();
+      setProfile(nextProfile);
+    } catch (err) {
+      console.warn("Failed to refresh profile:", toErrorMessage(err));
+    } finally {
+      setProfileLoading(false);
     }
   }, []);
 
   useEffect(() => {
     checkHealth().then(setBackendOnline);
-    fetchLectures();
-  }, [fetchLectures]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem(DEMO_MODE_STORAGE_KEY, demoMode ? "true" : "false");
-  }, [demoMode]);
+    void fetchLectures();
+    void fetchProfile();
+  }, [fetchLectures, fetchProfile]);
 
   const stopRegenerationSubscription = useCallback(() => {
     if (regenUnsubscribeRef.current) {
@@ -134,6 +214,15 @@ export default function App() {
     }
   }, []);
 
+  const stopProcessPolling = useCallback(() => {
+    if (processPollingTimerRef.current !== null) {
+      window.clearInterval(processPollingTimerRef.current);
+      processPollingTimerRef.current = null;
+    }
+    processPollingInFlightRef.current = false;
+    processActiveJobIdRef.current = null;
+  }, []);
+
   const stopProcessSubscription = useCallback(() => {
     if (processUnsubscribeRef.current) {
       processUnsubscribeRef.current();
@@ -143,7 +232,8 @@ export default function App() {
       window.clearTimeout(processReconnectTimerRef.current);
       processReconnectTimerRef.current = null;
     }
-  }, []);
+    stopProcessPolling();
+  }, [stopProcessPolling]);
 
   useEffect(() => {
     return () => {
@@ -158,6 +248,7 @@ export default function App() {
     setRegeneratingNotes(false);
     setRegenBanner(null);
     setRegenJob(null);
+    setSaveBanner(null);
     setArchiveBanner(null);
   }, [stopRegenerationSubscription]);
 
@@ -165,11 +256,12 @@ export default function App() {
     stopProcessSubscription();
     setProcessJob(null);
     setProcessChat([]);
+    setProcessBanner(null);
     processLastEventIdRef.current = 0;
     setUploadLoadingLabel("");
     setProcessingLectureName(null);
     if (clearPersisted) {
-      window.localStorage.removeItem(ACTIVE_PROCESS_JOB_STORAGE_KEY);
+      clearStorageWithLegacy(ACTIVE_PROCESS_JOB_STORAGE_KEY, LEGACY_ACTIVE_PROCESS_JOB_STORAGE_KEY);
     }
   }, [stopProcessSubscription]);
 
@@ -199,17 +291,34 @@ export default function App() {
     });
   }, []);
 
+  const fetchLectureWithRetry = useCallback(async (lectureId: number): Promise<LectureData> => {
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt <= PROCESS_DETAIL_RETRY_DELAYS_MS.length; attempt += 1) {
+      try {
+        return await getLecture(lectureId);
+      } catch (err) {
+        lastError = err;
+        if (attempt >= PROCESS_DETAIL_RETRY_DELAYS_MS.length) {
+          break;
+        }
+        await sleep(PROCESS_DETAIL_RETRY_DELAYS_MS[attempt]);
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }, []);
+
   const failProcessJob = useCallback((message: string, status?: UploadProcessJobStatus) => {
     stopProcessSubscription();
-    window.localStorage.removeItem(ACTIVE_PROCESS_JOB_STORAGE_KEY);
+    clearStorageWithLegacy(ACTIVE_PROCESS_JOB_STORAGE_KEY, LEGACY_ACTIVE_PROCESS_JOB_STORAGE_KEY);
     if (status) setProcessJob(status);
     setUploadLoadingLabel("");
+    setProcessBanner({ kind: "error", text: message });
     setMainView({ view: "upload", loading: false, error: message });
   }, [stopProcessSubscription]);
 
   const finishProcessJob = useCallback(async (status: UploadProcessJobStatus) => {
     stopProcessSubscription();
-    window.localStorage.removeItem(ACTIVE_PROCESS_JOB_STORAGE_KEY);
+    clearStorageWithLegacy(ACTIVE_PROCESS_JOB_STORAGE_KEY, LEGACY_ACTIVE_PROCESS_JOB_STORAGE_KEY);
     setProcessJob(status);
 
     const lectureId = status.lecture_id;
@@ -218,24 +327,98 @@ export default function App() {
       return;
     }
 
+    const refreshResult = await fetchLectures();
+    let completionWarning: string | null = null;
+    if (!refreshResult.ok) {
+      completionWarning = `Lecture was saved, but refreshing Saved lectures failed (${refreshResult.error}).`;
+    }
+
     try {
-      const data = await getLecture(lectureId);
-      await fetchLectures();
+      const data = await fetchLectureWithRetry(lectureId);
       setSelectedId(lectureId);
       setMainView({ view: "results", data, activeSlide: 0, lectureId });
+      setProcessBanner(completionWarning ? { kind: "error", text: completionWarning } : null);
       setProcessChat([]);
       setUploadLoadingLabel("");
     } catch (err) {
-      setMainView({
-        view: "upload",
-        loading: false,
-        error: err instanceof Error ? err.message : String(err),
-      });
+      const detailError = toErrorMessage(err);
+      const refreshSuffix = refreshResult.ok
+        ? ""
+        : ` Also, refreshing Saved lectures failed (${refreshResult.error || lectureRefreshError || "unknown error"}).`;
+      const message = (
+        "Processing finished and lecture was saved, but we could not open it automatically. "
+        + "Select it from Saved lectures and try again."
+        + refreshSuffix
+      );
+      setProcessBanner({ kind: "info", text: message });
+      setMainView({ view: "upload", loading: false, error: undefined });
+      setProcessChat([]);
+      setUploadLoadingLabel("");
+      console.warn(`Failed to open lecture ${lectureId} after completion:`, detailError);
     }
-  }, [fetchLectures, stopProcessSubscription]);
+  }, [fetchLectureWithRetry, fetchLectures, lectureRefreshError, stopProcessSubscription]);
+
+  const handleProcessDoneOnce = useCallback(async (status: UploadProcessJobStatus) => {
+    const jobId = status.job_id;
+    if (processTerminalHandledRef.current.has(jobId)) {
+      return;
+    }
+    processTerminalHandledRef.current.add(jobId);
+    await finishProcessJob(status);
+  }, [finishProcessJob]);
+
+  const handleProcessErrorOnce = useCallback((message: string, status?: UploadProcessJobStatus) => {
+    const jobId = status?.job_id;
+    if (jobId) {
+      if (processTerminalHandledRef.current.has(jobId)) {
+        return;
+      }
+      processTerminalHandledRef.current.add(jobId);
+    }
+    failProcessJob(message, status);
+  }, [failProcessJob]);
+
+  const startProcessPolling = useCallback((jobId: string) => {
+    processActiveJobIdRef.current = jobId;
+    processPollingInFlightRef.current = false;
+
+    if (processPollingTimerRef.current !== null) {
+      window.clearInterval(processPollingTimerRef.current);
+      processPollingTimerRef.current = null;
+    }
+
+    processPollingTimerRef.current = window.setInterval(() => {
+      if (processPollingInFlightRef.current) return;
+      if (processActiveJobIdRef.current !== jobId) return;
+
+      processPollingInFlightRef.current = true;
+      void (async () => {
+        try {
+          const snapshot = await getProcessJob(jobId);
+          if (processActiveJobIdRef.current !== jobId) return;
+          setProcessJob(snapshot);
+
+          if (snapshot.status === "done") {
+            await handleProcessDoneOnce(snapshot);
+            return;
+          }
+          if (snapshot.status === "error") {
+            handleProcessErrorOnce(snapshot.error || "Upload processing failed.", snapshot);
+          }
+        } catch (err) {
+          console.warn("Process polling failed:", toErrorMessage(err));
+        } finally {
+          processPollingInFlightRef.current = false;
+        }
+      })();
+    }, PROCESS_STATUS_POLL_MS);
+  }, [handleProcessDoneOnce, handleProcessErrorOnce]);
 
   const subscribeToProcessJob = useCallback((jobId: string, lastEventId: number) => {
     stopProcessSubscription();
+    processTerminalHandledRef.current.delete(jobId);
+    startProcessPolling(jobId);
+
     processUnsubscribeRef.current = subscribeProcessJobEvents(jobId, {
       onProgress: (event) => {
         setProcessJob(event);
@@ -254,13 +437,13 @@ export default function App() {
         setProcessJob(event);
         appendProcessChat(event, "done");
         setUploadLoadingLabel("");
-        void finishProcessJob(event);
+        void handleProcessDoneOnce(event);
       },
       onError: (event) => {
         setProcessJob(event);
         appendProcessChat(event, "error");
         setUploadLoadingLabel("");
-        failProcessJob(event.error || "Upload processing failed.", event);
+        handleProcessErrorOnce(event.error || "Upload processing failed.", event);
       },
       onTransportError: () => {
         stopProcessSubscription();
@@ -269,26 +452,36 @@ export default function App() {
             const snapshot = await getProcessJob(jobId);
             setProcessJob(snapshot);
             if (snapshot.status === "done") {
-              await finishProcessJob(snapshot);
+              await handleProcessDoneOnce(snapshot);
               return;
             }
             if (snapshot.status === "error") {
-              failProcessJob(snapshot.error || "Upload processing failed.", snapshot);
+              handleProcessErrorOnce(snapshot.error || "Upload processing failed.", snapshot);
               return;
             }
+            startProcessPolling(jobId);
             processReconnectTimerRef.current = window.setTimeout(() => {
               subscribeToProcessJob(jobId, processLastEventIdRef.current);
             }, 1000);
           } catch (err) {
-            failProcessJob(err instanceof Error ? err.message : String(err));
+            handleProcessErrorOnce(toErrorMessage(err));
           }
         })();
       },
     }, { lastEventId });
-  }, [appendProcessChat, failProcessJob, finishProcessJob, stopProcessSubscription]);
+  }, [
+    appendProcessChat,
+    handleProcessDoneOnce,
+    handleProcessErrorOnce,
+    startProcessPolling,
+    stopProcessSubscription,
+  ]);
 
   useEffect(() => {
-    const storedJobId = window.localStorage.getItem(ACTIVE_PROCESS_JOB_STORAGE_KEY);
+    const storedJobId = readStorageWithMigration(
+      ACTIVE_PROCESS_JOB_STORAGE_KEY,
+      LEGACY_ACTIVE_PROCESS_JOB_STORAGE_KEY,
+    );
     if (!storedJobId) return;
     const initialPath = window.location.pathname;
     if (initialPath !== "/workspace" && !initialPath.startsWith("/lectures/")) {
@@ -305,20 +498,20 @@ export default function App() {
         setProcessJob(snapshot);
         setUploadLoadingLabel(`Processing: ${formatProcessStage(snapshot.current_stage)} (${snapshot.progress_pct}%)`);
         if (snapshot.status === "done") {
-          await finishProcessJob(snapshot);
+          await handleProcessDoneOnce(snapshot);
           return;
         }
         if (snapshot.status === "error") {
-          failProcessJob(snapshot.error || "Upload processing failed.", snapshot);
+          handleProcessErrorOnce(snapshot.error || "Upload processing failed.", snapshot);
           return;
         }
         subscribeToProcessJob(storedJobId, 0);
       } catch {
-        window.localStorage.removeItem(ACTIVE_PROCESS_JOB_STORAGE_KEY);
+        clearStorageWithLegacy(ACTIVE_PROCESS_JOB_STORAGE_KEY, LEGACY_ACTIVE_PROCESS_JOB_STORAGE_KEY);
         setUploadLoadingLabel("");
       }
     })();
-  }, [failProcessJob, finishProcessJob, navigate, subscribeToProcessJob]);
+  }, [handleProcessDoneOnce, handleProcessErrorOnce, navigate, subscribeToProcessJob]);
 
   const finishRegeneration = useCallback(async (lectureId: number, status: RegenerateNotesJobStatus) => {
     stopRegenerationSubscription();
@@ -397,8 +590,10 @@ export default function App() {
     const runId = demoRunRef.current + 1;
     demoRunRef.current = runId;
 
+    setDemoPreviewActive(true);
     resetRegenerationUi();
     resetProcessUi(true);
+    setProcessBanner(null);
     setSelectedId(null);
     setProcessingLectureName(`${DEMO_LECTURE_NAME} - Demo (2026)`);
     setMainView({ view: "upload", loading: true });
@@ -456,11 +651,11 @@ export default function App() {
 
       const selectedDemo = await findBestLectureWithNotesByExactName(DEMO_LECTURE_NAME);
       if (!selectedDemo) {
-        setDemoSourceData(null);
+        setDemoPreviewActive(false);
         setMainView({
           view: "upload",
           loading: false,
-          error: `No lecture named ${DEMO_LECTURE_NAME} with notes was found. Open normal mode to process one.`,
+          error: `No lecture named ${DEMO_LECTURE_NAME} with notes was found. Process one and try again.`,
         });
         return;
       }
@@ -472,20 +667,15 @@ export default function App() {
         lecture_id: lectureId,
         name: lectureName,
         is_archived: selectedDemo.summary.is_archived,
+        is_saved: selectedDemo.summary.is_saved,
       };
-
-      setDemoSourceData({
-        ...selectedDemo.lecture,
-        lecture_id: lectureId,
-        name: lectureName,
-      });
 
       setSelectedId(selectedDemo.summary.id);
       await fetchLectures();
       if (demoRunRef.current !== runId) return;
       setMainView({ view: "results", data: lectureData, activeSlide: 0, lectureId: selectedDemo.summary.id });
     } catch (err) {
-      setDemoSourceData(null);
+      setDemoPreviewActive(false);
       setMainView({
         view: "upload",
         loading: false,
@@ -500,45 +690,30 @@ export default function App() {
     }
   }, [fetchLectures, resetProcessUi, resetRegenerationUi]);
 
-  const handleToggleDemo = useCallback(() => {
-    demoRunRef.current += 1;
-    setUploadLoadingLabel("");
-    setDemoSourceData(null);
-    setSelectedId(null);
-    resetRegenerationUi();
-    resetProcessUi(true);
-    setMainView({ view: "upload", loading: false });
-    setDemoMode((prev) => !prev);
-
-    checkHealth().then(setBackendOnline);
-    void fetchLectures();
-  }, [fetchLectures, resetProcessUi, resetRegenerationUi]);
-
   async function handleSubmit(pdf: File, recording: UploadRecordingInput, naming: UploadLectureNamingInput) {
-    if (demoMode) {
-      await handleRunDemo();
-      return;
-    }
-
+    demoRunRef.current += 1;
+    setDemoPreviewActive(false);
     resetRegenerationUi();
     resetProcessUi(true);
     setProcessChat([]);
     processLastEventIdRef.current = 0;
+    setProcessBanner(null);
     setUploadLoadingLabel("");
     setProcessingLectureName(`${naming.courseid} - ${naming.lecture} (${naming.year})`);
     setMainView({ view: "upload", loading: true });
     try {
       const job = await startProcessJob(pdf, recording, naming);
+      processTerminalHandledRef.current.delete(job.job_id);
       setSelectedId(null);
       setProcessJob(job);
       window.localStorage.setItem(ACTIVE_PROCESS_JOB_STORAGE_KEY, job.job_id);
 
       if (job.status === "done") {
-        await finishProcessJob(job);
+        await handleProcessDoneOnce(job);
         return;
       }
       if (job.status === "error") {
-        failProcessJob(job.error || "Upload processing failed.", job);
+        handleProcessErrorOnce(job.error || "Upload processing failed.", job);
         return;
       }
       subscribeToProcessJob(job.job_id, 0);
@@ -554,11 +729,11 @@ export default function App() {
             window.localStorage.setItem(ACTIVE_PROCESS_JOB_STORAGE_KEY, activeJobId);
 
             if (snapshot.status === "done") {
-              await finishProcessJob(snapshot);
+              await handleProcessDoneOnce(snapshot);
               return;
             }
             if (snapshot.status === "error") {
-              failProcessJob(snapshot.error || "Upload processing failed.", snapshot);
+              handleProcessErrorOnce(snapshot.error || "Upload processing failed.", snapshot);
               return;
             }
             subscribeToProcessJob(activeJobId, 0);
@@ -577,15 +752,19 @@ export default function App() {
       setMainView({
         view: "upload",
         loading: false,
-        error: err instanceof Error ? err.message : String(err),
+        error: toErrorMessage(err),
       });
     }
   }
 
   const loadLectureIntoWorkspace = useCallback(async (id: number) => {
+    demoRunRef.current += 1;
+    setDemoPreviewActive(false);
     resetRegenerationUi();
     resetProcessUi(false);
+    setProcessBanner(null);
     setUploadLoadingLabel("");
+    setSaveBanner(null);
     setArchiveBanner(null);
     setSelectedId(id);
     setMainView({ view: "upload", loading: true });
@@ -598,6 +777,7 @@ export default function App() {
   }, [resetProcessUi, resetRegenerationUi]);
 
   const handleSelectLecture = useCallback((id: number) => {
+    setProcessBanner(null);
     setSelectedId(id);
     if (location.pathname === `/lectures/${id}`) {
       void loadLectureIntoWorkspace(id);
@@ -607,11 +787,15 @@ export default function App() {
   }, [loadLectureIntoWorkspace, location.pathname, navigate]);
 
   const handleNewLecture = useCallback(() => {
+    demoRunRef.current += 1;
+    setDemoPreviewActive(false);
     resetRegenerationUi();
     if (!processJob || processJob.status === "done" || processJob.status === "error") {
       resetProcessUi(true);
     }
+    setProcessBanner(null);
     setUploadLoadingLabel("");
+    setSaveBanner(null);
     setArchiveBanner(null);
     setSelectedId(null);
     setMainView({ view: "upload", loading: false });
@@ -619,14 +803,58 @@ export default function App() {
   }, [navigate, processJob, resetProcessUi, resetRegenerationUi]);
 
   const handleGoHome = useCallback(() => {
+    demoRunRef.current += 1;
+    setDemoPreviewActive(false);
     navigate("/");
   }, [navigate]);
+
+  const handleOpenAdminPanel = useCallback(() => {
+    navigate("/admin");
+  }, [navigate]);
+
+  const handleLogout = useCallback(() => {
+    clearStorageWithLegacy(IS_ADMIN_STORAGE_KEY, LEGACY_IS_ADMIN_STORAGE_KEY);
+    setIsAdmin(false);
+    navigate("/");
+  }, [navigate]);
+
+  const handleRegisterAdmin = useCallback(async () => {
+    setAdminRegisterError(null);
+    setAdminRegisterLoading(true);
+    try {
+      await registerAsAdmin(adminSecretInput.trim());
+      window.localStorage.setItem(IS_ADMIN_STORAGE_KEY, "true");
+      setIsAdmin(true);
+      setShowAdminModal(false);
+      setAdminSecretInput("");
+    } catch (err) {
+      setAdminRegisterError(err instanceof ApiError ? err.message : "Registration failed.");
+    } finally {
+      setAdminRegisterLoading(false);
+    }
+  }, [adminSecretInput]);
 
   useEffect(() => {
     if (location.pathname === "/workspace" && mainView.view === "empty") {
       setMainView({ view: "upload", loading: false });
     }
   }, [location.pathname, mainView.view]);
+
+  useEffect(() => {
+    if (!deleteDialogOpen || deletePending) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setDeleteDialogOpen(false);
+      setDeleteTarget(null);
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [deleteDialogOpen, deletePending]);
 
   useEffect(() => {
     if (!lectureRouteIdParam) return;
@@ -636,7 +864,9 @@ export default function App() {
       resetRegenerationUi();
       resetProcessUi(false);
       setUploadLoadingLabel("");
+      setSaveBanner(null);
       setArchiveBanner(null);
+      setProcessBanner(null);
       setSelectedId(null);
       setMainView({ view: "upload", loading: false, error: "Invalid lecture id." });
       navigate("/workspace", { replace: true });
@@ -653,7 +883,7 @@ export default function App() {
   ]);
 
   async function handleToggleArchive() {
-    if (mainView.view !== "results" || demoMode) return;
+    if (mainView.view !== "results" || demoPreviewActive) return;
 
     const lectureId = mainView.lectureId ?? mainView.data.lecture_id;
     if (!lectureId) {
@@ -663,6 +893,7 @@ export default function App() {
 
     const shouldArchive = !mainView.data.is_archived;
     setArchivePending(true);
+    setSaveBanner(null);
     setArchiveBanner(null);
 
     try {
@@ -700,6 +931,103 @@ export default function App() {
     }
   }
 
+  async function handleToggleSaved() {
+    if (mainView.view !== "results" || demoPreviewActive) return;
+
+    const lectureId = mainView.lectureId ?? mainView.data.lecture_id;
+    if (!lectureId) {
+      setSaveBanner({ kind: "error", text: "Cannot update saved status because lecture id is missing." });
+      return;
+    }
+
+    const currentlySaved = Boolean(mainView.data.is_saved);
+    setSavePending(true);
+    setArchiveBanner(null);
+    setSaveBanner(null);
+
+    try {
+      const response = currentlySaved
+        ? await unsaveLecture(lectureId)
+        : await saveLecture(lectureId);
+
+      setMainView((prev) => (
+        prev.view === "results"
+          ? {
+            ...prev,
+            data: {
+              ...prev.data,
+              is_saved: response.is_saved,
+            },
+            lectureId,
+          }
+          : prev
+      ));
+
+      await fetchLectures();
+      setSaveBanner({
+        kind: "success",
+        text: response.is_saved ? "Lecture saved." : "Removed from Saved lectures.",
+      });
+    } catch (err) {
+      setSaveBanner({
+        kind: "error",
+        text: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setSavePending(false);
+    }
+  }
+
+  function openDeleteDialog() {
+    if (!isWorkspaceRoute || mainView.view !== "results" || demoPreviewActive) return;
+    const lectureId = mainView.lectureId ?? mainView.data.lecture_id;
+    if (!lectureId) return;
+
+    setDeleteTarget({
+      id: lectureId,
+      name: mainView.data.name?.trim() || "this lecture",
+    });
+    setDeleteDialogOpen(true);
+  }
+
+  function cancelDeleteDialog() {
+    if (deletePending) return;
+    setDeleteDialogOpen(false);
+    setDeleteTarget(null);
+  }
+
+  async function confirmDeleteDialog() {
+    if (!deleteTarget) return;
+    setDeletePending(true);
+
+    try {
+      await trashLecture(deleteTarget.id);
+      await fetchLectures();
+      setSelectedId(null);
+      setMainView({ view: "empty" });
+      navigate("/");
+    } catch (err) {
+      setArchiveBanner({ kind: "error", text: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setDeletePending(false);
+      setDeleteDialogOpen(false);
+      setDeleteTarget(null);
+    }
+  }
+
+  async function handleRestoreLecture(id: number) {
+    try {
+      await restoreLecture(id);
+      await fetchLectures();
+    } catch (err) {
+      console.warn("Failed to restore lecture:", err);
+    }
+  }
+
+  const handleProfileChange = useCallback((nextProfile: StudentProfile) => {
+    setProfile(nextProfile);
+  }, []);
+
   async function handleRegenerateNotes() {
     if (mainView.view !== "results") return;
     if (!REGENERATE_NOTES_AVAILABLE) {
@@ -712,7 +1040,7 @@ export default function App() {
       return;
     }
 
-    if (demoMode) {
+    if (demoPreviewActive) {
       const runId = demoRegenRunRef.current + 1;
       demoRegenRunRef.current = runId;
 
@@ -771,6 +1099,7 @@ export default function App() {
     stopRegenerationSubscription();
     setRegeneratingNotes(true);
     setRegenBanner(null);
+    setSaveBanner(null);
     setArchiveBanner(null);
     try {
       const job = await startRegenerateNotesJob(lectureId);
@@ -866,19 +1195,46 @@ export default function App() {
     return `Regenerating notes: Slide ${position} of ${total}`;
   }, [regenJob, regeneratingNotes]);
 
+  const sidebarSavedLectures = useMemo(
+    () => savedLectures.filter((lecture) => !lecture.is_archived),
+    [savedLectures],
+  );
+
+  const sidebarArchivedLectures = useMemo(
+    () => (
+      isAdmin
+        ? lectures.filter((lecture) => lecture.is_archived)
+        : savedLectures.filter((lecture) => lecture.is_archived)
+    ),
+    [isAdmin, lectures, savedLectures],
+  );
+
   const isWorkspaceRoute = location.pathname === "/workspace" || location.pathname.startsWith("/lectures/");
   const isUploadActive = processJob?.status === "queued" || processJob?.status === "running";
   const hasUploadLabel = uploadLoadingLabel.trim().length > 0;
   const hasUploadEntries = processChat.length > 0;
   const showUploadErrorLogs = isWorkspaceRoute && processJob?.status === "error" && hasUploadEntries;
   const showSidebarUploadConsole = isUploadActive || hasUploadLabel || showUploadErrorLogs;
-  const showBackendOfflineBanner = backendOnline === false && !(demoMode && demoSourceData);
+  const showBackendOfflineBanner = backendOnline === false && !demoPreviewActive;
+  const canShowTrashAction = (
+    isAdmin
+    && isWorkspaceRoute
+    && mainView.view === "results"
+    && !demoPreviewActive
+    && Boolean(mainView.lectureId ?? mainView.data.lecture_id)
+  );
+  const canToggleSaved = (
+    mainView.view === "results"
+    && !demoPreviewActive
+    && Boolean(mainView.lectureId ?? mainView.data.lecture_id)
+  );
+  const canToggleArchive = canToggleSaved && isAdmin;
   const workspaceContent = (
     <>
       {mainView.view === "empty" && (
         <div className="welcome-state">
           <div className="welcome-icon">📚</div>
-          <h2 className="welcome-title">Welcome to LectureSummary</h2>
+          <h2 className="welcome-title">Welcome to TeachersNote</h2>
           <p className="welcome-sub">
             Select a lecture from the sidebar or click{" "}
             <button className="welcome-link-btn" onClick={handleNewLecture}>
@@ -894,7 +1250,6 @@ export default function App() {
           <UploadForm
             onSubmit={handleSubmit}
             loading={mainView.loading}
-            demoMode={demoMode}
             onRunDemo={handleRunDemo}
             progressPct={processJob?.progress_pct ?? null}
             progressLabel={uploadLoadingLabel}
@@ -922,40 +1277,53 @@ export default function App() {
           <div className="results">
               <div className="results-header">
                 <span className="results-lecture-name">{data.name ?? "Lecture"}</span>
-                {demoMode && <span className="demo-pill">Demo Mode On</span>}
-                {lectureId && REGENERATE_NOTES_AVAILABLE && (
-                  <button
-                    className="secondary"
-                    onClick={handleRegenerateNotes}
-                    disabled={regeneratingNotes || archivePending}
-                  >
-                    {regeneratingNotes ? "Regenerating..." : "Regenerate notes"}
-                  </button>
-                )}
-                {lectureId && !REGENERATE_NOTES_AVAILABLE && (
-                  <button
-                    className="secondary"
-                    disabled
-                  >
-                    Regenerate unavailable
-                  </button>
-                )}
-                {lectureId && !demoMode && (
-                  <button
-                    className="secondary"
-                  onClick={handleToggleArchive}
-                  disabled={archivePending || regeneratingNotes}
-                >
-                  {archivePending
-                    ? (data.is_archived ? "Unarchiving..." : "Archiving...")
-                    : (data.is_archived ? "Unarchive" : "Archive")}
-                </button>
-              )}
-              {downloadHref && (
-                <a href={downloadHref} download>
-                  <button>Download PPTX</button>
-                </a>
-              )}
+                {demoPreviewActive && <span className="demo-pill">Demo preview</span>}
+                <div className="results-actions">
+                  {lectureId && REGENERATE_NOTES_AVAILABLE && (
+                    <button
+                      className="secondary"
+                      onClick={handleRegenerateNotes}
+                      disabled={regeneratingNotes || archivePending || savePending}
+                    >
+                      {regeneratingNotes ? "Regenerating..." : "Regenerate notes"}
+                    </button>
+                  )}
+                  {lectureId && !REGENERATE_NOTES_AVAILABLE && (
+                    <button
+                      className="secondary"
+                      disabled
+                    >
+                      Regenerate unavailable
+                    </button>
+                  )}
+                  {canToggleSaved && (
+                    <button
+                      className="secondary"
+                      onClick={handleToggleSaved}
+                      disabled={savePending || archivePending || regeneratingNotes}
+                    >
+                      {savePending
+                        ? (data.is_saved ? "Removing..." : "Saving...")
+                        : (data.is_saved ? "Remove from Saved" : "Save")}
+                    </button>
+                  )}
+                  {canToggleArchive && (
+                    <button
+                      className="secondary"
+                      onClick={handleToggleArchive}
+                      disabled={archivePending || savePending || regeneratingNotes}
+                    >
+                      {archivePending
+                        ? (data.is_archived ? "Unarchiving..." : "Archiving...")
+                        : (data.is_archived ? "Unarchive" : "Archive")}
+                    </button>
+                  )}
+                  {downloadHref && (
+                    <a href={downloadHref} download>
+                      <button>Download PPTX</button>
+                    </a>
+                  )}
+                </div>
             </div>
             {regeneratingNotes && (
               <div className="regen-progress">
@@ -965,6 +1333,9 @@ export default function App() {
             )}
             {regenBanner && (
               <div className={`banner ${regenBanner.kind}`}>{regenBanner.text}</div>
+            )}
+            {saveBanner && (
+              <div className={`banner ${saveBanner.kind}`}>{saveBanner.text}</div>
             )}
             {archiveBanner && (
               <div className={`banner ${archiveBanner.kind}`}>{archiveBanner.text}</div>
@@ -993,20 +1364,25 @@ export default function App() {
     <ErrorBoundary>
     <div className="app-shell">
       <Sidebar
-        lectures={lectures}
+        savedLectures={sidebarSavedLectures}
+        archivedLectures={sidebarArchivedLectures}
+        deletedLectures={deletedLectures}
         loading={lecturesLoading}
         selectedId={selectedId}
         onSelect={handleSelectLecture}
         onNewLecture={handleNewLecture}
         onGoHome={handleGoHome}
-        demoMode={demoMode}
-        onToggleDemo={handleToggleDemo}
-        onRunDemo={handleRunDemo}
+        onRestore={handleRestoreLecture}
         showUploadConsole={showSidebarUploadConsole}
         uploadLoadingLabel={uploadLoadingLabel}
         processJob={processJob}
         processChat={processChat}
         processingLectureName={processingLectureName}
+        isAdmin={isAdmin}
+        currentUserId={currentUserId}
+        onOpenAdminPanel={handleOpenAdminPanel}
+        onRegisterAdmin={() => setShowAdminModal(true)}
+        onLogout={handleLogout}
       />
 
       <main className="main-content">
@@ -1014,8 +1390,30 @@ export default function App() {
           <div className="banner error">Backend offline — start uvicorn on port 8000.</div>
         )}
 
-        {demoMode && (
-          <div className="banner info">Demo Mode On — uses existing DB-lecture-12-2026 lecture data without API-key processing.</div>
+        {isWorkspaceRoute && processBanner && (
+          <div className={`banner ${processBanner.kind}`}>{processBanner.text}</div>
+        )}
+
+        {canShowTrashAction && (
+          <button
+            type="button"
+            className="trash-fab"
+            onClick={openDeleteDialog}
+            disabled={archivePending || savePending || regeneratingNotes || deletePending}
+            aria-label="Delete lecture"
+            title="Delete lecture"
+          >
+            <svg className="trash-fab-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                d="M3 6h18M8 6V4h8v2m-9 0l1 14h8l1-14M10 10v7m4-7v7"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+          </button>
         )}
 
         <Routes>
@@ -1023,8 +1421,12 @@ export default function App() {
             path="/"
             element={(
               <Homepage
-                lectures={lectures}
+                savedLectures={savedLectures}
+                allLectures={lectures}
                 loading={lecturesLoading}
+                profile={profile}
+                profileLoading={profileLoading}
+                onProfileChange={handleProfileChange}
                 onOpenLecture={handleSelectLecture}
               />
             )}
@@ -1035,9 +1437,84 @@ export default function App() {
           />
           <Route path="/workspace" element={workspaceContent} />
           <Route path="/lectures/:lectureId" element={workspaceContent} />
+          <Route
+            path="/admin"
+            element={isAdmin ? <AdminPanel onBack={handleGoHome} /> : <Navigate to="/" replace />}
+          />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
+
+      {deleteDialogOpen && deleteTarget && (
+        <div
+          className="confirm-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="delete-confirm-title"
+          onClick={cancelDeleteDialog}
+        >
+          <div className="confirm-dialog" onClick={(e) => e.stopPropagation()}>
+            <h2 id="delete-confirm-title" className="confirm-title">Delete lecture?</h2>
+            <p className="confirm-text">
+              Delete <strong>"{deleteTarget.name}"</strong>? This will move the PPTX to Recently Deleted.
+            </p>
+            <div className="confirm-actions">
+              <button
+                type="button"
+                className="confirm-cancel-btn"
+                onClick={cancelDeleteDialog}
+                disabled={deletePending}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="confirm-delete-btn"
+                onClick={() => void confirmDeleteDialog()}
+                disabled={deletePending}
+              >
+                {deletePending ? "Deleting..." : "Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showAdminModal && (
+        <div className="modal-overlay" onClick={() => setShowAdminModal(false)}>
+          <div className="modal-box" onClick={(e) => e.stopPropagation()}>
+            <h2 className="modal-title">Register as Admin</h2>
+            <p className="modal-description">Enter the admin secret to gain admin access.</p>
+            <input
+              className="modal-input"
+              type="password"
+              placeholder="Admin secret"
+              value={adminSecretInput}
+              onChange={(e) => setAdminSecretInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") void handleRegisterAdmin(); }}
+              autoFocus
+            />
+            {adminRegisterError && (
+              <p className="modal-error">{adminRegisterError}</p>
+            )}
+            <div className="modal-actions">
+              <button
+                className="modal-btn modal-btn--secondary"
+                onClick={() => { setShowAdminModal(false); setAdminSecretInput(""); setAdminRegisterError(null); }}
+              >
+                Cancel
+              </button>
+              <button
+                className="modal-btn modal-btn--primary"
+                onClick={() => void handleRegisterAdmin()}
+                disabled={adminRegisterLoading || !adminSecretInput.trim()}
+              >
+                {adminRegisterLoading ? "Registering…" : "Register"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
     </ErrorBoundary>
   );

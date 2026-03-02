@@ -1,6 +1,6 @@
-# Frontend (LectureSummary)
+# Frontend (TeachersNote)
 
-React + TypeScript + Vite frontend for the LectureSummary pipeline.
+React + TypeScript + Vite frontend for the TeachersNote pipeline.
 
 ## Features
 

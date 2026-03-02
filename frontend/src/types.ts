@@ -45,11 +45,16 @@ export interface ProcessResult {
   is_archived?: boolean;
 }
 
-export interface LectureSummary {
+export interface TeachersNoteSummary {
   id: number;
   name: string;
   is_demo: boolean;
   is_archived: boolean;
+  is_deleted?: boolean;
+  is_approved?: boolean;
+  course_id: string | null;
+  uploaded_by?: string | null;
+  is_saved: boolean;
   pptx_path: string | null;
   pdf_url?: string | null;
   created_at: string;
@@ -58,7 +63,83 @@ export interface LectureSummary {
 export interface LectureDetail extends ProcessResult {
   lecture_id: number;
   name: string;
+  course_id: string | null;
   is_archived: boolean;
+  is_saved: boolean;
+}
+
+export interface Program {
+  id: number;
+  code: string;
+  name: string;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface Course {
+  id: number;
+  code: string;
+  name: string;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StudentProfile {
+  user_id: string;
+  program: Program | null;
+  selected_courses: Course[];
+}
+
+export interface ProfileCourseOptions {
+  program: Program | null;
+  programs: Program[];
+  all_courses: Course[];
+  program_courses: Course[];
+}
+
+export interface CatalogSyncRequest {
+  snapshot_date?: string;
+  dry_run?: boolean;
+}
+
+export interface CatalogSyncResult {
+  snapshot_date: string;
+  standalone_count: number;
+  program_count: number;
+  program_course_count: number;
+  program_plan_rows_written: number;
+  programs_created: number;
+  programs_updated: number;
+  programs_deactivated: number;
+  courses_created: number;
+  courses_updated: number;
+  courses_deactivated: number;
+  mappings_added: number;
+  mappings_removed: number;
+  warnings: string[];
+  duration_seconds: number;
+  dry_run: boolean;
+}
+
+export interface ProgramPlanRow {
+  id: number;
+  program_id: number;
+  course_id: number | null;
+  term_label: string;
+  group_type: "mandatory" | "optional";
+  group_label: string | null;
+  course_code: string | null;
+  course_name_sv: string;
+  course_url: string;
+  display_order: number;
+  snapshot_date: string | null;
+}
+
+export interface ProgramPlanResponse {
+  program: Program;
+  rows: ProgramPlanRow[];
 }
 
 export interface ArchiveLectureResponse {

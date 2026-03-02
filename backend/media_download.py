@@ -138,8 +138,13 @@ def download_remote_media_to_path(
     bytes_written = 0
 
     try:
-        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        with httpx.Client(timeout=timeout, follow_redirects=False) as client:
             with client.stream("GET", normalized) as response:
+                if response.status_code in (301, 302, 303, 307, 308):
+                    raise RemoteMediaDownloadError(
+                        f"Recording URL returned a redirect ({response.status_code}). "
+                        "Please provide a direct download link to the media file."
+                    )
                 if response.status_code >= 400:
                     raise RemoteMediaDownloadError(
                         f"Failed to download recording URL ({safe_url}): HTTP {response.status_code}."

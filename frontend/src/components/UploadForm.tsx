@@ -4,7 +4,6 @@ import { type UploadLectureNamingInput, type UploadRecordingInput } from "../typ
 interface Props {
   onSubmit: (pdf: File, recording: UploadRecordingInput, naming: UploadLectureNamingInput) => void;
   loading: boolean;
-  demoMode: boolean;
   onRunDemo: () => void;
   progressPct?: number | null;
   progressLabel?: string;
@@ -52,6 +51,7 @@ function FileSelectedIcon() {
 }
 
 const AUDIO_EXTENSIONS = /\.(mp4|mov|webm|wav|m4a|mp3)$/i;
+const URL_RECORDING_ENABLED = false;
 
 interface DropZoneProps {
   label: string;
@@ -121,7 +121,7 @@ function DropZone({
   );
 }
 
-export default function UploadForm({ onSubmit, loading, demoMode, onRunDemo, progressPct, progressLabel }: Props) {
+export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, progressLabel }: Props) {
   const [pdfFile, setPdfFile] = useState<File | null>(null);
   const [audioFile, setAudioFile] = useState<File | null>(null);
   const [recordingSource, setRecordingSource] = useState<"file" | "url">("file");
@@ -136,6 +136,7 @@ export default function UploadForm({ onSubmit, loading, demoMode, onRunDemo, pro
   const [showHowItWorks, setShowHowItWorks] = useState(false);
   const pdfInputRef = useRef<HTMLInputElement>(null);
   const audioInputRef = useRef<HTMLInputElement>(null);
+  const effectiveRecordingSource: "file" | "url" = URL_RECORDING_ENABLED ? recordingSource : "file";
 
   function makeDropHandler(
     mimeCheck: (file: File) => boolean,
@@ -175,7 +176,7 @@ export default function UploadForm({ onSubmit, loading, demoMode, onRunDemo, pro
     }
 
     let recording: UploadRecordingInput | null = null;
-    if (recordingSource === "file") {
+    if (effectiveRecordingSource === "file") {
       if (!audioFile) {
         setError("Please select an audio or video file.");
         return;
@@ -224,15 +225,10 @@ export default function UploadForm({ onSubmit, loading, demoMode, onRunDemo, pro
 
   return (
     <form className="upload-form" onSubmit={handleSubmit}>
-      <h1 className="form-title">Lecture Summary</h1>
+      <h1 className="form-title">TeachersNote</h1>
       <p className="form-subtitle">
         Upload lecture slides (PDF) and add a recording file or direct URL to generate an aligned transcript.
       </p>
-      {demoMode && (
-        <div className="form-demo-hint">
-          Demo Mode is on. Processing and regeneration are simulated without API-key calls.
-        </div>
-      )}
 
       <div className="form-info-box">
         <button
@@ -246,7 +242,19 @@ export default function UploadForm({ onSubmit, loading, demoMode, onRunDemo, pro
         </button>
         {showHowItWorks && (
           <div className="form-info-box-content">
-            Upload your lecture slides (PDF) and recording. Our system extracts the slide content, transcribes the audio, and aligns each transcript segment to the corresponding slide. Then it generates rich notes and takeaways for each slide.
+            <p className="form-info-box-text">
+              Upload your lecture slides (PDF) and recording. Our system extracts the slide content, transcribes the
+              audio, and aligns each transcript segment to the corresponding slide. Then it generates rich notes and
+              takeaways for each slide.
+            </p>
+            <button
+              type="button"
+              className="form-info-box-demo-btn"
+              onClick={onRunDemo}
+              disabled={loading}
+            >
+              Show demo
+            </button>
           </div>
         )}
       </div>
@@ -355,24 +363,25 @@ export default function UploadForm({ onSubmit, loading, demoMode, onRunDemo, pro
             />
             Upload File
           </label>
-          <label className="recording-source-option">
+          <label className={`recording-source-option${URL_RECORDING_ENABLED ? "" : " recording-source-option--disabled"}`}>
             <input
               type="radio"
               name="recording-source"
               value="url"
               checked={recordingSource === "url"}
-              disabled={loading}
+              disabled={loading || !URL_RECORDING_ENABLED}
               onChange={() => {
+                if (!URL_RECORDING_ENABLED) return;
                 setError("");
                 setRecordingSource("url");
               }}
             />
-            Paste URL
+            Paste URL {!URL_RECORDING_ENABLED ? "(Unavailable)" : ""}
           </label>
         </div>
       </div>
 
-      {recordingSource === "file" ? (
+      {effectiveRecordingSource === "file" ? (
         <DropZone
           label="Video / Audio"
           accept=".mp4,.mov,.webm,.wav,.m4a,.mp3"
@@ -418,7 +427,7 @@ export default function UploadForm({ onSubmit, loading, demoMode, onRunDemo, pro
           disabled={
             loading
             || !pdfFile
-            || (recordingSource === "file" ? !audioFile : !audioUrl.trim())
+            || (effectiveRecordingSource === "file" ? !audioFile : !audioUrl.trim())
             || !courseid.trim()
             || !lecture.trim()
             || !year.trim()
@@ -426,16 +435,6 @@ export default function UploadForm({ onSubmit, loading, demoMode, onRunDemo, pro
         >
           {loading ? <span className="spinner spinner--dark" /> : "Process Lecture"}
         </button>
-        {demoMode && (
-          <button
-            type="button"
-            className="submit-btn submit-btn-secondary"
-            onClick={onRunDemo}
-            disabled={loading}
-          >
-            {loading ? <span className="spinner spinner--dark" /> : "Run Demo"}
-          </button>
-        )}
       </div>
 
       {loading && (

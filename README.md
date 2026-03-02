@@ -1,4 +1,4 @@
-# LectureSummary
+# TeachersNote
 
 Full-stack lecture processing platform. Upload a PDF slide deck and an audio/video recording, then run a pipeline that extracts slide text, transcribes speech, aligns transcript segments to slides, enriches slide notes with AI, and generates a downloadable PPTX.
 
@@ -34,7 +34,7 @@ DB_HOST=localhost
 DB_PORT=3306
 DB_USER=your_user
 DB_PASSWORD=your_password
-DB_NAME=lecturesummary
+DB_NAME=teachersnote
 API_KEY=your_api_key
 ANTHROPIC_API_KEY=sk-ant-...
 GROQ_API_KEY=gsk_...
@@ -61,6 +61,54 @@ REMOTE_MEDIA_TOTAL_TIMEOUT_SEC=600
 REMOTE_MEDIA_ALLOWED_EXTENSIONS=.mp4,.mov,.webm,.wav,.m4a,.mp3
 ```
 
+### Database Rename (`lecturesummary` -> `teachersnote`)
+
+Use the migration script to preserve all existing data while moving to the new DB name.
+
+Prerequisites:
+- `mysql` and `mysqldump` are installed and available on `PATH`
+- Credentials can read/write both source and target DBs
+
+Run:
+
+```bash
+./scripts/migrate_db_name_to_teachersnote.sh
+```
+
+Optional flags/env:
+
+```bash
+# If target DB already has tables and you explicitly want to replace it
+./scripts/migrate_db_name_to_teachersnote.sh --force-empty-target
+
+# Override defaults when needed
+DB_HOST=localhost \
+DB_PORT=3306 \
+DB_USER=your_user \
+DB_PASSWORD=your_password \
+OLD_DB_NAME=lecturesummary \
+NEW_DB_NAME=teachersnote \
+./scripts/migrate_db_name_to_teachersnote.sh
+```
+
+What the script does:
+1. Stops if source DB is missing.
+2. Stops if target DB already has tables (unless `--force-empty-target`).
+3. Creates a backup in `out/db_backups/`.
+4. Creates target DB (`teachersnote`) with utf8mb4.
+5. Imports all source data into target.
+6. Verifies required table presence and row-count parity.
+
+After successful migration:
+1. Set `DB_NAME=teachersnote` in `backend/.env`.
+2. Restart the backend.
+3. Run smoke checks: `GET /health`, `/lectures`, `/programs`, `/courses`, `/profile`.
+
+Rollback:
+1. Keep the old `lecturesummary` DB until signoff.
+2. Revert `DB_NAME` to `lecturesummary`.
+3. Restart the backend to return to the previous database.
+
 ### Backend
 
 ```bash
@@ -83,6 +131,64 @@ npm run lint    # ESLint check
 
 If needed, set `VITE_API_URL` to point to a non-default backend URL.
 The "Regenerate notes" UI action is disabled by default; set `VITE_ENABLE_REGENERATE_NOTES=true` in frontend env to enable it.
+
+---
+
+## Catalog Sync (IDSV / DSV)
+
+TeachersNote can sync current Stockholm University DSV catalog data directly into:
+
+- `programs`
+- `courses`
+- `program_courses`
+- `program_course_plan`
+
+### Local extractor CLI
+
+```bash
+python scripts/collect_idsv_catalog.py --snapshot-date 2026-03-01 --out-dir out
+```
+
+Outputs:
+
+- `out/teachersnote_idsv_standalone_courses_<YYYY-MM-DD>.csv`
+- `out/teachersnote_idsv_program_courses_<YYYY-MM-DD>.csv`
+- `out/teachersnote_idsv_programs_<YYYY-MM-DD>.json`
+
+### Admin sync API
+
+`POST /admin/catalog/sync` (admin + API key required)
+
+Request body:
+
+```json
+{
+  "snapshot_date": "2026-03-01",
+  "dry_run": false
+}
+```
+
+- `snapshot_date` is optional (defaults to server `today`).
+- `dry_run=true` calculates changes without writing to DB.
+
+Response includes counters for created/updated/deactivated programs/courses, mapping adds/removals, plan rows written, and warnings.
+
+### Program plan API
+
+`GET /admin/programs/{program_id}/plan` (admin + API key required)
+
+Returns read-only rows with `term_label`, `group_type`, `group_label`, `course_code`, `course_name_sv`, `course_url`, `display_order`, `snapshot_date`.
+
+### Deactivation policy
+
+When a sync applies:
+
+- Programs missing from the snapshot are set `is_active=false` (soft deactivation).
+- Courses missing from the snapshot are set `is_active=false` (soft deactivation).
+- Program-course mappings are replaced for programs included in the snapshot.
+- Program plan rows are replaced for programs included in the snapshot.
+
+Warnings are returned for incomplete source rows (for example missing `Programöversikt` sections or missing `course_code`).
 
 ---
 
@@ -215,7 +321,11 @@ Serve an uploaded source PDF copied into `backend/source_pdfs/` (with legacy fal
 
 ### `GET /lectures`
 
-List all stored lectures, newest first. Lectures with missing PPTX assets are excluded.
+List visible lectures, newest first. Lectures with missing PPTX assets are excluded.
+
+Visibility:
+- non-admin users: approved lectures + their own pending uploads
+- admin users: all non-deleted lectures
 
 **Response** — `200 OK`
 ```json
@@ -224,17 +334,109 @@ List all stored lectures, newest first. Lectures with missing PPTX assets are ex
     "id": 42,
     "name": "DB-lecture-12-2026",
     "is_demo": false,
+    "course_id": "DB",
+    "is_saved": true,
     "pptx_path": "generated/DB-lecture-12-2026.pptx",
     "created_at": "2024-01-15T10:30:00"
   }
 ]
 ```
 
+### `GET /lectures/my`
+
+List lectures saved by the current user, newest saved first.
+
+### `PUT /lectures/{lecture_id}/save`
+
+Save a lecture to the current user's personal saved list.
+
+Visibility rules match `GET /lectures/{lecture_id}`.
+
+### `DELETE /lectures/{lecture_id}/save`
+
+Remove a lecture from the current user's personal saved list.
+
+Visibility rules match `GET /lectures/{lecture_id}`.
+
 ### `GET /lectures/{lecture_id}`
 
 Retrieve full processed data for a stored lecture.
 
-**Error** — `404` if lecture is not found or its PPTX asset is missing.
+Visibility:
+- non-admin users: approved lectures + their own pending uploads
+- admin users: all lectures
+
+Response payload includes `course_id` (normalized course code for lecture matching on homepage).
+
+**Error** — `404` if lecture is not found, not visible to current user, or its PPTX asset is missing.
+
+### `POST /lectures/{lecture_id}/archive`
+
+Set lecture archive state (`?archive=true|false`). Archive is a global lecture state.
+
+**Authorization** — admin only (`403` otherwise).
+
+### `POST /lectures/{lecture_id}/trash`
+
+Soft-delete a lecture globally (`is_deleted=true`).
+
+**Authorization** — admin only (`403` otherwise).
+
+### `POST /lectures/{lecture_id}/restore`
+
+Restore a soft-deleted lecture globally (`is_deleted=false`).
+
+**Authorization** — admin only (`403` otherwise).
+
+### `GET /lectures/deleted`
+
+List soft-deleted lectures.
+
+**Authorization** — admin only (`403` otherwise).
+
+### `GET /profile`
+
+Returns the current user profile (`X-User-Id`) with selected program and selected courses.
+
+### `PUT /profile/program`
+
+Set/replace the current user program.
+
+**Request**
+```json
+{ "program_id": 1 }
+```
+
+Use `null` to clear program.
+
+### `PUT /profile/courses`
+
+Replace the current user selected courses.
+
+**Request**
+```json
+{ "course_ids": [2, 4, 8] }
+```
+
+Unknown or inactive IDs return `400`.
+
+### `GET /profile/course-options`
+
+Returns active programs/courses and program-recommended course subset.
+
+### `GET /admin/programs`
+### `POST /admin/programs`
+### `PATCH /admin/programs/{program_id}`
+### `GET /admin/courses`
+### `POST /admin/courses`
+### `PATCH /admin/courses/{course_id}`
+### `GET /admin/programs/{program_id}/courses`
+### `PUT /admin/programs/{program_id}/courses/{course_id}`
+### `DELETE /admin/programs/{program_id}/courses/{course_id}`
+
+Program/course catalog and mapping endpoints used by admin panel.
+
+**Authorization** — admin only (`403` otherwise).
 
 ### `POST /lectures/{lecture_id}/regenerate-notes`
 
@@ -294,11 +496,17 @@ SSE stream for live regeneration progress events (`progress`, `done`, `error`).
 
 | Table | Key columns |
 |---|---|
-| `lectures` | `id`, `name`, `is_demo`, `pptx_path`, `pdf_path`, `created_at` |
+| `lectures` | `id`, `name`, `course_id`, `is_demo`, `is_archived`, `is_deleted`, `is_approved`, `uploaded_by`, `pptx_path`, `pdf_path`, `created_at` |
+| `lecture_saves` | `id`, `user_id`, `lecture_id`, `created_at` |
 | `slides` | `lecture_id`, `slide_number`, `text` |
 | `transcript_segments` | `lecture_id`, `segment_index`, `start_time`, `end_time`, `text` |
 | `alignments` | `lecture_id`, `slide_number`, `start_segment`, `end_segment` |
 | `enriched_slides` | `lecture_id`, `slide_number`, `summary`, `slide_content`, `lecturer_additions`, `key_takeaways` (JSON) |
+| `programs` | `id`, `code`, `name`, `is_active`, `created_at`, `updated_at` |
+| `courses` | `id`, `code`, `name`, `is_active`, `created_at`, `updated_at` |
+| `program_courses` | `program_id`, `course_id`, `created_at` |
+| `student_profiles` | `user_id`, `program_id`, `created_at`, `updated_at` |
+| `student_courses` | `user_id`, `course_id`, `created_at` |
 
 ---
 
@@ -343,7 +551,7 @@ frontend/src/
 - `aligned.json`
 - `enhanced.json`
 
-Demo mode uses a stored lecture named `DB-lecture-12-2026`, backed by `backend/generated/DB-lecture-12-2026.pptx`.
+The `Show demo` action uses a stored lecture named `DB-lecture-12-2026`, backed by `backend/generated/DB-lecture-12-2026.pptx`.
 
 ---
 
