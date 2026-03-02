@@ -22,31 +22,23 @@ export default function RegenerateNotesModal({
       return;
     }
 
-    let unsubscribe: (() => void) | null = null;
+    const unsubscribe = subscribeRegenerateNotesEvents(status.job_id, {
+      onProgress: (event) => {
+        setStatus(event);
+      },
+      onDone: (event) => {
+        setStatus(event);
+      },
+      onError: (event) => {
+        setStatus(event);
+        setError(event.error || "An error occurred during regeneration.");
+      },
+      onTransportError: () => {
+        setError("Connection lost. Please refresh or close this modal.");
+      },
+    });
 
-    const startSubscription = async () => {
-      unsubscribe = subscribeRegenerateNotesEvents(status.job_id, {
-        onProgress: (event) => {
-          setStatus(event);
-        },
-        onDone: (event) => {
-          setStatus(event);
-        },
-        onError: (event) => {
-          setStatus(event);
-          setError(event.error || "An error occurred during regeneration.");
-        },
-        onTransportError: () => {
-          setError("Connection lost. Please refresh or close this modal.");
-        },
-      });
-    };
-
-    void startSubscription();
-
-    return () => {
-      if (unsubscribe) unsubscribe();
-    };
+    return unsubscribe;
   }, [status.job_id, status.status]);
 
   const isDone = status.status === "done";

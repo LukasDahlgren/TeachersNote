@@ -443,11 +443,11 @@ async def _course_display_overrides_by_code(
     db: AsyncSession,
     course_ids: list[str | None],
 ) -> dict[str, str]:
-    normalized_codes = sorted({
+    normalized_codes = {
         normalized
         for course_id in course_ids
         if (normalized := _canonical_course_code(course_id))
-    })
+    }
     if not normalized_codes:
         return {}
 
@@ -457,10 +457,9 @@ async def _course_display_overrides_by_code(
 
     overrides: dict[str, str] = {}
     for course_code, display_code in result.all():
-        normalized_code = _canonical_course_code(str(course_code))
         normalized_display = _normalize_optional_catalog_code(display_code)
-        if normalized_code and normalized_display:
-            overrides[normalized_code] = normalized_display
+        if normalized_display:
+            overrides[str(course_code)] = normalized_display
     return overrides
 
 

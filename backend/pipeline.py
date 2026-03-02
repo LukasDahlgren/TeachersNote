@@ -63,6 +63,10 @@ TRANSCRIBE_CHUNK_HEADROOM_PCT = _env_int("TRANSCRIBE_CHUNK_HEADROOM_PCT", 90, mi
 TRANSCRIBE_MIN_CHUNK_SECONDS = _env_int("TRANSCRIBE_MIN_CHUNK_SECONDS", 300, minimum=60)
 TRANSCRIBE_RETRY_ATTEMPTS = _env_int("TRANSCRIBE_RETRY_ATTEMPTS", 3, minimum=1)
 TRANSCRIBE_RETRY_BASE_DELAY_SECONDS = float(os.getenv("TRANSCRIBE_RETRY_BASE_DELAY_SECONDS", "3").strip() or "3")
+TRANSCRIBE_SAFE_BYTES = max(
+    1_000_000,
+    int(TRANSCRIBE_MAX_UPLOAD_BYTES * (TRANSCRIBE_CHUNK_HEADROOM_PCT / 100)),
+)
 ALIGN_MAX_TRANSCRIPT_SEGMENTS = _env_int("ALIGN_MAX_TRANSCRIPT_SEGMENTS", 900, minimum=100)
 ALIGN_MAX_SEGMENT_CHARS = _env_int("ALIGN_MAX_SEGMENT_CHARS", 180, minimum=40)
 ALIGN_MAX_SLIDE_CHARS = _env_int("ALIGN_MAX_SLIDE_CHARS", 1200, minimum=120)
@@ -251,30 +255,14 @@ def _ffprobe_duration_seconds(path: Path) -> float:
     return duration
 
 
-def _render_chunk_progress(
-    emit: ProgressEmitter | None,
-    *,
-    chunk_index: int,
-    chunk_count: int,
-) -> None:
-    if chunk_count <= 0:
-        return
-    pct = 35 + int(((chunk_index - 1) / chunk_count) * 11)
-    _ = pct  # chunk-level progress suppressed from UI
-
-
 def _estimate_chunk_seconds(
     *,
     file_size_bytes: int,
     duration_seconds: float,
     force_split: bool,
 ) -> int:
-    safe_target_bytes = max(
-        1_000_000,
-        int(TRANSCRIBE_MAX_UPLOAD_BYTES * (TRANSCRIBE_CHUNK_HEADROOM_PCT / 100)),
-    )
     bytes_per_second = file_size_bytes / max(duration_seconds, 1.0)
-    estimated = int(safe_target_bytes / max(bytes_per_second, 1.0))
+    estimated = int(TRANSCRIBE_SAFE_BYTES / max(bytes_per_second, 1.0))
     estimated = max(TRANSCRIBE_MIN_CHUNK_SECONDS, estimated)
 
     if force_split and duration_seconds > TRANSCRIBE_MIN_CHUNK_SECONDS:
@@ -329,7 +317,6 @@ def _transcribe_mp3_in_chunks(
                 capture_output=True,
             )
 
-            _render_chunk_progress(emit, chunk_index=chunk_idx + 1, chunk_count=chunk_count)
             chunk_segments = _transcribe_mp3_file_with_retries(
                 groq_client,
                 chunk_path,
@@ -357,13 +344,9 @@ def _transcribe_mp3_with_auto_chunking(
     mp3_path: Path,
     emit: ProgressEmitter | None = None,
 ) -> list[dict]:
-    safe_single_request_bytes = max(
-        1_000_000,
-        int(TRANSCRIBE_MAX_UPLOAD_BYTES * (TRANSCRIBE_CHUNK_HEADROOM_PCT / 100)),
-    )
     file_size_bytes = mp3_path.stat().st_size
 
-    force_split = file_size_bytes > safe_single_request_bytes
+    force_split = file_size_bytes > TRANSCRIBE_SAFE_BYTES
     if not force_split:
         try:
             return _transcribe_mp3_file_with_retries(groq_client, mp3_path, emit=emit)
