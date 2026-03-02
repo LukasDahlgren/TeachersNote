@@ -6,14 +6,80 @@ import anthropic
 client = anthropic.Anthropic()
 
 
-def build_prompt(slides: list[dict], segments: list[dict]) -> str:
+def _collapse_whitespace(text: str) -> str:
+    return " ".join(str(text).split())
+
+
+def _truncate_text(text: str, *, max_chars: int) -> str:
+    compact = _collapse_whitespace(text)
+    if max_chars <= 0 or len(compact) <= max_chars:
+        return compact
+    if max_chars <= 3:
+        return compact[:max_chars]
+    return f"{compact[: max_chars - 3].rstrip()}..."
+
+
+def _sample_segment_indexes(total_segments: int, max_segments: int) -> list[int]:
+    if max_segments <= 0 or total_segments <= max_segments:
+        return list(range(total_segments))
+    if max_segments == 1:
+        return [0]
+
+    indexes = {0, total_segments - 1}
+    step = (total_segments - 1) / (max_segments - 1)
+    for i in range(1, max_segments - 1):
+        indexes.add(int(round(i * step)))
+    return sorted(indexes)
+
+
+def _prepare_segments_for_prompt(
+    segments: list[dict],
+    *,
+    max_segments: int | None,
+    max_segment_chars: int,
+) -> tuple[list[dict], bool]:
+    if not segments:
+        return [], False
+
+    indexes = (
+        _sample_segment_indexes(len(segments), max_segments)
+        if max_segments is not None
+        else list(range(len(segments)))
+    )
+    sampled = len(indexes) < len(segments)
+    prepared: list[dict] = []
+    for idx in indexes:
+        seg = segments[idx]
+        prepared.append({
+            "segment_index": idx,
+            "start": float(seg.get("start", 0.0)),
+            "text": _truncate_text(str(seg.get("text", "")), max_chars=max_segment_chars),
+        })
+    return prepared, sampled
+
+
+def build_prompt(
+    slides: list[dict],
+    segments: list[dict],
+    *,
+    max_segments: int | None = None,
+    max_segment_chars: int = 180,
+    max_slide_chars: int = 1200,
+) -> str:
     lines = ["SLIDES (presented in order during the lecture):"]
     for slide in slides:
-        lines.append(f"\nSlide {slide['slide']}:\n{slide['text']}")
+        text = _truncate_text(str(slide.get("text", "")), max_chars=max_slide_chars)
+        lines.append(f"\nSlide {slide['slide']}:\n{text}")
+
+    prompt_segments, sampled = _prepare_segments_for_prompt(
+        segments,
+        max_segments=max_segments,
+        max_segment_chars=max_segment_chars,
+    )
 
     lines.append("\n\nTRANSCRIPT (numbered segments with timestamps):")
-    for i, seg in enumerate(segments):
-        lines.append(f"[{i}] {seg['start']:.1f}s: {seg['text'].strip()}")
+    for seg in prompt_segments:
+        lines.append(f"[{seg['segment_index']}] {seg['start']:.1f}s: {seg['text']}")
 
     n = len(slides)
     lines.append(
@@ -27,6 +93,11 @@ def build_prompt(slides: list[dict], segments: list[dict]) -> str:
         "\n- every segment must belong to exactly one slide"
         f"\n- return all {n} slides"
     )
+    if sampled:
+        lines.append(
+            "\n- the transcript list is sampled for length; "
+            "start_segment values MUST use one of the listed segment indices"
+        )
     return "\n".join(lines)
 
 

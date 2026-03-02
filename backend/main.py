@@ -102,7 +102,7 @@ ACTIVE_UPLOAD_JOB_ID: str | None = None
 UPLOAD_JOB_LOCK = asyncio.Lock()
 DEFAULT_USER_ID = "local-dev-user"
 USER_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
-DEMO_LECTURE_NAME = "DB-lecture-12-2026"
+DEMO_LECTURE_NAME = "IB133N-lecture-14-2026"
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
@@ -219,6 +219,13 @@ def _normalize_courseid(raw: str) -> str:
 
 def _normalize_catalog_code(raw: str) -> str:
     return _normalize_courseid(raw)
+
+
+def _normalize_optional_catalog_code(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    normalized = _normalize_catalog_code(raw)
+    return normalized or None
 
 
 def _require_non_empty_name(raw: str, *, field_name: str) -> str:
@@ -425,7 +432,55 @@ def _lecture_has_visible_pptx(lecture: Lecture) -> bool:
     return pptx_path.exists() and pptx_path.is_file()
 
 
-def _teachers_note_payload(lecture: Lecture, *, is_saved: bool) -> dict[str, Any]:
+def _canonical_course_code(raw_course_id: str | None) -> str:
+    value = (raw_course_id or "").strip()
+    if not value:
+        return ""
+    return _normalize_catalog_code(value)
+
+
+async def _course_display_overrides_by_code(
+    db: AsyncSession,
+    course_ids: list[str | None],
+) -> dict[str, str]:
+    normalized_codes = sorted({
+        normalized
+        for course_id in course_ids
+        if (normalized := _canonical_course_code(course_id))
+    })
+    if not normalized_codes:
+        return {}
+
+    result = await db.execute(
+        select(Course.code, Course.display_code).where(Course.code.in_(normalized_codes))
+    )
+
+    overrides: dict[str, str] = {}
+    for course_code, display_code in result.all():
+        normalized_code = _canonical_course_code(str(course_code))
+        normalized_display = _normalize_optional_catalog_code(display_code)
+        if normalized_code and normalized_display:
+            overrides[normalized_code] = normalized_display
+    return overrides
+
+
+def _resolve_course_display(
+    raw_course_id: str | None,
+    display_overrides_by_code: dict[str, str],
+) -> str | None:
+    fallback = (raw_course_id or "").strip()
+    if not fallback:
+        return None
+    override = display_overrides_by_code.get(_canonical_course_code(fallback))
+    return override or fallback
+
+
+def _teachers_note_payload(
+    lecture: Lecture,
+    *,
+    is_saved: bool,
+    course_display: str | None,
+) -> dict[str, Any]:
     return {
         "id": lecture.id,
         "name": lecture.name,
@@ -434,6 +489,7 @@ def _teachers_note_payload(lecture: Lecture, *, is_saved: bool) -> dict[str, Any
         "is_deleted": bool(lecture.is_deleted),
         "is_approved": bool(lecture.is_approved),
         "course_id": lecture.course_id,
+        "course_display": course_display,
         "uploaded_by": lecture.uploaded_by,
         "is_saved": is_saved,
         "pptx_path": lecture.pptx_path,
@@ -457,6 +513,7 @@ def _course_payload(course: Course) -> dict[str, Any]:
     return {
         "id": course.id,
         "code": course.code,
+        "display_code": course.display_code,
         "name": course.name,
         "is_active": bool(course.is_active),
         "created_at": course.created_at.isoformat(),
@@ -1744,7 +1801,18 @@ async def list_lectures(
     result = await db.execute(select(Lecture).where(visibility_filter).order_by(Lecture.created_at.desc()))
     lectures = [lecture for lecture in result.scalars().all() if _lecture_has_visible_pptx(lecture)]
     saved_ids = await _saved_lecture_ids_for_user(db, user_id, [int(lecture.id) for lecture in lectures])
-    return [_teachers_note_payload(lecture, is_saved=lecture.id in saved_ids) for lecture in lectures]
+    display_overrides_by_code = await _course_display_overrides_by_code(
+        db,
+        [lecture.course_id for lecture in lectures],
+    )
+    return [
+        _teachers_note_payload(
+            lecture,
+            is_saved=lecture.id in saved_ids,
+            course_display=_resolve_course_display(lecture.course_id, display_overrides_by_code),
+        )
+        for lecture in lectures
+    ]
 
 
 @app.get("/lectures/my", dependencies=[Depends(_require_api_key)])
@@ -1768,7 +1836,18 @@ async def list_my_lectures(
         )
     result = await db.execute(query.order_by(LectureSave.created_at.desc(), Lecture.created_at.desc()))
     lectures = [lecture for lecture in result.scalars().all() if _lecture_has_visible_pptx(lecture)]
-    return [_teachers_note_payload(lecture, is_saved=True) for lecture in lectures]
+    display_overrides_by_code = await _course_display_overrides_by_code(
+        db,
+        [lecture.course_id for lecture in lectures],
+    )
+    return [
+        _teachers_note_payload(
+            lecture,
+            is_saved=True,
+            course_display=_resolve_course_display(lecture.course_id, display_overrides_by_code),
+        )
+        for lecture in lectures
+    ]
 
 
 @app.get("/lectures/deleted", dependencies=[Depends(_require_api_key)])
@@ -1782,7 +1861,18 @@ async def list_deleted_lectures(
     )
     lectures = result.scalars().all()
     saved_ids = await _saved_lecture_ids_for_user(db, user_id, [int(lecture.id) for lecture in lectures])
-    return [_teachers_note_payload(lecture, is_saved=lecture.id in saved_ids) for lecture in lectures]
+    display_overrides_by_code = await _course_display_overrides_by_code(
+        db,
+        [lecture.course_id for lecture in lectures],
+    )
+    return [
+        _teachers_note_payload(
+            lecture,
+            is_saved=lecture.id in saved_ids,
+            course_display=_resolve_course_display(lecture.course_id, display_overrides_by_code),
+        )
+        for lecture in lectures
+    ]
 
 
 @app.get("/lectures/{lecture_id}", dependencies=[Depends(_require_api_key)])
@@ -1798,11 +1888,13 @@ async def get_lecture(
         raise HTTPException(status_code=404, detail="Lecture file not found")
 
     data = await lecture_to_response(db, lecture_id)
+    display_overrides_by_code = await _course_display_overrides_by_code(db, [lecture.course_id])
     return {
         **data,
         "lecture_id": lecture.id,
         "name": lecture.name,
         "course_id": lecture.course_id,
+        "course_display": _resolve_course_display(lecture.course_id, display_overrides_by_code),
         "is_archived": bool(lecture.is_archived),
         "is_saved": await _is_lecture_saved_for_user(db, user_id, lecture_id),
         **_lecture_file_urls(lecture),
@@ -1820,7 +1912,12 @@ async def save_lecture(
     assert_user_can_view_lecture(user_id=user_id, lecture=lecture, is_admin=admin)
 
     await save_lecture_for_user(db, user_id=user_id, lecture_id=lecture_id)
-    return _teachers_note_payload(lecture, is_saved=True)
+    display_overrides_by_code = await _course_display_overrides_by_code(db, [lecture.course_id])
+    return _teachers_note_payload(
+        lecture,
+        is_saved=True,
+        course_display=_resolve_course_display(lecture.course_id, display_overrides_by_code),
+    )
 
 
 @app.delete("/lectures/{lecture_id}/save", dependencies=[Depends(_require_api_key)])
@@ -1834,7 +1931,12 @@ async def unsave_lecture(
     assert_user_can_view_lecture(user_id=user_id, lecture=lecture, is_admin=admin)
 
     await unsave_lecture_for_user(db, user_id=user_id, lecture_id=lecture_id)
-    return _teachers_note_payload(lecture, is_saved=False)
+    display_overrides_by_code = await _course_display_overrides_by_code(db, [lecture.course_id])
+    return _teachers_note_payload(
+        lecture,
+        is_saved=False,
+        course_display=_resolve_course_display(lecture.course_id, display_overrides_by_code),
+    )
 
 
 @app.post("/lectures/{lecture_id}/archive", dependencies=[Depends(_require_api_key)])
@@ -1893,12 +1995,14 @@ class ProgramUpdateRequest(BaseModel):
 
 class CourseCreateRequest(BaseModel):
     code: str
+    display_code: str | None = None
     name: str
     is_active: bool = True
 
 
 class CourseUpdateRequest(BaseModel):
     code: str | None = None
+    display_code: str | None = None
     name: str | None = None
     is_active: bool | None = None
 
@@ -1978,24 +2082,34 @@ async def get_profile_course_options(
     db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_id),
 ):
+    admin = await _is_admin(user_id, db)
     profile_result = await db.execute(select(StudentProfile).where(StudentProfile.user_id == user_id))
     profile = profile_result.scalar_one_or_none()
 
-    all_courses_result = await db.execute(
-        select(Course).where(Course.is_active == True).order_by(Course.code.asc())
-    )
+    all_courses_query = select(Course).order_by(Course.code.asc())
+    if not admin:
+        all_courses_query = all_courses_query.where(Course.is_active == True)
+    all_courses_result = await db.execute(all_courses_query)
     all_courses = all_courses_result.scalars().all()
-    programs_result = await db.execute(
-        select(Program).where(Program.is_active == True).order_by(Program.code.asc())
-    )
+
+    programs_query = select(Program).order_by(Program.code.asc())
+    if not admin:
+        programs_query = programs_query.where(Program.is_active == True)
+    programs_result = await db.execute(programs_query)
     programs = programs_result.scalars().all()
-    grouped_courses_result = await db.execute(
+
+    grouped_courses_query = (
         select(Program, Course)
         .join(ProgramCourse, ProgramCourse.program_id == Program.id)
         .join(Course, ProgramCourse.course_id == Course.id)
-        .where(Program.is_active == True, Course.is_active == True)
         .order_by(Program.code.asc(), Course.code.asc())
     )
+    if not admin:
+        grouped_courses_query = grouped_courses_query.where(
+            Program.is_active == True,
+            Course.is_active == True,
+        )
+    grouped_courses_result = await db.execute(grouped_courses_query)
     grouped_courses_rows = grouped_courses_result.all()
     grouped_courses_by_program: dict[int, list[Course]] = {}
     for mapped_program, mapped_course in grouped_courses_rows:
@@ -2004,8 +2118,6 @@ async def get_profile_course_options(
     program_course_groups: list[dict[str, Any]] = []
     for item in programs:
         grouped_courses = grouped_courses_by_program.get(int(item.id), [])
-        if not grouped_courses:
-            continue
         program_course_groups.append(
             {
                 "program": _program_payload(item),
@@ -2019,12 +2131,15 @@ async def get_profile_course_options(
         program_result = await db.execute(select(Program).where(Program.id == profile.program_id))
         program = program_result.scalar_one_or_none()
         if program:
-            program_courses_result = await db.execute(
+            program_courses_query = (
                 select(Course)
                 .join(ProgramCourse, ProgramCourse.course_id == Course.id)
-                .where(ProgramCourse.program_id == program.id, Course.is_active == True)
+                .where(ProgramCourse.program_id == program.id)
                 .order_by(Course.code.asc())
             )
+            if not admin:
+                program_courses_query = program_courses_query.where(Course.is_active == True)
+            program_courses_result = await db.execute(program_courses_query)
             program_courses = program_courses_result.scalars().all()
 
     return {
@@ -2121,9 +2236,10 @@ async def create_course(
     code = _normalize_catalog_code(body.code)
     if not code:
         raise HTTPException(status_code=400, detail="Invalid code: use A-Z, 0-9, or '-'.")
+    display_code = _normalize_optional_catalog_code(body.display_code)
     name = _require_non_empty_name(body.name, field_name="name")
 
-    course = Course(code=code, name=name, is_active=bool(body.is_active))
+    course = Course(code=code, display_code=display_code, name=name, is_active=bool(body.is_active))
     db.add(course)
     try:
         await db.commit()
@@ -2144,7 +2260,7 @@ async def update_course(
     await _require_admin_user_or_403(user_id=user_id, db=db)
     course = await _get_course_or_404(db, course_id)
 
-    if body.code is None and body.name is None and body.is_active is None:
+    if body.code is None and body.display_code is None and body.name is None and body.is_active is None:
         raise HTTPException(status_code=400, detail="Provide at least one field to update.")
 
     if body.code is not None:
@@ -2152,6 +2268,8 @@ async def update_course(
         if not code:
             raise HTTPException(status_code=400, detail="Invalid code: use A-Z, 0-9, or '-'.")
         course.code = code
+    if body.display_code is not None:
+        course.display_code = _normalize_optional_catalog_code(body.display_code)
     if body.name is not None:
         course.name = _require_non_empty_name(body.name, field_name="name")
     if body.is_active is not None:
@@ -2313,7 +2431,18 @@ async def list_pending_lectures(
         .order_by(Lecture.created_at.desc())
     )
     lectures = result.scalars().all()
-    return [_teachers_note_payload(lecture, is_saved=False) for lecture in lectures]
+    display_overrides_by_code = await _course_display_overrides_by_code(
+        db,
+        [lecture.course_id for lecture in lectures],
+    )
+    return [
+        _teachers_note_payload(
+            lecture,
+            is_saved=False,
+            course_display=_resolve_course_display(lecture.course_id, display_overrides_by_code),
+        )
+        for lecture in lectures
+    ]
 
 
 @app.post("/lectures/{lecture_id}/approve", dependencies=[Depends(_require_api_key)])
@@ -2327,7 +2456,12 @@ async def approve_lecture(
     lecture = await get_lecture_or_404(db, lecture_id)
     lecture.is_approved = True
     await db.commit()
-    return _teachers_note_payload(lecture, is_saved=False)
+    display_overrides_by_code = await _course_display_overrides_by_code(db, [lecture.course_id])
+    return _teachers_note_payload(
+        lecture,
+        is_saved=False,
+        course_display=_resolve_course_display(lecture.course_id, display_overrides_by_code),
+    )
 
 
 @app.post("/lectures/{lecture_id}/reject", dependencies=[Depends(_require_api_key)])

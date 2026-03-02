@@ -7,12 +7,18 @@ import {
   type UploadRecordingInput,
 } from "../types";
 
+interface ConsoleEntry {
+  id: number;
+  message: string;
+  done?: boolean;
+}
+
 interface Props {
   onSubmit: (pdf: File, recording: UploadRecordingInput, naming: UploadLectureNamingInput) => void;
   loading: boolean;
   onRunDemo: () => void;
   progressPct?: number | null;
-  progressLabel?: string;
+  consoleEntries?: ConsoleEntry[];
 }
 
 function formatBytes(bytes: number): string {
@@ -67,6 +73,10 @@ interface ProgramCourseGroupOption {
 
 function normalizeCourseCode(value: string): string {
   return value.trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function studentCourseCode(course: Course): string {
+  return course.display_code?.trim() || course.code;
 }
 
 function dedupeCoursesByCode(courses: Course[]): Course[] {
@@ -147,7 +157,8 @@ function DropZone({
   );
 }
 
-export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, progressLabel }: Props) {
+export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, consoleEntries }: Props) {
+  const consoleEndRef = useRef<HTMLDivElement>(null);
   const [pdfFile, setPdfFile] = useState<File | null>(null);
   const [audioFile, setAudioFile] = useState<File | null>(null);
   const [recordingSource, setRecordingSource] = useState<"file" | "url">("file");
@@ -169,6 +180,10 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
   const pdfInputRef = useRef<HTMLInputElement>(null);
   const audioInputRef = useRef<HTMLInputElement>(null);
   const effectiveRecordingSource: "file" | "url" = URL_RECORDING_ENABLED ? recordingSource : "file";
+
+  useEffect(() => {
+    consoleEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [consoleEntries]);
 
   useEffect(() => {
     let cancelled = false;
@@ -208,7 +223,6 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
         for (const course of courses) {
           groupedCodes.add(normalizeCourseCode(course.code));
         }
-        if (courses.length === 0) continue;
         grouped.push({
           programId: group.program.id,
           programLabel: `${group.program.name} (${group.program.code})`,
@@ -386,7 +400,7 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
   }
 
   return (
-    <form className="upload-form" onSubmit={handleSubmit}>
+    <form className={`upload-form${loading ? " upload-form--loading" : ""}`} onSubmit={handleSubmit}>
       <h1 className="form-title">TeachersNote</h1>
       <p className="form-subtitle">
         Upload lecture slides (PDF) and add a recording file or direct URL to generate an aligned transcript.
@@ -437,7 +451,7 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
             >
               <span className={`course-picker-trigger-text${selectedCourse ? "" : " course-picker-trigger-text--placeholder"}`}>
                 {selectedCourse
-                  ? `${selectedCourse.course.name} (${selectedCourse.course.code})`
+                  ? `${selectedCourse.course.name} (${studentCourseCode(selectedCourse.course)})`
                   : (courseOptionsLoading ? "Loading courses..." : "Select a course")}
               </span>
               <span className="course-picker-trigger-chevron">▾</span>
@@ -461,6 +475,9 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
 
                       {isExpanded && (
                         <div className="course-picker-course-list">
+                          {group.courses.length === 0 && (
+                            <p className="course-picker-empty">No courses mapped in this program.</p>
+                          )}
                           {group.courses.map((course) => (
                             <button
                               key={`${group.programId}-${course.id}`}
@@ -469,7 +486,7 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
                               onClick={() => handleSelectCourse(course.code)}
                             >
                               <span className="course-picker-course-name">{course.name}</span>
-                              <span className="course-picker-course-code">{course.code}</span>
+                              <span className="course-picker-course-code">{studentCourseCode(course)}</span>
                             </button>
                           ))}
                         </div>
@@ -659,9 +676,19 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
               style={{ width: `${progressPct ?? 0}%` }}
             />
           </div>
-          {progressLabel && (
-            <span className="upload-progress-label">{progressLabel}</span>
-          )}
+          <div className="upload-console">
+            {(consoleEntries ?? []).length === 0 ? (
+              <span className="upload-console-line upload-console-line--dim">Waiting...</span>
+            ) : (
+              (consoleEntries ?? []).map((entry) => (
+                <span key={entry.id} className={`upload-console-line${entry.done ? " upload-console-line--done" : ""}`}>
+                  <span className="upload-console-text">{entry.message}</span>
+                  {entry.done && <span className="upload-console-check">✓</span>}
+                </span>
+              ))
+            )}
+            <div ref={consoleEndRef} />
+          </div>
         </div>
       )}
     </form>

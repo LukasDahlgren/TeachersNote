@@ -32,6 +32,37 @@ function formatDate(iso: string): string {
   });
 }
 
+function normalizeCourseToken(value: string | null | undefined): string {
+  return (value ?? "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function formatLectureDisplayName(lecture: TeachersNoteSummary): string {
+  const rawName = lecture.name ?? "";
+  const name = rawName.trim();
+  if (!name) return rawName;
+
+  const courseId = (lecture.course_id ?? "").trim();
+  const courseDisplay = (lecture.course_display ?? "").trim();
+  if (!courseId || !courseDisplay) return rawName;
+  if (normalizeCourseToken(courseId) === normalizeCourseToken(courseDisplay)) return rawName;
+
+  const prefixPattern = new RegExp(`^${escapeRegex(courseId)}(?=($|[-_\\s]))`, "i");
+  if (prefixPattern.test(name)) {
+    return name.replace(prefixPattern, courseDisplay);
+  }
+
+  const firstToken = name.split(/[-_\s]+/, 1)[0] ?? "";
+  if (normalizeCourseToken(firstToken) === normalizeCourseToken(courseId)) {
+    return `${courseDisplay}${name.slice(firstToken.length)}`;
+  }
+
+  return rawName;
+}
+
 export default function Sidebar({
   savedLectures,
   archivedLectures,
@@ -66,6 +97,7 @@ export default function Sidebar({
 
   function renderLectureCard(lecture: TeachersNoteSummary) {
     const isPendingOwn = lecture.is_approved === false && lecture.uploaded_by === currentUserId;
+    const lectureDisplayName = formatLectureDisplayName(lecture);
     return (
       <button
         key={lecture.id}
@@ -74,7 +106,7 @@ export default function Sidebar({
       >
         <span className="lecture-card-icon">📄</span>
         <span className="lecture-card-body">
-          <span className="lecture-card-name">{lecture.name}</span>
+          <span className="lecture-card-name">{lectureDisplayName}</span>
           <span className="lecture-card-date">{formatDate(lecture.created_at)}</span>
           {isPendingOwn && (
             <span className="lecture-card-pending-badge">⏳ Pending approval</span>
@@ -161,7 +193,7 @@ export default function Sidebar({
                 <div key={lecture.id} className="lecture-card lecture-card--deleted">
                   <span className="lecture-card-icon">🗑</span>
                   <span className="lecture-card-body">
-                    <span className="lecture-card-name">{lecture.name}</span>
+                    <span className="lecture-card-name">{formatLectureDisplayName(lecture)}</span>
                     <span className="lecture-card-date">{formatDate(lecture.created_at)}</span>
                   </span>
                   <button

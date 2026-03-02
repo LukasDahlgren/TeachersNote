@@ -121,6 +121,7 @@ class Course(Base):
 
     id         = Column(Integer, primary_key=True, autoincrement=True)
     code       = Column(String(64), nullable=False, unique=True, index=True)
+    display_code = Column(String(64), nullable=True)
     name       = Column(String(255), nullable=False)
     is_active  = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)

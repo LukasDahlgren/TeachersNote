@@ -541,6 +541,25 @@ def enrich_slide(
     return normalized, usage
 
 
+_HEARTBEAT_INTERVAL = 10  # seconds between progress pings during a long sleep
+
+
+def _sleep_with_heartbeat(
+    total_seconds: int,
+    *,
+    slide_num: Any,
+    log_callback: Callable[[str], None] | None,
+) -> None:
+    """Sleep for total_seconds, emitting a countdown log every _HEARTBEAT_INTERVAL seconds."""
+    remaining = total_seconds
+    while remaining > 0:
+        chunk = min(_HEARTBEAT_INTERVAL, remaining)
+        time.sleep(chunk)
+        remaining -= chunk
+        if remaining > 0 and log_callback:
+            log_callback(f"⏳ Slide {slide_num}: rate-limited, ~{remaining}s remaining...")
+
+
 def enrich_slide_with_retry(
     client: Any,
     slide: dict,
@@ -651,12 +670,12 @@ def enrich_slide_with_retry(
             last_error = exc
             failure_reason = "connection_error" if _is_connection_error(exc) else "other_error"
             if _is_rate_limit_error(exc):
-                wait = 60 * (attempt + 1)
+                wait = min(30 * (attempt + 1), 120)
                 msg = f"⏳ Rate limited on slide {slide_num}, waiting {wait}s..."
                 print(f"  {msg}", flush=True)
                 if log_callback:
                     log_callback(msg)
-                time.sleep(wait)
+                _sleep_with_heartbeat(wait, slide_num=slide_num, log_callback=log_callback)
             else:
                 if attempt < max_attempts - 1:
                     wait = min(8, attempt + 1)

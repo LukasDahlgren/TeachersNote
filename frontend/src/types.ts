@@ -53,6 +53,7 @@ export interface TeachersNoteSummary {
   is_deleted?: boolean;
   is_approved?: boolean;
   course_id: string | null;
+  course_display: string | null;
   uploaded_by?: string | null;
   is_saved: boolean;
   pptx_path: string | null;
@@ -64,6 +65,7 @@ export interface LectureDetail extends ProcessResult {
   lecture_id: number;
   name: string;
   course_id: string | null;
+  course_display: string | null;
   is_archived: boolean;
   is_saved: boolean;
 }
@@ -80,6 +82,7 @@ export interface Program {
 export interface Course {
   id: number;
   code: string;
+  display_code: string | null;
   name: string;
   is_active: boolean;
   created_at: string;

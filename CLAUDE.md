@@ -23,7 +23,7 @@ npm run build                 # tsc -b && vite build → dist/
 npm run lint                  # ESLint check
 ```
 
-No automated test suite. Manual testing includes `GET /demo` against stored lecture `DB-lecture-12-2026`.
+No automated test suite. Manual testing includes `GET /demo` against stored lecture `IB133N-lecture-14-2026`.
 
 ## Architecture
 
@@ -80,6 +80,12 @@ ENRICH_MAX_ATTEMPTS                                 # Optional; default 4
 ENRICH_LOG_USAGE                                    # Optional; default true
 ENRICH_PROVIDER                                     # Optional; anthropic|groq (default anthropic)
 ENRICH_MODEL                                        # Optional model override (Anthropic default: claude-haiku-4-5)
+TRANSCRIBE_MAX_UPLOAD_BYTES                         # Optional; max bytes per transcription request before chunking (default 24000000)
+TRANSCRIBE_CHUNK_HEADROOM_PCT                       # Optional; chunk size safety margin percent (default 90)
+TRANSCRIBE_MIN_CHUNK_SECONDS                        # Optional; minimum chunk length in seconds (default 300)
+ALIGN_MAX_TRANSCRIPT_SEGMENTS                       # Optional; max transcript rows included in one alignment prompt (default 900)
+ALIGN_MAX_SEGMENT_CHARS                             # Optional; max chars per transcript row in alignment prompt (default 180)
+ALIGN_MAX_SLIDE_CHARS                               # Optional; max chars per slide text in alignment prompt (default 1200)
 DISABLE_EXTERNAL_AI                                 # Optional; if true, enrichment uses deterministic fallback only (no API calls)
 REMOTE_MEDIA_ALLOWED_EXTENSIONS                     # Optional; comma-separated (default: .mp4,.mov,.webm,.wav,.m4a,.mp3)
 REMOTE_MEDIA_MAX_BYTES                              # Optional; default 524288000 (500 MB)

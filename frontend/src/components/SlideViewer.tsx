@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState, useEffect } from "react";
 import { Document, Page } from "react-pdf";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
@@ -17,7 +17,22 @@ interface Props {
 
 export default function SlideViewer({ slideText, slideNumber, total, onPrev, onNext, pdfUrl }: Props) {
   const [pdfErrorByUrl, setPdfErrorByUrl] = useState<{ url: string; message: string } | null>(null);
+  const [pdfWidth, setPdfWidth] = useState(600);
+  const containerRef = useRef<HTMLDivElement>(null);
   const pdfError = pdfUrl && pdfErrorByUrl?.url === pdfUrl ? pdfErrorByUrl.message : "";
+
+  useEffect(() => {
+    const updateWidth = () => {
+      if (containerRef.current) {
+        const width = containerRef.current.offsetWidth - 32; // account for padding
+        setPdfWidth(Math.max(width, 300));
+      }
+    };
+
+    updateWidth();
+    window.addEventListener("resize", updateWidth);
+    return () => window.removeEventListener("resize", updateWidth);
+  }, []);
 
   return (
     <div className="slide-viewer">
@@ -27,7 +42,7 @@ export default function SlideViewer({ slideText, slideNumber, total, onPrev, onN
         <button onClick={onNext} disabled={slideNumber === total}>&#8594;</button>
       </div>
       {pdfUrl && !pdfError ? (
-        <div className="slide-pdf">
+        <div className="slide-pdf" ref={containerRef}>
           <Document
             file={pdfUrl}
             loading={<div className="slide-pdf-loading">Loading PDF…</div>}
@@ -41,7 +56,7 @@ export default function SlideViewer({ slideText, slideNumber, total, onPrev, onN
               });
             }}
           >
-            <Page pageNumber={slideNumber} width={600} />
+            <Page pageNumber={slideNumber} width={pdfWidth} />
           </Document>
         </div>
       ) : pdfUrl && pdfError ? (

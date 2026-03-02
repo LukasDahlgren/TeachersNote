@@ -429,6 +429,7 @@ export async function getCourses(): Promise<Course[]> {
 
 export async function createCourse(payload: {
   code: string;
+  display_code?: string | null;
   name: string;
   is_active?: boolean;
 }): Promise<Course> {
@@ -443,7 +444,7 @@ export async function createCourse(payload: {
 
 export async function updateCourse(
   id: number,
-  payload: Partial<{ code: string; name: string; is_active: boolean }>,
+  payload: Partial<{ code: string; display_code: string | null; name: string; is_active: boolean }>,
 ): Promise<Course> {
   const res = await apiFetch(`/admin/courses/${id}`, {
     method: "PATCH",

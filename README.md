@@ -48,6 +48,13 @@ ENRICH_MAX_OUTPUT_TOKENS=900
 ENRICH_MAX_ATTEMPTS=4
 ENRICH_LOG_USAGE=true
 # Code defaults if unset: ENRICH_MAX_TRANSCRIPT_WORDS=700, ENRICH_MAX_OUTPUT_TOKENS=320
+# Optional transcription/alignment payload controls for long lectures
+TRANSCRIBE_MAX_UPLOAD_BYTES=24000000
+TRANSCRIBE_CHUNK_HEADROOM_PCT=90
+TRANSCRIBE_MIN_CHUNK_SECONDS=300
+ALIGN_MAX_TRANSCRIPT_SEGMENTS=900
+ALIGN_MAX_SEGMENT_CHARS=180
+ALIGN_MAX_SLIDE_CHARS=1200
 # Optional provider/model override (default provider is anthropic)
 # ENRICH_PROVIDER=anthropic
 # ENRICH_MODEL=claude-haiku-4-5
@@ -207,7 +214,7 @@ Health check.
 
 ### `GET /demo`
 
-Returns processed data for the stored demo lecture named `DB-lecture-12-2026`.
+Returns processed data for the stored demo lecture named `IB133N-lecture-14-2026`.
 The endpoint returns the newest lecture with that exact name and a visible PPTX asset.
 If no matching lecture exists, the endpoint returns `404`.
 
@@ -232,7 +239,7 @@ Lecture names and generated assets follow:
 `<COURSEID>-<kind>-<lecture>-<year>`
 
 Examples:
-- default kind: `DB-lecture-12-2026`
+- default kind: `IB133N-lecture-14-2026`
 - custom kind: `DB-presentation-12-2026`
 
 If a generated filename already exists (PPTX in `backend/generated/` or source PDF in `backend/source_pdfs/`), suffixes `-2`, `-3`, ... are appended.
@@ -269,8 +276,8 @@ Validation behavior:
       "key_takeaways": ["...", "..."]
     }
   ],
-  "download_url": "/download/DB-lecture-12-2026.pptx",
-  "pdf_url": "/pdf/DB-lecture-12-2026.pdf"
+  "download_url": "/download/IB133N-lecture-14-2026.pptx",
+  "pdf_url": "/pdf/IB133N-lecture-14-2026.pdf"
 }
 ```
 
@@ -332,11 +339,11 @@ Visibility:
 [
   {
     "id": 42,
-    "name": "DB-lecture-12-2026",
+    "name": "IB133N-lecture-14-2026",
     "is_demo": false,
     "course_id": "DB",
     "is_saved": true,
-    "pptx_path": "generated/DB-lecture-12-2026.pptx",
+    "pptx_path": "generated/IB133N-lecture-14-2026.pptx",
     "created_at": "2024-01-15T10:30:00"
   }
 ]
@@ -551,7 +558,7 @@ frontend/src/
 - `aligned.json`
 - `enhanced.json`
 
-The `Show demo` action uses a stored lecture named `DB-lecture-12-2026`, backed by `backend/generated/DB-lecture-12-2026.pptx`.
+The `Show demo` action uses a stored lecture named `IB133N-lecture-14-2026`, backed by `backend/generated/IB133N-lecture-14-2026.pptx`.
 
 ---
 

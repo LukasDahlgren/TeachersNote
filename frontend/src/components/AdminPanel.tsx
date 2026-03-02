@@ -4,6 +4,7 @@ import {
   createCourse,
   createProgram,
   getCourses,
+  getLectures,
   getPendingLectures,
   getProgramCourses,
   getProgramPlan,
@@ -11,15 +12,20 @@ import {
   mapProgramCourse,
   rejectLecture,
   runCatalogSync,
+  startRegenerateNotesJob,
   unmapProgramCourse,
   updateCourse,
   updateProgram,
 } from "../api";
+import LectureReviewModal from "./LectureReviewModal";
+import ProgramPicker from "./ProgramPicker";
+import RegenerateNotesModal from "./RegenerateNotesModal";
 import type {
   CatalogSyncResult,
   Course,
   Program,
   ProgramPlanRow,
+  RegenerateNotesJobStatus,
   TeachersNoteSummary,
 } from "../types";
 
@@ -27,7 +33,7 @@ interface AdminPanelProps {
   onBack: () => void;
 }
 
-type AdminTab = "pending" | "programs" | "courses" | "mappings" | "catalog";
+type AdminTab = "pending" | "programs" | "courses" | "mappings" | "catalog" | "lectures";
 
 function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString(undefined, {
@@ -57,6 +63,10 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
   const [pending, setPending] = useState<TeachersNoteSummary[]>([]);
   const [programs, setPrograms] = useState<Program[]>([]);
   const [courses, setCourses] = useState<Course[]>([]);
+  const [approvedLectures, setApprovedLectures] = useState<TeachersNoteSummary[]>([]);
+
+  const [reviewLecture, setReviewLecture] = useState<TeachersNoteSummary | null>(null);
+  const [regenerateJobStatus, setRegenerateJobStatus] = useState<RegenerateNotesJobStatus | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -65,6 +75,7 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
   const [newProgramCode, setNewProgramCode] = useState("");
   const [newProgramName, setNewProgramName] = useState("");
   const [newCourseCode, setNewCourseCode] = useState("");
+  const [newCourseDisplayCode, setNewCourseDisplayCode] = useState("");
   const [newCourseName, setNewCourseName] = useState("");
 
   const [selectedProgramId, setSelectedProgramId] = useState<number | null>(null);
@@ -82,14 +93,16 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
     setLoading(true);
     setError(null);
     try {
-      const [pendingData, programData, courseData] = await Promise.all([
+      const [pendingData, programData, courseData, lecturesData] = await Promise.all([
         getPendingLectures(),
         getPrograms(),
         getCourses(),
+        getLectures(),
       ]);
       setPending(pendingData);
       setPrograms(programData);
       setCourses(courseData);
+      setApprovedLectures(lecturesData.filter(l => !l.is_deleted && !l.is_archived));
       if (!selectedProgramId && programData.length > 0) {
         setSelectedProgramId(programData[0].id);
       } else if (
@@ -198,13 +211,20 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
 
   async function handleCreateCourse() {
     const code = newCourseCode.trim();
+    const displayCode = newCourseDisplayCode.trim();
     const name = newCourseName.trim();
     if (!code || !name) return;
     setActionInFlight("create-course");
     setError(null);
     try {
-      await createCourse({ code, name, is_active: true });
+      await createCourse({
+        code,
+        display_code: displayCode || null,
+        name,
+        is_active: true,
+      });
       setNewCourseCode("");
+      setNewCourseDisplayCode("");
       setNewCourseName("");
       await load();
     } catch (err) {
@@ -277,7 +297,7 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
   }
 
   async function handleCourseCode(course: Course) {
-    const nextCode = window.prompt("Course code", course.code)?.trim();
+    const nextCode = window.prompt("CourseID", course.code)?.trim();
     if (!nextCode || nextCode === course.code) return;
     const key = `course-code-${course.id}`;
     setActionInFlight(key);
@@ -286,7 +306,30 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
       await updateCourse(course.id, { code: nextCode });
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to update course code.");
+      setError(err instanceof Error ? err.message : "Failed to update CourseID.");
+    } finally {
+      setActionInFlight(null);
+    }
+  }
+
+  async function handleCourseDisplayCode(course: Course) {
+    const nextDisplayCode = window.prompt(
+      "Course display code (leave blank to clear)",
+      course.display_code ?? "",
+    );
+    if (nextDisplayCode === null) return;
+
+    const normalized = nextDisplayCode.trim();
+    if (normalized === (course.display_code ?? "")) return;
+
+    const key = `course-display-code-${course.id}`;
+    setActionInFlight(key);
+    setError(null);
+    try {
+      await updateCourse(course.id, { display_code: normalized || null });
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to update course display code.");
     } finally {
       setActionInFlight(null);
     }
@@ -353,6 +396,19 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
     }
   }
 
+  async function handleRegenerateNotes(lectureId: number) {
+    const key = `regen-${lectureId}`;
+    setActionInFlight(key);
+    setError(null);
+    try {
+      const job = await startRegenerateNotesJob(lectureId);
+      setRegenerateJobStatus(job);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to start regeneration job.");
+      setActionInFlight(null);
+    }
+  }
+
   const selectedProgram = useMemo(
     () => programs.find((program) => program.id === selectedProgramId) ?? null,
     [programs, selectedProgramId],
@@ -400,6 +456,7 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
   }, [programPlanRows]);
 
   return (
+    <>
     <div className="admin-panel">
       <div className="admin-panel-header">
         <button className="admin-panel-back-btn" onClick={onBack}>← Back</button>
@@ -409,6 +466,7 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
       <div className="admin-panel-tabs" role="tablist" aria-label="Admin sections">
         {[
           { key: "pending", label: `Pending (${pending.length})` },
+          { key: "lectures", label: `Lectures (${approvedLectures.length})` },
           { key: "programs", label: `Programs (${programs.length})` },
           { key: "courses", label: `Courses (${courses.length})` },
           { key: "mappings", label: "Program-course mappings" },
@@ -454,6 +512,12 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
                     <td className="admin-panel-cell--muted">{formatDate(lecture.created_at)}</td>
                     <td className="admin-panel-actions">
                       <button
+                        className="admin-panel-review-btn"
+                        onClick={() => setReviewLecture(lecture)}
+                      >
+                        Review
+                      </button>
+                      <button
                         className="admin-panel-approve-btn"
                         disabled={actionInFlight === `pending-approve-${lecture.id}`}
                         onClick={() => void handleApprove(lecture.id)}
@@ -466,6 +530,45 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
                         onClick={() => void handleReject(lecture.id)}
                       >
                         Reject
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </section>
+      )}
+
+      {!loading && activeTab === "lectures" && (
+        <section className="admin-panel-section">
+          <h2 className="admin-panel-section-title">Approved Lectures</h2>
+          {approvedLectures.length === 0 && (
+            <p className="admin-panel-empty">No approved lectures.</p>
+          )}
+          {approvedLectures.length > 0 && (
+            <table className="admin-panel-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Course</th>
+                  <th>Date</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {approvedLectures.map((lecture) => (
+                  <tr key={lecture.id}>
+                    <td>{lecture.name}</td>
+                    <td className="admin-panel-cell--muted">{lecture.course_display || lecture.course_id}</td>
+                    <td className="admin-panel-cell--muted">{formatDate(lecture.created_at)}</td>
+                    <td className="admin-panel-actions">
+                      <button
+                        className="admin-panel-secondary-btn"
+                        disabled={actionInFlight === `regen-${lecture.id}`}
+                        onClick={() => void handleRegenerateNotes(lecture.id)}
+                      >
+                        {actionInFlight === `regen-${lecture.id}` ? "Starting..." : "Regenerate notes"}
                       </button>
                     </td>
                   </tr>
@@ -535,9 +638,15 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
           <div className="admin-panel-create-row">
             <input
               className="admin-panel-input"
-              placeholder="Code (e.g. OOS)"
+              placeholder="CourseID (e.g. IB132N)"
               value={newCourseCode}
               onChange={(event) => setNewCourseCode(event.target.value)}
+            />
+            <input
+              className="admin-panel-input"
+              placeholder="Display code (optional)"
+              value={newCourseDisplayCode}
+              onChange={(event) => setNewCourseDisplayCode(event.target.value)}
             />
             <input
               className="admin-panel-input"
@@ -556,7 +665,8 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
           <table className="admin-panel-table">
             <thead>
               <tr>
-                <th>Code</th>
+                <th>CourseID</th>
+                <th>Display</th>
                 <th>Name</th>
                 <th>Status</th>
                 <th>Actions</th>
@@ -566,10 +676,12 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
               {courses.map((course) => (
                 <tr key={course.id}>
                   <td>{course.code}</td>
+                  <td>{course.display_code || "—"}</td>
                   <td>{course.name}</td>
                   <td className="admin-panel-cell--muted">{course.is_active ? "Active" : "Inactive"}</td>
                   <td className="admin-panel-actions">
-                    <button className="admin-panel-secondary-btn" onClick={() => void handleCourseCode(course)}>Edit code</button>
+                    <button className="admin-panel-secondary-btn" onClick={() => void handleCourseCode(course)}>Edit CourseID</button>
+                    <button className="admin-panel-secondary-btn" onClick={() => void handleCourseDisplayCode(course)}>Edit display</button>
                     <button className="admin-panel-secondary-btn" onClick={() => void handleCourseRename(course)}>Rename</button>
                     <button className="admin-panel-secondary-btn" onClick={() => void handleToggleCourse(course)}>
                       {course.is_active ? "Deactivate" : "Activate"}
@@ -587,20 +699,15 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
           <h2 className="admin-panel-section-title">Program-course mappings</h2>
           <div className="admin-panel-mapping-toolbar">
             <label htmlFor="mapping-program-select">Program</label>
-            <select
+            <ProgramPicker
               id="mapping-program-select"
-              value={selectedProgramId ?? ""}
-              onChange={(event) => {
-                const value = event.target.value;
-                setSelectedProgramId(value ? Number(value) : null);
-              }}
-            >
-              {programs.map((program) => (
-                <option key={program.id} value={program.id}>
-                  {program.code} - {program.name}
-                </option>
-              ))}
-            </select>
+              value={selectedProgramId}
+              programs={programs}
+              onChange={setSelectedProgramId}
+              disabled={programs.length === 0 || loadingMappings}
+              placeholder="Select a program"
+              className="program-picker--admin"
+            />
           </div>
 
           {!selectedProgram && (
@@ -733,5 +840,30 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
         </section>
       )}
     </div>
+      {reviewLecture && (
+        <LectureReviewModal
+          lecture={reviewLecture}
+          onApproved={(id) => {
+            setPending((prev) => prev.filter((l) => l.id !== id));
+            setReviewLecture(null);
+          }}
+          onRejected={(id) => {
+            setPending((prev) => prev.filter((l) => l.id !== id));
+            setReviewLecture(null);
+          }}
+          onClose={() => setReviewLecture(null)}
+        />
+      )}
+      {regenerateJobStatus && (
+        <RegenerateNotesModal
+          lectureTitle={approvedLectures.find(l => l.id === regenerateJobStatus.lecture_id)?.name ?? "Unknown"}
+          jobStatus={regenerateJobStatus}
+          onClose={() => {
+            setRegenerateJobStatus(null);
+            setActionInFlight(null);
+          }}
+        />
+      )}
+    </>
   );
 }

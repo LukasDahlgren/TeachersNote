@@ -5,6 +5,7 @@ import {
   getProfileCourseOptions,
   updateProfileProgram,
 } from "../api";
+import ProgramPicker from "./ProgramPicker";
 import type {
   TeachersNoteSummary,
   ProfileCourseOptions,
@@ -25,13 +26,20 @@ interface HomepageProps {
 interface LectureNameParts {
   courseId: string;
   lectureLabel: string;
+  displayName: string;
+  kind: string;
+  number: string;
 }
 
 interface HomepageLectureItem {
   lecture: TeachersNoteSummary;
   courseId: string;
+  courseDisplay: string;
   courseCodeNormalized: string;
   lectureLabel: string;
+  displayName: string;
+  kind: string;
+  number: string;
   createdAtMs: number;
 }
 
@@ -42,7 +50,13 @@ function stripExtension(value: string): string {
 function splitLectureName(name: string): LectureNameParts {
   const cleanedName = stripExtension(name).replace(/\s+/g, " ").trim();
   if (!cleanedName) {
-    return { courseId: "Lecture", lectureLabel: "Lecture" };
+    return {
+      courseId: "Lecture",
+      lectureLabel: "Lecture",
+      displayName: "Lecture",
+      kind: "",
+      number: "",
+    };
   }
 
   const courseId = cleanedName.split(/[-\s_]+/).filter(Boolean)[0] ?? cleanedName;
@@ -51,7 +65,35 @@ function splitLectureName(name: string): LectureNameParts {
     lectureLabel = cleanedName;
   }
 
-  return { courseId, lectureLabel };
+  // Parse lectureLabel to extract displayName, kind, and number
+  // Expected format: "DisplayName Lecture 12" or "DisplayName-Lecture-12"
+  const parts = lectureLabel.split(/[-\s_]+/).filter(Boolean);
+
+  let displayName = lectureLabel;
+  let kind = "";
+  let number = "";
+
+  if (parts.length >= 2) {
+    // Check if the last part is a number
+    const lastPart = parts[parts.length - 1];
+    if (/^\d+$/.test(lastPart)) {
+      number = lastPart;
+      // Check if second-to-last part looks like a kind (e.g., "Lecture", "Lab", "Seminar")
+      const potentialKind = parts[parts.length - 2];
+      if (/^[a-z]/i.test(potentialKind) && !/^\d+$/.test(potentialKind)) {
+        kind = potentialKind;
+        displayName = parts.slice(0, parts.length - 2).join(" ");
+        if (!displayName) {
+          displayName = potentialKind;
+          kind = "";
+        }
+      } else {
+        displayName = parts.slice(0, parts.length - 1).join(" ");
+      }
+    }
+  }
+
+  return { courseId, lectureLabel, displayName, kind, number };
 }
 
 function normalizeQuery(value: string): string {
@@ -64,7 +106,7 @@ function normalizeCourseCode(value: string | null | undefined): string {
 
 function lectureMatchesQuery(item: HomepageLectureItem, normalizedQuery: string): boolean {
   if (!normalizedQuery) return true;
-  return `${item.lecture.name} ${item.courseId} ${item.lectureLabel}`
+  return `${item.lecture.name} ${item.courseId} ${item.courseDisplay} ${item.lectureLabel}`
     .toLowerCase()
     .includes(normalizedQuery);
 }
@@ -138,11 +180,16 @@ export default function Homepage({
   const toLectureItem = (lecture: TeachersNoteSummary): HomepageLectureItem => {
     const parsed = splitLectureName(lecture.name);
     const derivedCourseId = lecture.course_id?.trim() || parsed.courseId;
+    const derivedCourseDisplay = lecture.course_display?.trim() || derivedCourseId;
     return {
       lecture,
       courseId: derivedCourseId,
+      courseDisplay: derivedCourseDisplay,
       courseCodeNormalized: normalizeCourseCode(derivedCourseId || parsed.courseId),
       lectureLabel: parsed.lectureLabel,
+      displayName: parsed.displayName,
+      kind: parsed.kind,
+      number: parsed.number,
       createdAtMs: Date.parse(lecture.created_at) || 0,
     };
   };
@@ -174,21 +221,31 @@ export default function Homepage({
   }, [acceptedAllLectures, normalizedQuery]);
 
   const groupedAllLectures = (() => {
-    const byCourse = new Map<string, HomepageLectureItem[]>();
+    const byCourse = new Map<string, { courseDisplay: string; lectures: HomepageLectureItem[] }>();
     for (const lecture of filteredAllLectures) {
       const existing = byCourse.get(lecture.courseId);
       if (existing) {
-        existing.push(lecture);
+        existing.lectures.push(lecture);
       } else {
-        byCourse.set(lecture.courseId, [lecture]);
+        byCourse.set(lecture.courseId, {
+          courseDisplay: lecture.courseDisplay,
+          lectures: [lecture],
+        });
       }
     }
 
     return [...byCourse.entries()]
-      .sort(([courseA], [courseB]) => courseA.localeCompare(courseB, undefined, { sensitivity: "base" }))
-      .map(([courseId, lectures]) => ({
+      .sort((entryA, entryB) => {
+        const [courseIdA, groupA] = entryA;
+        const [courseIdB, groupB] = entryB;
+        const byDisplay = groupA.courseDisplay.localeCompare(groupB.courseDisplay, undefined, { sensitivity: "base" });
+        if (byDisplay !== 0) return byDisplay;
+        return courseIdA.localeCompare(courseIdB, undefined, { sensitivity: "base" });
+      })
+      .map(([courseId, group]) => ({
         courseId,
-        lectures: sortLectureItems(lectures),
+        courseDisplay: group.courseDisplay,
+        lectures: sortLectureItems(group.lectures),
       }));
   })();
 
@@ -228,8 +285,14 @@ export default function Homepage({
   }
 
   function renderLectureCard(item: HomepageLectureItem) {
-    const { lecture, courseId, lectureLabel } = item;
+    const { lecture, courseDisplay, displayName, kind, number } = item;
     const pdfUrl = buildAssetUrl(lecture.pdf_url);
+
+    // Format title as "display name - kind - number"
+    const titleParts = [displayName];
+    if (kind) titleParts.push(kind);
+    if (number) titleParts.push(number);
+    const mainTitle = titleParts.join(" - ");
 
     return (
       <button
@@ -257,8 +320,8 @@ export default function Homepage({
           )}
         </div>
         <div className="homepage-lecture-info">
-          <p className="homepage-lecture-course-id">{courseId}</p>
-          <p className="homepage-lecture-label">{lectureLabel}</p>
+          <p className="homepage-lecture-course-id">{courseDisplay}</p>
+          <p className="homepage-lecture-label">{mainTitle}</p>
         </div>
       </button>
     );
@@ -325,22 +388,16 @@ export default function Homepage({
 
               <div className="homepage-profile-field">
                 <label htmlFor="profile-program-popup">Program</label>
-                <select
+                <ProgramPicker
                   id="profile-program-popup"
-                  value={draftProgramId ?? ""}
-                  onChange={(event) => {
-                    const value = event.target.value;
-                    setDraftProgramId(value ? Number(value) : null);
-                  }}
+                  value={draftProgramId}
+                  programs={programOptions}
+                  onChange={setDraftProgramId}
                   disabled={profileOptionsLoading || programSavePending}
-                >
-                  <option value="">Show all</option>
-                  {programOptions.map((program) => (
-                    <option key={program.id} value={program.id}>
-                      {program.code} - {program.name}
-                    </option>
-                  ))}
-                </select>
+                  showAllOption
+                  showAllLabel="Show all"
+                  placeholder="Select a program"
+                />
               </div>
 
               <div className="homepage-program-popup-actions">
@@ -393,22 +450,16 @@ export default function Homepage({
 
             <div className="homepage-profile-field">
               <label htmlFor="profile-program">Program</label>
-              <select
+              <ProgramPicker
                 id="profile-program"
-                value={draftProgramId ?? ""}
-                onChange={(event) => {
-                  const value = event.target.value;
-                  setDraftProgramId(value ? Number(value) : null);
-                }}
+                value={draftProgramId}
+                programs={programOptions}
+                onChange={setDraftProgramId}
                 disabled={profileOptionsLoading || programSavePending}
-              >
-                <option value="">Show all</option>
-                {programOptions.map((program) => (
-                  <option key={program.id} value={program.id}>
-                    {program.code} - {program.name}
-                  </option>
-                ))}
-              </select>
+                showAllOption
+                showAllLabel="Show all"
+                placeholder="Select a program"
+              />
               <button
                 type="button"
                 className="homepage-profile-save-btn"
@@ -539,7 +590,7 @@ export default function Homepage({
                     aria-expanded={isExpanded}
                     aria-controls={panelId}
                   >
-                    <span className="homepage-course-group-title">{group.courseId}</span>
+                    <span className="homepage-course-group-title">{group.courseDisplay}</span>
                     <span className="homepage-course-group-meta">
                       <span className="homepage-course-group-count">{group.lectures.length}</span>
                       <span className="homepage-course-group-chevron">▾</span>

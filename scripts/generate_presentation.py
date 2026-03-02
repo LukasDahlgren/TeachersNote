@@ -13,10 +13,10 @@ from pptx.util import Inches, Pt
 
 SLIDE_WIDTH = Inches(13.33)
 SLIDE_HEIGHT = Inches(7.5)
-IMAGE_PANEL_WIDTH = Inches(8.0)
-NOTES_PANEL_LEFT = Inches(8.0)
-NOTES_PANEL_WIDTH = Inches(5.33)
-NOTES_PAD = Inches(0.18)
+IMAGE_PANEL_WIDTH = Inches(7.5)
+NOTES_PANEL_LEFT = Inches(7.5)
+NOTES_PANEL_WIDTH = Inches(5.83)
+NOTES_PAD = Inches(0.22)
 NOTES_BG = RGBColor(0xF5, 0xF7, 0xFA)
 HEADER_COLOR = RGBColor(0x0F, 0x4C, 0x81)
 BODY_COLOR = RGBColor(0x22, 0x29, 0x36)
@@ -129,32 +129,43 @@ def _add_notes_panel(slide, entry: dict) -> None:
         bodyPr.set("tIns", pad_str)
         bodyPr.set("bIns", pad_str)
 
+    def _add_divider() -> None:
+        p = tf.add_paragraph()
+        p.space_before = Pt(0)
+        p.space_after = Pt(0)
+        run = p.add_run()
+        run.text = "─" * 28
+        run.font.size = Pt(6)
+        run.font.color.rgb = RGBColor(0xCC, 0xD3, 0xDB)
+
     def _add_header(label: str, first: bool = False) -> None:
+        if not first:
+            _add_divider()
         p = tf.paragraphs[0] if first else tf.add_paragraph()
-        p.space_before = Pt(0) if first else Pt(4)
-        p.space_after = Pt(1)
+        p.space_before = Pt(0) if first else Pt(6)
+        p.space_after = Pt(3)
         run = p.add_run()
         run.text = label
         run.font.bold = True
-        run.font.size = Pt(10)
+        run.font.size = Pt(12)
         run.font.color.rgb = HEADER_COLOR
 
     def _add_body(text: str) -> None:
         p = tf.add_paragraph()
         p.space_before = Pt(0)
-        p.space_after = Pt(1)
+        p.space_after = Pt(2)
         run = p.add_run()
         run.text = text
-        run.font.size = Pt(8.5)
+        run.font.size = Pt(10.5)
         run.font.color.rgb = BODY_COLOR
 
     def _add_bullet(text: str) -> None:
         p = tf.add_paragraph()
         p.space_before = Pt(0)
-        p.space_after = Pt(1)
+        p.space_after = Pt(2)
         run = p.add_run()
         run.text = f"• {text}"
-        run.font.size = Pt(8.5)
+        run.font.size = Pt(10.5)
         run.font.color.rgb = BODY_COLOR
 
     # Section 1: SAMMANFATTNING

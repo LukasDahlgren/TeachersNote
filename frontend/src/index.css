@@ -68,7 +68,7 @@ body { margin: 0; }
   letter-spacing: 0.01em;
   transition: background 0.15s;
 }
-.sidebar-new-btn:hover { background: #1f2937; }
+.sidebar-new-btn:hover:not(:disabled) { background: #2563eb; }
 
 .sidebar-section-label {
   padding: 0.5rem 0.75rem 0.25rem;
@@ -250,10 +250,16 @@ body { margin: 0; }
 /* ── Main content area ── */
 .main-content {
   flex: 1;
+  min-height: 0;
   overflow: auto;
   display: flex;
   flex-direction: column;
   position: relative;
+}
+
+.main-content--admin {
+  overflow-y: scroll;
+  scrollbar-gutter: stable both-edges;
 }
 
 /* ── Welcome / empty state ── */
@@ -299,7 +305,7 @@ body { margin: 0; }
 
 /* ── Homepage ── */
 .homepage {
-  padding: 1.5rem;
+  padding: 1.5rem 1.5rem 3.5rem;
 }
 
 .homepage--catalog {
@@ -520,7 +526,7 @@ body { margin: 0; }
 }
 
 .homepage-profile-save-btn:hover:not(:disabled) {
-  background: #1e293b;
+  background: #2563eb;
 }
 
 .homepage-profile-save-btn:disabled {
@@ -895,6 +901,12 @@ button.homepage-course-toggle:focus-visible {
   border-radius: 12px;
   padding: 2rem;
   box-shadow: 0 4px 24px rgba(0,0,0,.08);
+  flex-shrink: 0;
+}
+
+.upload-form--loading {
+  margin-top: 3vh;
+  margin-bottom: 3vh;
 }
 
 .process-chat {
@@ -1181,6 +1193,156 @@ button.homepage-course-toggle:focus-visible {
   color: #6b7280;
 }
 
+.program-picker {
+  position: relative;
+  width: 100%;
+}
+
+.program-picker-trigger {
+  width: 100%;
+  min-height: 38px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 0 0.7rem;
+  background: #fff;
+  color: #111827;
+  font-size: 0.9rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  cursor: pointer;
+  text-align: left;
+}
+
+.program-picker-trigger:hover:not(:disabled) {
+  background: #f8fafc;
+  border-color: #9ca3af;
+}
+
+.program-picker-trigger:focus-visible {
+  outline: 2px solid #cbd5e1;
+  border-color: #94a3b8;
+}
+
+.program-picker-trigger--open {
+  border-color: #94a3b8;
+  box-shadow: 0 0 0 2px #e2e8f0;
+}
+
+.program-picker-trigger:disabled {
+  background: #f9fafb;
+  color: #6b7280;
+  cursor: not-allowed;
+}
+
+.program-picker-trigger-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.program-picker-trigger-text--placeholder {
+  color: #6b7280;
+}
+
+.program-picker-trigger-chevron {
+  flex-shrink: 0;
+  font-size: 0.65rem;
+  color: #6b7280;
+  transition: transform 0.14s ease;
+}
+
+.program-picker-trigger--open .program-picker-trigger-chevron {
+  transform: rotate(180deg);
+}
+
+.program-picker-popover {
+  position: absolute;
+  top: calc(100% + 0.35rem);
+  left: 0;
+  z-index: 25;
+  width: min(560px, max(100%, 34vw));
+  max-width: calc(100vw - 2rem);
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 12px 24px rgba(15, 23, 42, 0.13);
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 0.3rem;
+}
+
+.program-picker-option {
+  width: 100%;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  min-height: 36px;
+  padding: 0.35rem 0.5rem;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.06rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.program-picker-option:hover {
+  background: #f1f5f9;
+}
+
+.program-picker-option:focus-visible {
+  outline: 2px solid #cbd5e1;
+  outline-offset: 1px;
+}
+
+.program-picker-option--active {
+  background: #e2e8f0;
+}
+
+.program-picker-option-name {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #1f2937;
+  line-height: 1.25;
+}
+
+.program-picker-option-meta {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #64748b;
+  line-height: 1.2;
+}
+
+.program-picker-empty {
+  margin: 0;
+  padding: 0.2rem 0.3rem;
+  color: #64748b;
+  font-size: 0.75rem;
+  font-style: italic;
+}
+
+button.program-picker-trigger:hover:not(:disabled),
+button.program-picker-option:hover:not(:disabled),
+button.program-picker-option--active:hover:not(:disabled) {
+  background: #f1f5f9;
+  color: #111827;
+}
+
+button.program-picker-option--active {
+  background: #e2e8f0;
+}
+
+.program-picker--admin {
+  min-width: 300px;
+}
+
+.program-picker--admin .program-picker-popover {
+  width: min(520px, max(100%, 28vw));
+}
+
 .course-picker {
   position: relative;
 }
@@ -1320,6 +1482,14 @@ button.homepage-course-toggle:focus-visible {
   display: flex;
   flex-direction: column;
   gap: 0.16rem;
+}
+
+.course-picker-empty {
+  margin: 0;
+  padding: 0.2rem 0.3rem;
+  color: #64748b;
+  font-size: 0.75rem;
+  font-style: italic;
 }
 
 .course-picker-course-btn {
@@ -1487,7 +1657,7 @@ button.course-picker-group-btn--open {
   margin-top: 12px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 
 .upload-progress-bar {
@@ -1504,8 +1674,47 @@ button.course-picker-group-btn--open {
   transition: width 0.4s ease;
 }
 
-.upload-progress-label {
+.upload-console {
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 0.65rem 0.85rem;
+  max-height: 160px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-family: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace;
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
+
+.upload-console-line {
+  color: #374151;
+  white-space: pre-wrap;
+  word-break: break-word;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.upload-console-text {
+  flex: 1;
+}
+
+.upload-console-check {
+  color: #16a34a;
   font-size: 0.8rem;
+  flex-shrink: 0;
+}
+
+.upload-console-line--dim {
+  color: #9ca3af;
+}
+
+.upload-console-line--done .upload-console-text {
   color: #6b7280;
 }
 
@@ -1527,7 +1736,7 @@ button.course-picker-group-btn--open {
   margin-top: 0.5rem;
   transition: background 0.15s;
 }
-.submit-btn:hover:not(:disabled) { background: #1f2937; }
+.submit-btn:hover:not(:disabled) { background: #2563eb; }
 .submit-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .submit-actions {
   display: flex;
@@ -1548,8 +1757,8 @@ button {
   padding: 0.5rem 1.1rem;
   border: 1px solid #ccc;
   border-radius: 6px;
-  background: #3b82f6;
-  color: #fff;
+  background: #fff;
+  color: #1f2937;
   font-size: 0.9rem;
   font-family: inherit;
   cursor: pointer;
@@ -1558,7 +1767,7 @@ button {
   gap: 0.4rem;
   transition: background 0.15s;
 }
-button:hover:not(:disabled) { background: #2563eb; }
+button:hover:not(:disabled) { background: #f0f0f0; }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
 button.secondary { background: #fff; color: #333; border-color: #ccc; }
 button.secondary:hover:not(:disabled) { background: #f0f0f0; }
@@ -1989,7 +2198,7 @@ button.panel-tab:hover:not(:disabled) { background: #f0f0f0; color: #374151; }
   }
 
   .homepage {
-    padding: 1rem;
+    padding: 1rem 1rem 2.5rem;
   }
 
   .homepage-search-input {
@@ -2178,12 +2387,13 @@ button.panel-tab:hover:not(:disabled) { background: #f0f0f0; color: #374151; }
   background: #111827;
   color: #fff;
 }
-.modal-btn--primary:hover:not(:disabled) { background: #374151; }
+.modal-btn--primary:hover:not(:disabled) { background: #2563eb; }
 .modal-btn--primary:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* ── Admin panel ── */
 .admin-panel {
   padding: 2rem;
+  width: 100%;
   max-width: 860px;
   margin: 0 auto;
 }
@@ -2229,6 +2439,11 @@ button.panel-tab:hover:not(:disabled) { background: #f0f0f0; color: #374151; }
 .admin-panel-tab--active {
   background: #0f172a;
   border-color: #0f172a;
+  color: #fff;
+}
+.admin-panel-tab--active:hover {
+  background: #2563eb;
+  border-color: #2563eb;
   color: #fff;
 }
 .admin-panel-section-title {
@@ -2306,7 +2521,8 @@ button.panel-tab:hover:not(:disabled) { background: #f0f0f0; color: #374151; }
   cursor: not-allowed;
 }
 .admin-panel-approve-btn,
-.admin-panel-reject-btn {
+.admin-panel-reject-btn,
+.admin-panel-review-btn {
   padding: 0.25rem 0.75rem;
   border-radius: 5px;
   font-size: 0.8125rem;
@@ -2315,6 +2531,11 @@ button.panel-tab:hover:not(:disabled) { background: #f0f0f0; color: #374151; }
   border: none;
   transition: background 0.15s;
 }
+.admin-panel-review-btn {
+  background: #e0e7ff;
+  color: #3730a3;
+}
+.admin-panel-review-btn:hover { background: #c7d2fe; }
 .admin-panel-approve-btn {
   background: #dcfce7;
   color: #166534;

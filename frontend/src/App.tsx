@@ -17,7 +17,6 @@ import {
   restoreLecture,
   saveLecture,
   startProcessJob,
-  startRegenerateNotesJob,
   subscribeProcessJobEvents,
   subscribeRegenerateNotesEvents,
   findBestLectureWithNotesByExactName,
@@ -30,12 +29,11 @@ import SlideViewer from "./components/SlideViewer";
 import TranscriptPanel from "./components/TranscriptPanel";
 import Sidebar from "./components/Sidebar";
 import ErrorBoundary from "./components/ErrorBoundary";
-import ProcessChat, { type ProcessChatEntry } from "./components/ProcessChat";
+import { type ProcessChatEntry } from "./components/ProcessChat";
 import Homepage from "./components/Homepage";
 import AllLecturesPlaceholder from "./components/AllLecturesPlaceholder";
 import AdminPanel from "./components/AdminPanel";
 import {
-  isEnrichedSlideInvalid,
   type ProcessResult,
   type TeachersNoteSummary,
   type RegenerateNotesJobStatus,
@@ -46,27 +44,28 @@ import {
   type StudentProfile,
 } from "./types";
 
-const REGENERATE_NOTES_AVAILABLE = (() => {
-  const value = import.meta.env.VITE_ENABLE_REGENERATE_NOTES;
-  if (typeof value !== "string") return false;
-  return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
-})();
 const ACTIVE_PROCESS_JOB_STORAGE_KEY = "teachers-note.active-process-job-id";
 const LEGACY_ACTIVE_PROCESS_JOB_STORAGE_KEY = "lecture-summary.active-process-job-id";
 const IS_ADMIN_STORAGE_KEY = "teachers-note.is-admin";
 const LEGACY_IS_ADMIN_STORAGE_KEY = "lecture-summary.is-admin";
-const DEMO_LECTURE_NAME = "DB-lecture-12-2026";
-const DEMO_REGEN_STEP_MS = 650;
+const DEMO_LECTURE_NAME = "IB133N-lecture-14-2026";
 const PROCESS_DETAIL_RETRY_DELAYS_MS = [700, 1300, 2000];
 const PROCESS_STATUS_POLL_MS = 5000;
 const DEMO_UPLOAD_STAGES: Array<{ label: string; stage: string; delayMs: number }> = [
-  { label: "Validating files...", stage: "parse_slides", delayMs: 450 },
-  { label: "Parsing PDF...", stage: "parse_slides", delayMs: 900 },
-  { label: "Transcribing...", stage: "transcribe", delayMs: 1400 },
-  { label: "Generating notes...", stage: "enrich", delayMs: 1100 },
+  { label: "📄 Parsing slides...", stage: "parse_slides", delayMs: 450 },
+  { label: "📄 Extracted 27 slides.", stage: "parse_slides", delayMs: 900 },
+  { label: "☁️ Transcribing recording...", stage: "transcribe", delayMs: 1400 },
+  { label: "🔗 Aligning transcript to slides...", stage: "align", delayMs: 600 },
+  { label: "✨ Enriching 27 slides...", stage: "enrich", delayMs: 1100 },
 ];
 
-type LectureData = ProcessResult & { name?: string; lecture_id?: number; is_saved?: boolean };
+type LectureData = ProcessResult & {
+  name?: string;
+  lecture_id?: number;
+  course_id?: string | null;
+  course_display?: string | null;
+  is_saved?: boolean;
+};
 
 type MainView =
   | { view: "empty" }
@@ -87,6 +86,41 @@ function formatProcessStage(stage: string): string {
 
 function toErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function normalizeCourseToken(value: string | null | undefined): string {
+  return (value ?? "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function formatLectureDisplayName(input: {
+  name?: string;
+  course_id?: string | null;
+  course_display?: string | null;
+}): string {
+  const rawName = input.name ?? "";
+  const name = rawName.trim();
+  if (!name) return rawName;
+
+  const courseId = (input.course_id ?? "").trim();
+  const courseDisplay = (input.course_display ?? "").trim();
+  if (!courseId || !courseDisplay) return rawName;
+  if (normalizeCourseToken(courseId) === normalizeCourseToken(courseDisplay)) return rawName;
+
+  const prefixPattern = new RegExp(`^${escapeRegex(courseId)}(?=($|[-_\\s]))`, "i");
+  if (prefixPattern.test(name)) {
+    return name.replace(prefixPattern, courseDisplay);
+  }
+
+  const firstToken = name.split(/[-_\s]+/, 1)[0] ?? "";
+  if (normalizeCourseToken(firstToken) === normalizeCourseToken(courseId)) {
+    return `${courseDisplay}${name.slice(firstToken.length)}`;
+  }
+
+  return rawName;
 }
 
 function readStorageWithMigration(primaryKey: string, legacyKey: string): string | null {
@@ -153,6 +187,7 @@ export default function App() {
   const processLastEventIdRef = useRef(0);
   const demoRegenRunRef = useRef(0);
   const demoRunRef = useRef(0);
+  const initialAdminRedirectHandledRef = useRef(false);
   const navigate = useNavigate();
   const location = useLocation();
   const lectureRouteMatch = useMatch("/lectures/:lectureId");
@@ -202,6 +237,15 @@ export default function App() {
     void fetchLectures();
     void fetchProfile();
   }, [fetchLectures, fetchProfile]);
+
+  useEffect(() => {
+    if (initialAdminRedirectHandledRef.current) return;
+    initialAdminRedirectHandledRef.current = true;
+
+    if (isAdmin && location.pathname === "/") {
+      navigate("/admin", { replace: true });
+    }
+  }, [isAdmin, location.pathname, navigate]);
 
   const stopRegenerationSubscription = useCallback(() => {
     if (regenUnsubscribeRef.current) {
@@ -422,7 +466,6 @@ export default function App() {
     processUnsubscribeRef.current = subscribeProcessJobEvents(jobId, {
       onProgress: (event) => {
         setProcessJob(event);
-        appendProcessChat(event, "progress");
         setUploadLoadingLabel(`Processing: ${formatProcessStage(event.current_stage)} (${event.progress_pct}%)`);
         setMainView((prev) => (
           prev.view === "upload" ? { ...prev, loading: true, error: undefined } : prev
@@ -601,10 +644,11 @@ export default function App() {
     try {
       // Simulate progress through stages with increasing percentages
       const stageProgressMap: Record<string, { start: number; end: number }> = {
-        "Validating files...": { start: 0, end: 10 },
-        "Parsing PDF...": { start: 10, end: 35 },
-        "Transcribing...": { start: 35, end: 75 },
-        "Generating notes...": { start: 75, end: 100 },
+        "📄 Parsing slides...": { start: 0, end: 10 },
+        "📄 Extracted 27 slides.": { start: 10, end: 22 },
+        "☁️ Transcribing recording...": { start: 22, end: 55 },
+        "🔗 Aligning transcript to slides...": { start: 55, end: 70 },
+        "✨ Enriching 27 slides...": { start: 70, end: 100 },
       };
 
       for (const stage of DEMO_UPLOAD_STAGES) {
@@ -614,6 +658,37 @@ export default function App() {
         const startProgress = progressRange?.start ?? 0;
         const endProgress = progressRange?.end ?? 100;
         const stepSize = (endProgress - startProgress) / Math.max(1, Math.ceil(stage.delayMs / 100));
+
+        // Add a chat entry for this stage
+        appendProcessChat({
+          job_id: `demo-${Date.now()}`,
+          status: "running",
+          current_stage: stage.stage,
+          progress_pct: startProgress,
+          lecture_id: null,
+          error: null,
+          updated_at: new Date().toISOString(),
+          message: stage.label,
+        }, "log");
+
+        // Simulate per-slide enrichment progress
+        if (stage.stage === "enrich") {
+          const totalSlides = 27;
+          for (let slide = 1; slide <= totalSlides; slide++) {
+            if (demoRunRef.current !== runId) return;
+            await sleep(stage.delayMs / totalSlides);
+            appendProcessChat({
+              job_id: `demo-${Date.now()}`,
+              status: "running",
+              current_stage: "enrich",
+              progress_pct: 70 + Math.round((slide / totalSlides) * 20),
+              lecture_id: null,
+              error: null,
+              updated_at: new Date().toISOString(),
+              message: `✅ Slide ${slide} done (${slide}/${totalSlides})`,
+            }, "log");
+          }
+        }
 
         // Animate progress during this stage
         for (let progress = startProgress; progress <= endProgress; progress += stepSize) {
@@ -688,7 +763,7 @@ export default function App() {
         setMainView((prev) => (prev.view === "upload" ? { ...prev, loading: false } : prev));
       }
     }
-  }, [fetchLectures, resetProcessUi, resetRegenerationUi]);
+  }, [appendProcessChat, fetchLectures, resetProcessUi, resetRegenerationUi]);
 
   async function handleSubmit(pdf: File, recording: UploadRecordingInput, naming: UploadLectureNamingInput) {
     demoRunRef.current += 1;
@@ -827,12 +902,13 @@ export default function App() {
       setIsAdmin(true);
       setShowAdminModal(false);
       setAdminSecretInput("");
+      navigate("/admin");
     } catch (err) {
       setAdminRegisterError(err instanceof ApiError ? err.message : "Registration failed.");
     } finally {
       setAdminRegisterLoading(false);
     }
-  }, [adminSecretInput]);
+  }, [adminSecretInput, navigate]);
 
   useEffect(() => {
     if (location.pathname === "/workspace" && mainView.view === "empty") {
@@ -983,9 +1059,10 @@ export default function App() {
     const lectureId = mainView.lectureId ?? mainView.data.lecture_id;
     if (!lectureId) return;
 
+    const lectureDisplayName = formatLectureDisplayName(mainView.data).trim();
     setDeleteTarget({
       id: lectureId,
-      name: mainView.data.name?.trim() || "this lecture",
+      name: lectureDisplayName || "this lecture",
     });
     setDeleteDialogOpen(true);
   }
@@ -1027,97 +1104,6 @@ export default function App() {
   const handleProfileChange = useCallback((nextProfile: StudentProfile) => {
     setProfile(nextProfile);
   }, []);
-
-  async function handleRegenerateNotes() {
-    if (mainView.view !== "results") return;
-    if (!REGENERATE_NOTES_AVAILABLE) {
-      setRegenBanner({ kind: "error", text: "Regenerate notes is currently unavailable." });
-      return;
-    }
-    const lectureId = mainView.lectureId ?? mainView.data.lecture_id;
-    if (!lectureId) {
-      setRegenBanner({ kind: "error", text: "Cannot regenerate notes because lecture id is missing." });
-      return;
-    }
-
-    if (demoPreviewActive) {
-      const runId = demoRegenRunRef.current + 1;
-      demoRegenRunRef.current = runId;
-
-      stopRegenerationSubscription();
-      setRegeneratingNotes(true);
-      setRegenBanner(null);
-
-      const totalSlides = mainView.data.slides.length;
-      const invalidSlides = mainView.data.enhanced.filter((slide) => isEnrichedSlideInvalid(slide)).length;
-      const jobId = `demo-${Date.now()}`;
-      const buildDemoStatus = (overrides: Partial<RegenerateNotesJobStatus> = {}): RegenerateNotesJobStatus => ({
-        job_id: jobId,
-        lecture_id: lectureId,
-        status: "running",
-        total_slides: totalSlides,
-        completed_slides: 0,
-        current_slide: null,
-        regenerated_slides: 0,
-        error: null,
-        updated_at: new Date().toISOString(),
-        ...overrides,
-      });
-
-      setRegenJob(buildDemoStatus());
-
-      for (let idx = 0; idx < totalSlides; idx += 1) {
-        await sleep(DEMO_REGEN_STEP_MS);
-        if (demoRegenRunRef.current !== runId) return;
-
-        const currentSlideNumber = mainView.data.slides[idx]?.slide ?? (idx + 1);
-        setRegenJob(buildDemoStatus({
-          completed_slides: idx + 1,
-          current_slide: currentSlideNumber,
-          regenerated_slides: invalidSlides,
-        }));
-      }
-
-      if (demoRegenRunRef.current !== runId) return;
-
-      setRegenJob(buildDemoStatus({
-        status: "done",
-        completed_slides: totalSlides,
-        current_slide: null,
-        regenerated_slides: invalidSlides,
-      }));
-      setRegeneratingNotes(false);
-      setRegenBanner({
-        kind: "success",
-        text: invalidSlides === 0
-          ? "All slide notes are already valid."
-          : `Regeneration simulation complete for ${invalidSlides} slide${invalidSlides === 1 ? "" : "s"}.`,
-      });
-      return;
-    }
-
-    stopRegenerationSubscription();
-    setRegeneratingNotes(true);
-    setRegenBanner(null);
-    setSaveBanner(null);
-    setArchiveBanner(null);
-    try {
-      const job = await startRegenerateNotesJob(lectureId);
-      setRegenJob(job);
-
-      if (job.status === "done") {
-        await finishRegeneration(lectureId, job);
-        return;
-      }
-      if (job.status === "error") {
-        failRegeneration(job.error || "Regeneration failed.", job);
-        return;
-      }
-      subscribeToRegenerationJob(job.job_id, lectureId);
-    } catch (err) {
-      failRegeneration(err instanceof Error ? err.message : String(err));
-    }
-  }
 
   const activeSlideComputed = useMemo(() => {
     if (mainView.view !== "results") return null;
@@ -1209,7 +1195,48 @@ export default function App() {
     [isAdmin, lectures, savedLectures],
   );
 
+  const consoleEntries = useMemo(() => {
+    type Entry = { id: number; message: string; done: boolean; stage: string };
+    const entries: Entry[] = [];
+
+    for (const chat of processChat) {
+      // Merge per-slide messages into the enriching line counter
+      const slideMatch = chat.message.match(/✅ Slide \d+ done \((\d+)\/(\d+)\)/);
+      if (slideMatch) {
+        const current = parseInt(slideMatch[1], 10);
+        const total = parseInt(slideMatch[2], 10);
+        let enrichIdx = -1;
+        for (let i = entries.length - 1; i >= 0; i--) {
+          if (entries[i].stage === "enrich") { enrichIdx = i; break; }
+        }
+        if (enrichIdx >= 0) {
+          entries[enrichIdx] = {
+            ...entries[enrichIdx],
+            message: `✨ Enriching slides... (${current}/${total})`,
+            done: current === total,
+          };
+        }
+        continue;
+      }
+
+      // Mark previous stage entries as done when stage changes
+      if (entries.length > 0) {
+        const prevStage = entries[entries.length - 1].stage;
+        if (prevStage !== chat.stage) {
+          for (let i = entries.length - 1; i >= 0 && entries[i].stage === prevStage; i--) {
+            entries[i] = { ...entries[i], done: true };
+          }
+        }
+      }
+
+      entries.push({ id: chat.eventId, message: chat.message, done: false, stage: chat.stage });
+    }
+
+    return entries;
+  }, [processChat]);
+
   const isWorkspaceRoute = location.pathname === "/workspace" || location.pathname.startsWith("/lectures/");
+  const isAdminRoute = location.pathname === "/admin";
   const isUploadActive = processJob?.status === "queued" || processJob?.status === "running";
   const hasUploadLabel = uploadLoadingLabel.trim().length > 0;
   const hasUploadEntries = processChat.length > 0;
@@ -1252,15 +1279,8 @@ export default function App() {
             loading={mainView.loading}
             onRunDemo={handleRunDemo}
             progressPct={processJob?.progress_pct ?? null}
-            progressLabel={uploadLoadingLabel}
+            consoleEntries={consoleEntries}
           />
-          {mainView.loading && processJob && (
-            <ProcessChat
-              entries={processChat}
-              job={processJob}
-              lectureName={processingLectureName}
-            />
-          )}
           {mainView.error && (
             <div className="banner error">{mainView.error}</div>
           )}
@@ -1269,33 +1289,15 @@ export default function App() {
 
       {mainView.view === "results" && activeSlideComputed && (() => {
         const { data, activeSlide, segments } = activeSlideComputed;
-        const lectureId = mainView.lectureId ?? data.lecture_id;
         const downloadHref = buildAssetUrl(data.download_url);
         const pdfUrl = buildAssetUrl(data.pdf_url);
 
         return (
           <div className="results">
               <div className="results-header">
-                <span className="results-lecture-name">{data.name ?? "Lecture"}</span>
+                <span className="results-lecture-name">{formatLectureDisplayName(data) || "Lecture"}</span>
                 {demoPreviewActive && <span className="demo-pill">Demo preview</span>}
                 <div className="results-actions">
-                  {lectureId && REGENERATE_NOTES_AVAILABLE && (
-                    <button
-                      className="secondary"
-                      onClick={handleRegenerateNotes}
-                      disabled={regeneratingNotes || archivePending || savePending}
-                    >
-                      {regeneratingNotes ? "Regenerating..." : "Regenerate notes"}
-                    </button>
-                  )}
-                  {lectureId && !REGENERATE_NOTES_AVAILABLE && (
-                    <button
-                      className="secondary"
-                      disabled
-                    >
-                      Regenerate unavailable
-                    </button>
-                  )}
                   {canToggleSaved && (
                     <button
                       className="secondary"
@@ -1385,7 +1387,7 @@ export default function App() {
         onLogout={handleLogout}
       />
 
-      <main className="main-content">
+      <main className={`main-content${isAdminRoute ? " main-content--admin" : ""}`}>
         {showBackendOfflineBanner && (
           <div className="banner error">Backend offline — start uvicorn on port 8000.</div>
         )}

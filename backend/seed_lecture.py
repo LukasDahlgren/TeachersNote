@@ -1,6 +1,6 @@
 """
 Run from the backend/ directory:
-  python seed_lecture.py "DB-lecture-12-2026"
+  python seed_lecture.py "IB133N-lecture-14-2026"
 """
 import asyncio
 import json
@@ -70,5 +70,5 @@ async def seed(name: str):
         break
 
 if __name__ == "__main__":
-    name = sys.argv[1] if len(sys.argv) > 1 else "DB-lecture-12-2026"
+    name = sys.argv[1] if len(sys.argv) > 1 else "IB133N-lecture-14-2026"
     asyncio.run(seed(name))

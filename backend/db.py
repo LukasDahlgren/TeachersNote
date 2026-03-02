@@ -1,12 +1,13 @@
 import logging
 import os
 import re
+from pathlib import Path
 
 from dotenv import load_dotenv
 from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).resolve().with_name(".env"))
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "3306")
@@ -83,6 +84,7 @@ def _ensure_schema_compatibility(sync_conn) -> None:
             CREATE TABLE IF NOT EXISTS courses (
                 id INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
                 code VARCHAR(64) NOT NULL UNIQUE,
+                display_code VARCHAR(64) NULL,
                 name VARCHAR(255) NOT NULL,
                 is_active BOOLEAN NOT NULL DEFAULT 1,
                 created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -91,6 +93,11 @@ def _ensure_schema_compatibility(sync_conn) -> None:
             """
         )
     )
+    course_columns = {column["name"] for column in inspector.get_columns("courses")}
+    if "display_code" not in course_columns:
+        sync_conn.execute(
+            text("ALTER TABLE courses ADD COLUMN display_code VARCHAR(64) NULL")
+        )
     sync_conn.execute(
         text(
             """
