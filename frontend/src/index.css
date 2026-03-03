@@ -2932,7 +2932,6 @@ button.panel-tab:hover:not(:disabled) { background: #f0f0f0; color: #374151; }
   background: white;
   border: 1px solid #e2e8f0;
   border-radius: 12px;
-  overflow: hidden;
 }
 
 .profile-section-title {
