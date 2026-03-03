@@ -30,6 +30,22 @@ export interface UploadLectureNamingInput {
   year: string;
 }
 
+export type CanonicalLectureKind = "lecture" | "other";
+
+export interface ApproveLectureNamingInput {
+  courseid: string;
+  kind: CanonicalLectureKind;
+  lecture: string;
+  year: string;
+}
+
+export interface UploadNamingRaw {
+  courseid: string | null;
+  kind: string | null;
+  lecture: string | null;
+  year: string | null;
+}
+
 export type UploadRecordingInput =
   | { type: "file"; file: File }
   | { type: "url"; url: string };
@@ -54,6 +70,10 @@ export interface TeachersNoteSummary {
   is_approved?: boolean;
   course_id: string | null;
   course_display: string | null;
+  naming_kind?: string | null;
+  naming_lecture?: string | null;
+  naming_year?: string | null;
+  upload_naming_raw?: UploadNamingRaw | null;
   uploaded_by?: string | null;
   is_saved: boolean;
   pptx_path: string | null;
@@ -66,6 +86,10 @@ export interface LectureDetail extends ProcessResult {
   name: string;
   course_id: string | null;
   course_display: string | null;
+  naming_kind?: string | null;
+  naming_lecture?: string | null;
+  naming_year?: string | null;
+  upload_naming_raw?: UploadNamingRaw | null;
   is_archived: boolean;
   is_saved: boolean;
 }

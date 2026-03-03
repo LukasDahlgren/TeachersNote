@@ -29,6 +29,7 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:-tnpass}
       DB_NAME: teachersnote
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      ALIGN_MODEL: ${ALIGN_MODEL:-sonnet}
       GROQ_API_KEY: ${GROQ_API_KEY}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY}
       ADMIN_SECRET: ${ADMIN_SECRET}

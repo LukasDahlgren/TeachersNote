@@ -1,6 +1,11 @@
 import { type KeyboardEvent } from "react";
-import ProcessChat, { type ProcessChatEntry } from "./ProcessChat";
-import type { TeachersNoteSummary, UploadProcessJobStatus } from "../types";
+import type { TeachersNoteSummary } from "../types";
+
+interface ConsoleEntry {
+  id: number;
+  message: string;
+  done?: boolean;
+}
 
 interface SidebarProps {
   savedLectures: TeachersNoteSummary[];
@@ -8,21 +13,25 @@ interface SidebarProps {
   selectedId: number | null;
   onSelect: (id: number) => void;
   onNewLecture: () => void;
+  newLectureButtonRef?: (el: HTMLButtonElement | null) => void;
+  isNewLectureOverlayOpen?: boolean;
   onGoHome: () => void;
   showUploadConsole: boolean;
   uploadLoadingLabel: string;
-  processJob: UploadProcessJobStatus | null;
-  processChat: ProcessChatEntry[];
+  consoleEntries?: ConsoleEntry[];
   processingLectureName?: string | null;
   currentUserId?: string;
   onOpenProfile?: () => void;
 }
 
 function formatDate(iso: string): string {
-  return new Date(iso).toLocaleDateString(undefined, {
+  return new Date(iso).toLocaleString(undefined, {
     year: "numeric",
     month: "short",
     day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
   });
 }
 
@@ -63,11 +72,12 @@ export default function Sidebar({
   selectedId,
   onSelect,
   onNewLecture,
+  newLectureButtonRef,
+  isNewLectureOverlayOpen = false,
   onGoHome,
   showUploadConsole,
   uploadLoadingLabel,
-  processJob,
-  processChat,
+  consoleEntries,
   processingLectureName,
   currentUserId,
   onOpenProfile,
@@ -113,22 +123,18 @@ export default function Sidebar({
       </div>
 
       <div className="sidebar-new-btn-wrap">
-        <button className="sidebar-new-btn" onClick={onNewLecture}>
+        <button
+          type="button"
+          className="sidebar-new-btn"
+          onClick={onNewLecture}
+          ref={newLectureButtonRef}
+          aria-haspopup="dialog"
+          aria-expanded={isNewLectureOverlayOpen}
+          aria-controls="new-lecture-overlay-panel"
+        >
           + New Lecture
         </button>
       </div>
-
-      {showUploadConsole && (
-        <div className="sidebar-upload-console">
-          <ProcessChat
-            entries={processChat}
-            job={processJob}
-            variant="sidebar"
-            statusLabel={uploadLoadingLabel}
-            lectureName={processingLectureName}
-          />
-        </div>
-      )}
 
       <div className="sidebar-groups">
         <div className="sidebar-group sidebar-group--active">
@@ -148,6 +154,29 @@ export default function Sidebar({
           </div>
         </div>
       </div>
+
+      {showUploadConsole && (
+        <div className="sidebar-upload-console sidebar-upload-console--bottom">
+          {processingLectureName && (
+            <div className="sidebar-upload-console-title">{processingLectureName}</div>
+          )}
+          {uploadLoadingLabel.trim().length > 0 && (
+            <div className="sidebar-upload-console-status">{uploadLoadingLabel}</div>
+          )}
+          <div className="upload-console upload-console--sidebar">
+            {(consoleEntries ?? []).length === 0 ? (
+              <span className="upload-console-line upload-console-line--dim">Waiting...</span>
+            ) : (
+              (consoleEntries ?? []).map((entry) => (
+                <span key={entry.id} className={`upload-console-line${entry.done ? " upload-console-line--done" : ""}`}>
+                  <span className="upload-console-text">{entry.message}</span>
+                  {entry.done && <span className="upload-console-check">✓</span>}
+                </span>
+              ))
+            )}
+          </div>
+        </div>
+      )}
 
       <div className="sidebar-bottom-menu">
         <button

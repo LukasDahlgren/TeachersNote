@@ -1,5 +1,6 @@
 import {
   type ArchiveLectureResponse,
+  type ApproveLectureNamingInput,
   type AuthResponse,
   type AuthUser,
   type CatalogSyncRequest,
@@ -110,7 +111,7 @@ function parseEventPayload<T>(evt: Event): T | null {
 export async function processFiles(
   pdf: File,
   recording: UploadRecordingInput,
-  naming: UploadLectureNamingInput,
+  naming?: UploadLectureNamingInput,
 ): Promise<ProcessResult> {
   const form = new FormData();
   form.append("pdf", pdf);
@@ -119,10 +120,12 @@ export async function processFiles(
   } else {
     form.append("audio_url", recording.url);
   }
-  form.append("courseid", naming.courseid);
-  form.append("kind", naming.kind);
-  form.append("lecture", naming.lecture);
-  form.append("year", naming.year);
+  if (naming) {
+    form.append("courseid", naming.courseid);
+    form.append("kind", naming.kind);
+    form.append("lecture", naming.lecture);
+    form.append("year", naming.year);
+  }
   const res = await apiFetch("/process", { method: "POST", body: form });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
@@ -361,8 +364,15 @@ export async function getPendingLectures(): Promise<TeachersNoteSummary[]> {
   return res.json();
 }
 
-export async function approveLecture(id: number): Promise<TeachersNoteSummary> {
-  const res = await apiFetch(`/lectures/${id}/approve`, { method: "POST" });
+export async function approveLecture(
+  id: number,
+  naming: ApproveLectureNamingInput,
+): Promise<TeachersNoteSummary> {
+  const res = await apiFetch(`/lectures/${id}/approve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(naming),
+  });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -517,7 +527,7 @@ export async function getProgramPlan(programId: number): Promise<ProgramPlanResp
 export async function startProcessJob(
   pdf: File,
   recording: UploadRecordingInput,
-  naming: UploadLectureNamingInput,
+  naming?: UploadLectureNamingInput,
 ): Promise<UploadProcessJobStartResponse> {
   const form = new FormData();
   form.append("pdf", pdf);
@@ -526,10 +536,12 @@ export async function startProcessJob(
   } else {
     form.append("audio_url", recording.url);
   }
-  form.append("courseid", naming.courseid);
-  form.append("kind", naming.kind);
-  form.append("lecture", naming.lecture);
-  form.append("year", naming.year);
+  if (naming) {
+    form.append("courseid", naming.courseid);
+    form.append("kind", naming.kind);
+    form.append("lecture", naming.lecture);
+    form.append("year", naming.year);
+  }
   const res = await apiFetch("/process/jobs", { method: "POST", body: form });
   if (!res.ok) {
     const body = await readBody(res);

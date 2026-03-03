@@ -25,13 +25,23 @@ export default function ProgramPicker({
   className,
 }: ProgramPickerProps) {
   const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState("");
   const rootRef = useRef<HTMLDivElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const isOpen = open && !disabled;
 
   const selectedProgram = useMemo(
     () => programs.find((program) => program.id === value) ?? null,
     [programs, value],
   );
+
+  const filteredPrograms = useMemo(() => {
+    const normalized = search.trim().toLowerCase();
+    if (!normalized) return programs;
+    return programs.filter((program) =>
+      `${program.name} ${program.code}`.toLowerCase().includes(normalized),
+    );
+  }, [programs, search]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -46,8 +56,22 @@ export default function ProgramPicker({
     };
   }, [isOpen]);
 
+  useEffect(() => {
+    if (!isOpen) {
+      setSearch("");
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      searchInputRef.current?.focus();
+    }, 0);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [isOpen]);
+
   function selectProgram(programId: number | null) {
     onChange(programId);
+    setSearch("");
     setOpen(false);
   }
 
@@ -80,6 +104,17 @@ export default function ProgramPicker({
           role="listbox"
           aria-label="Program picker"
         >
+          <div className="program-picker-search">
+            <input
+              ref={searchInputRef}
+              type="search"
+              className="program-picker-search-input"
+              placeholder="Search programs..."
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+            />
+          </div>
+
           {showAllOption && (
             <button
               type="button"
@@ -90,7 +125,7 @@ export default function ProgramPicker({
             </button>
           )}
 
-          {programs.map((program) => (
+          {filteredPrograms.map((program) => (
             <button
               key={program.id}
               type="button"
@@ -104,8 +139,10 @@ export default function ProgramPicker({
             </button>
           ))}
 
-          {!showAllOption && programs.length === 0 && (
-            <p className="program-picker-empty">No programs available.</p>
+          {filteredPrograms.length === 0 && (
+            <p className="program-picker-empty">
+              {programs.length === 0 ? "No programs available." : "No programs match your search."}
+            </p>
           )}
         </div>
       )}

@@ -1,9 +1,13 @@
 import argparse
 import json
+import os
 import re
 import anthropic
+from scripts.model_config import resolve_alignment_model, resolve_alignment_model_alias
 
 client = anthropic.Anthropic()
+ALIGN_MODEL_ALIAS = resolve_alignment_model_alias(os.getenv("ALIGN_MODEL"))
+ALIGN_MODEL = resolve_alignment_model(os.getenv("ALIGN_MODEL"))
 
 
 def _collapse_whitespace(text: str) -> str:
@@ -116,12 +120,12 @@ def align(slides_path: str, transcript_path: str, output_path: str) -> None:
         segments = json.load(f)
 
     print(f"Loaded {len(slides)} slides and {len(segments)} transcript segments")
-    print("Calling Claude API for alignment...")
+    print(f"Calling Claude API for alignment ({ALIGN_MODEL_ALIAS}:{ALIGN_MODEL})...")
 
     prompt = build_prompt(slides, segments)
 
     message = client.messages.create(
-        model="claude-sonnet-4-6",
+        model=ALIGN_MODEL,
         max_tokens=1024,
         messages=[{"role": "user", "content": prompt}],
     )

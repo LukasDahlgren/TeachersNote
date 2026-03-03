@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import {
-  approveLecture,
   createCourse,
   createProgram,
   getCourses,
@@ -13,6 +13,7 @@ import {
   rejectLecture,
   runCatalogSync,
   startRegenerateNotesJob,
+  trashLecture,
   unmapProgramCourse,
   updateCourse,
   updateProgram,
@@ -33,6 +34,7 @@ import type {
 
 type DialogState =
   | { type: "confirm-reject"; id: number }
+  | { type: "confirm-delete"; lecture: { id: number; name: string } }
   | { type: "edit-program-name"; program: Program }
   | { type: "edit-program-code"; program: Program }
   | { type: "edit-course-name"; course: Course }
@@ -47,10 +49,13 @@ interface AdminPanelProps {
 type AdminTab = "pending" | "programs" | "courses" | "mappings" | "catalog" | "lectures";
 
 function formatDate(iso: string): string {
-  return new Date(iso).toLocaleDateString(undefined, {
+  return new Date(iso).toLocaleString(undefined, {
     year: "numeric",
     month: "short",
     day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
   });
 }
 
@@ -70,6 +75,7 @@ function formatGroupType(groupType: ProgramPlanRow["group_type"]): string {
 }
 
 export default function AdminPanel({ onBack }: AdminPanelProps) {
+  const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState<AdminTab>("pending");
   const [pending, setPending] = useState<TeachersNoteSummary[]>([]);
   const [programs, setPrograms] = useState<Program[]>([]);
@@ -107,6 +113,9 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
   const [lectureSearch, setLectureSearch] = useState("");
   const [courseSearch, setCourseSearch] = useState("");
   const [programSearch, setProgramSearch] = useState("");
+  const [openLectureActionsFor, setOpenLectureActionsFor] = useState<number | null>(null);
+  const [openProgramActionsFor, setOpenProgramActionsFor] = useState<number | null>(null);
+  const [openCourseActionsFor, setOpenCourseActionsFor] = useState<number | null>(null);
 
   async function load() {
     setLoading(true);
@@ -182,19 +191,6 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
       loadProgramPlan(selectedProgramId),
     ]);
   }, [selectedProgramId]);
-
-  async function handleApprove(id: number) {
-    const key = `pending-approve-${id}`;
-    setActionInFlight(key);
-    try {
-      await approveLecture(id);
-      setPending((prev) => prev.filter((lecture) => lecture.id !== id));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to approve lecture.");
-    } finally {
-      setActionInFlight(null);
-    }
-  }
 
   async function handleReject(id: number) {
     const key = `pending-reject-${id}`;
@@ -419,6 +415,24 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
     }
   }
 
+  async function handleDeleteLecture(lecture: { id: number; name: string }) {
+    const key = `lecture-delete-${lecture.id}`;
+    setActionInFlight(key);
+    setError(null);
+    try {
+      await trashLecture(lecture.id);
+      setApprovedLectures((prev) => prev.filter((item) => item.id !== lecture.id));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to delete lecture.");
+    } finally {
+      setActionInFlight(null);
+    }
+  }
+
+  function handleOpenLecture(lectureId: number) {
+    navigate(`/lectures/${lectureId}`);
+  }
+
   const selectedProgram = useMemo(
     () => programs.find((program) => program.id === selectedProgramId) ?? null,
     [programs, selectedProgramId],
@@ -503,6 +517,13 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
         onCancel={() => setDialog(null)}
       />
     )}
+    {dialog?.type === "confirm-delete" && (
+      <ConfirmDialog
+        message={`Delete "${dialog.lecture.name}" and move it to Recently Deleted?`}
+        onConfirm={() => { const lecture = dialog.lecture; setDialog(null); void handleDeleteLecture(lecture); }}
+        onCancel={() => setDialog(null)}
+      />
+    )}
     {dialog?.type === "edit-program-name" && (
       <InputDialog
         label="Program name"
@@ -543,13 +564,13 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
         onCancel={() => setDialog(null)}
       />
     )}
-    <div className="admin-panel">
-      <div className="admin-panel-header">
+    <div className="admin-panel app-surface app-surface--stagger">
+      <div className="admin-panel-header app-surface-item app-surface-item--1">
         <button className="admin-panel-back-btn" onClick={onBack}>← Back</button>
         <h1 className="admin-panel-title">Admin Panel</h1>
       </div>
 
-      <div className="admin-panel-tabs" role="tablist" aria-label="Admin sections">
+      <div className="admin-panel-tabs app-surface-item app-surface-item--2" role="tablist" aria-label="Admin sections">
         {[
           { key: "pending", label: `Pending (${pending.length})` },
           { key: "lectures", label: `Lectures (${approvedLectures.length})` },
@@ -571,11 +592,11 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
         ))}
       </div>
 
-      {error && <p className="admin-panel-error">{error}</p>}
-      {loading && <p className="admin-panel-loading">Loading…</p>}
+      {error && <p className="admin-panel-error app-surface-item app-surface-item--3">{error}</p>}
+      {loading && <p className="admin-panel-loading app-surface-item app-surface-item--3">Loading…</p>}
 
       {!loading && activeTab === "pending" && (
-        <section className="admin-panel-section">
+        <section className="admin-panel-section app-surface-item app-surface-item--3">
           <h2 className="admin-panel-section-title">Pending Approval</h2>
           {pending.length === 0 && (
             <p className="admin-panel-empty">No lectures pending approval.</p>
@@ -601,14 +622,7 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
                         className="admin-panel-review-btn"
                         onClick={() => setReviewLecture(lecture)}
                       >
-                        Review
-                      </button>
-                      <button
-                        className="admin-panel-approve-btn"
-                        disabled={actionInFlight === `pending-approve-${lecture.id}`}
-                        onClick={() => void handleApprove(lecture.id)}
-                      >
-                        Approve
+                        Review &amp; approve
                       </button>
                       <button
                         className="admin-panel-reject-btn"
@@ -627,7 +641,7 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
       )}
 
       {!loading && activeTab === "lectures" && (
-        <section className="admin-panel-section">
+        <section className="admin-panel-section app-surface-item app-surface-item--3">
           <h2 className="admin-panel-section-title">Approved Lectures</h2>
           {approvedLectures.length === 0 && (
             <p className="admin-panel-empty">No approved lectures.</p>
@@ -651,29 +665,80 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
                     <th>Name</th>
                     <th>Course</th>
                     <th>Date</th>
-                    <th>Actions</th>
+                    <th className="admin-panel-actions-header">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
                   {filteredLectures.length === 0 && (
                     <tr><td colSpan={4} className="admin-panel-cell--muted">No lectures match your search.</td></tr>
                   )}
-                  {filteredLectures.map((lecture) => (
-                    <tr key={lecture.id}>
-                      <td>{lecture.name}</td>
-                      <td className="admin-panel-cell--muted">{lecture.course_display || lecture.course_id}</td>
-                      <td className="admin-panel-cell--muted">{formatDate(lecture.created_at)}</td>
-                      <td className="admin-panel-actions">
-                        <button
-                          className="admin-panel-secondary-btn"
-                          disabled={actionInFlight === `regen-${lecture.id}`}
-                          onClick={() => void handleRegenerateNotes(lecture.id)}
-                        >
-                          {actionInFlight === `regen-${lecture.id}` ? "Starting..." : "Regenerate notes"}
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
+                  {filteredLectures.map((lecture) => {
+                    const isActionsOpen = openLectureActionsFor === lecture.id;
+                    return (
+                      <tr key={lecture.id}>
+                        <td>
+                          <button
+                            type="button"
+                            className="admin-panel-lecture-link"
+                            onClick={() => handleOpenLecture(lecture.id)}
+                          >
+                            {lecture.name}
+                          </button>
+                        </td>
+                        <td className="admin-panel-cell--muted">{lecture.course_display || lecture.course_id}</td>
+                        <td className="admin-panel-cell--muted">{formatDate(lecture.created_at)}</td>
+                        <td className="admin-panel-actions admin-panel-actions--lectures">
+                          <button
+                            type="button"
+                            className="admin-panel-secondary-btn"
+                            aria-expanded={isActionsOpen}
+                            onClick={() => setOpenLectureActionsFor((current) => (current === lecture.id ? null : lecture.id))}
+                          >
+                            Actions
+                          </button>
+                          {isActionsOpen && (
+                            <div className="admin-panel-row-actions-menu">
+                              <button
+                                type="button"
+                                className="admin-panel-secondary-btn"
+                                onClick={() => {
+                                  setOpenLectureActionsFor(null);
+                                  handleOpenLecture(lecture.id);
+                                }}
+                              >
+                                Open
+                              </button>
+                              <button
+                                type="button"
+                                className="admin-panel-secondary-btn"
+                                disabled={actionInFlight === `regen-${lecture.id}`}
+                                onClick={() => {
+                                  setOpenLectureActionsFor(null);
+                                  void handleRegenerateNotes(lecture.id);
+                                }}
+                              >
+                                {actionInFlight === `regen-${lecture.id}` ? "Starting..." : "Regenerate notes"}
+                              </button>
+                              <button
+                                type="button"
+                                className="admin-panel-reject-btn"
+                                disabled={actionInFlight === `lecture-delete-${lecture.id}`}
+                                onClick={() => {
+                                  setOpenLectureActionsFor(null);
+                                  setDialog({
+                                    type: "confirm-delete",
+                                    lecture: { id: lecture.id, name: lecture.name },
+                                  });
+                                }}
+                              >
+                                {actionInFlight === `lecture-delete-${lecture.id}` ? "Deleting..." : "Delete"}
+                              </button>
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </>
@@ -682,7 +747,7 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
       )}
 
       {!loading && activeTab === "programs" && (
-        <section className="admin-panel-section">
+        <section className="admin-panel-section app-surface-item app-surface-item--3">
           <h2 className="admin-panel-section-title">
             Programs
             <button
@@ -733,34 +798,70 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
                 <th>Code</th>
                 <th>Name</th>
                 <th>Status</th>
-                <th>Actions</th>
+                <th className="admin-panel-actions-header">Actions</th>
               </tr>
             </thead>
             <tbody>
               {filteredPrograms.length === 0 && (
                 <tr><td colSpan={4} className="admin-panel-cell--muted">No programs match your search.</td></tr>
               )}
-              {filteredPrograms.map((program) => (
-                <tr key={program.id}>
-                  <td>{program.code}</td>
-                  <td>{program.name}</td>
-                  <td className="admin-panel-cell--muted">{program.is_active ? "Active" : "Inactive"}</td>
-                  <td className="admin-panel-actions">
-                    <button className="admin-panel-secondary-btn" onClick={() => setDialog({ type: "edit-program-code", program })}>Edit code</button>
-                    <button className="admin-panel-secondary-btn" onClick={() => setDialog({ type: "edit-program-name", program })}>Rename</button>
-                    <button className="admin-panel-secondary-btn" onClick={() => void handleToggleProgram(program)}>
-                      {program.is_active ? "Deactivate" : "Activate"}
-                    </button>
-                  </td>
-                </tr>
-              ))}
+              {filteredPrograms.map((program) => {
+                const isActionsOpen = openProgramActionsFor === program.id;
+                return (
+                  <tr key={program.id}>
+                    <td>{program.code}</td>
+                    <td>{program.name}</td>
+                    <td className="admin-panel-cell--muted">{program.is_active ? "Active" : "Inactive"}</td>
+                    <td className="admin-panel-actions admin-panel-actions--programs">
+                      <button
+                        className="admin-panel-secondary-btn"
+                        aria-expanded={isActionsOpen}
+                        onClick={() => setOpenProgramActionsFor((current) => (current === program.id ? null : program.id))}
+                      >
+                        Actions
+                      </button>
+                      {isActionsOpen && (
+                        <div className="admin-panel-row-actions-menu">
+                          <button
+                            className="admin-panel-secondary-btn"
+                            onClick={() => {
+                              setOpenProgramActionsFor(null);
+                              setDialog({ type: "edit-program-code", program });
+                            }}
+                          >
+                            Edit code
+                          </button>
+                          <button
+                            className="admin-panel-secondary-btn"
+                            onClick={() => {
+                              setOpenProgramActionsFor(null);
+                              setDialog({ type: "edit-program-name", program });
+                            }}
+                          >
+                            Rename
+                          </button>
+                          <button
+                            className="admin-panel-secondary-btn"
+                            onClick={() => {
+                              setOpenProgramActionsFor(null);
+                              void handleToggleProgram(program);
+                            }}
+                          >
+                            {program.is_active ? "Deactivate" : "Activate"}
+                          </button>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </section>
       )}
 
       {!loading && activeTab === "courses" && (
-        <section className="admin-panel-section">
+        <section className="admin-panel-section app-surface-item app-surface-item--3">
           <h2 className="admin-panel-section-title">
             Courses
             <button
@@ -818,36 +919,80 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
                 <th>Display</th>
                 <th>Name</th>
                 <th>Status</th>
-                <th>Actions</th>
+                <th className="admin-panel-actions-header">Actions</th>
               </tr>
             </thead>
             <tbody>
               {filteredCourses.length === 0 && (
                 <tr><td colSpan={5} className="admin-panel-cell--muted">No courses match your search.</td></tr>
               )}
-              {filteredCourses.map((course) => (
-                <tr key={course.id}>
-                  <td>{course.code}</td>
-                  <td>{course.display_code || "—"}</td>
-                  <td>{course.name}</td>
-                  <td className="admin-panel-cell--muted">{course.is_active ? "Active" : "Inactive"}</td>
-                  <td className="admin-panel-actions">
-                    <button className="admin-panel-secondary-btn" onClick={() => setDialog({ type: "edit-course-code", course })}>Edit CourseID</button>
-                    <button className="admin-panel-secondary-btn" onClick={() => setDialog({ type: "edit-course-display-code", course })}>Edit display</button>
-                    <button className="admin-panel-secondary-btn" onClick={() => setDialog({ type: "edit-course-name", course })}>Rename</button>
-                    <button className="admin-panel-secondary-btn" onClick={() => void handleToggleCourse(course)}>
-                      {course.is_active ? "Deactivate" : "Activate"}
-                    </button>
-                  </td>
-                </tr>
-              ))}
+              {filteredCourses.map((course) => {
+                const isActionsOpen = openCourseActionsFor === course.id;
+                return (
+                  <tr key={course.id}>
+                    <td>{course.code}</td>
+                    <td>{course.display_code || "—"}</td>
+                    <td>{course.name}</td>
+                    <td className="admin-panel-cell--muted">{course.is_active ? "Active" : "Inactive"}</td>
+                    <td className="admin-panel-actions admin-panel-actions--courses">
+                      <button
+                        className="admin-panel-secondary-btn"
+                        aria-expanded={isActionsOpen}
+                        onClick={() => setOpenCourseActionsFor((current) => (current === course.id ? null : course.id))}
+                      >
+                        Actions
+                      </button>
+                      {isActionsOpen && (
+                        <div className="admin-panel-row-actions-menu">
+                          <button
+                            className="admin-panel-secondary-btn"
+                            onClick={() => {
+                              setOpenCourseActionsFor(null);
+                              setDialog({ type: "edit-course-code", course });
+                            }}
+                          >
+                            Edit CourseID
+                          </button>
+                          <button
+                            className="admin-panel-secondary-btn"
+                            onClick={() => {
+                              setOpenCourseActionsFor(null);
+                              setDialog({ type: "edit-course-display-code", course });
+                            }}
+                          >
+                            Edit display
+                          </button>
+                          <button
+                            className="admin-panel-secondary-btn"
+                            onClick={() => {
+                              setOpenCourseActionsFor(null);
+                              setDialog({ type: "edit-course-name", course });
+                            }}
+                          >
+                            Rename
+                          </button>
+                          <button
+                            className="admin-panel-secondary-btn"
+                            onClick={() => {
+                              setOpenCourseActionsFor(null);
+                              void handleToggleCourse(course);
+                            }}
+                          >
+                            {course.is_active ? "Deactivate" : "Activate"}
+                          </button>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </section>
       )}
 
       {!loading && activeTab === "mappings" && (
-        <section className="admin-panel-section">
+        <section className="admin-panel-section app-surface-item app-surface-item--3">
           <h2 className="admin-panel-section-title">Program-course mappings</h2>
           <div className="admin-panel-mapping-toolbar">
             <label htmlFor="mapping-program-select">Program</label>
@@ -930,7 +1075,7 @@ export default function AdminPanel({ onBack }: AdminPanelProps) {
       )}
 
       {!loading && activeTab === "catalog" && (
-        <section className="admin-panel-section">
+        <section className="admin-panel-section app-surface-item app-surface-item--3">
           <h2 className="admin-panel-section-title">Catalog sync</h2>
           <p className="admin-panel-cell--muted admin-panel-sync-copy">
             Syncs current Stockholm University DSV catalog into programs, courses, mappings, and plan rows.

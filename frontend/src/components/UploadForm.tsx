@@ -1,9 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { getProfileCourseOptions } from "../api";
+import { useEffect, useRef, useState } from "react";
 import {
-  type Course,
-  type ProfileCourseOptions,
-  type UploadLectureNamingInput,
   type UploadRecordingInput,
 } from "../types";
 
@@ -14,7 +10,7 @@ interface ConsoleEntry {
 }
 
 interface Props {
-  onSubmit: (pdf: File, recording: UploadRecordingInput, naming: UploadLectureNamingInput) => void;
+  onSubmit: (pdf: File, recording: UploadRecordingInput) => void;
   loading: boolean;
   onRunDemo: () => void;
   progressPct?: number | null;
@@ -63,31 +59,6 @@ function FileSelectedIcon() {
 }
 
 const AUDIO_EXTENSIONS = /\.(mp4|mov|webm|wav|m4a|mp3)$/i;
-const URL_RECORDING_ENABLED = false;
-
-interface ProgramCourseGroupOption {
-  programId: number;
-  programLabel: string;
-  courses: Course[];
-}
-
-function normalizeCourseCode(value: string): string {
-  return value.trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
-}
-
-function studentCourseCode(course: Course): string {
-  return course.display_code?.trim() || course.code;
-}
-
-function dedupeCoursesByCode(courses: Course[]): Course[] {
-  const byCode = new Map<string, Course>();
-  for (const course of courses) {
-    const key = normalizeCourseCode(course.code);
-    if (!key || byCode.has(key)) continue;
-    byCode.set(key, course);
-  }
-  return [...byCode.values()].sort((a, b) => a.code.localeCompare(b.code, undefined, { sensitivity: "base" }));
-}
 
 interface DropZoneProps {
   label: string;
@@ -161,158 +132,17 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
   const consoleEndRef = useRef<HTMLDivElement>(null);
   const [pdfFile, setPdfFile] = useState<File | null>(null);
   const [audioFile, setAudioFile] = useState<File | null>(null);
-  const [recordingSource, setRecordingSource] = useState<"file" | "url">("file");
-  const [audioUrl, setAudioUrl] = useState("");
-  const [courseid, setCourseid] = useState("");
-  const [isCoursePickerOpen, setIsCoursePickerOpen] = useState(false);
-  const [expandedProgramIds, setExpandedProgramIds] = useState<number[]>([]);
-  const [profileOptions, setProfileOptions] = useState<ProfileCourseOptions | null>(null);
-  const [courseOptionsLoading, setCourseOptionsLoading] = useState(true);
-  const [courseOptionsError, setCourseOptionsError] = useState("");
-  const [kind, setKind] = useState("lecture");
-  const [lecture, setLecture] = useState("");
-  const [year, setYear] = useState("");
   const [pdfDragOver, setPdfDragOver] = useState(false);
   const [audioDragOver, setAudioDragOver] = useState(false);
   const [error, setError] = useState("");
   const [showHowItWorks, setShowHowItWorks] = useState(false);
-  const coursePickerRef = useRef<HTMLDivElement>(null);
+
   const pdfInputRef = useRef<HTMLInputElement>(null);
   const audioInputRef = useRef<HTMLInputElement>(null);
-  const effectiveRecordingSource: "file" | "url" = URL_RECORDING_ENABLED ? recordingSource : "file";
 
   useEffect(() => {
     consoleEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [consoleEntries]);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function loadCourseOptions() {
-      setCourseOptionsLoading(true);
-      setCourseOptionsError("");
-      try {
-        const nextOptions = await getProfileCourseOptions();
-        if (cancelled) return;
-        setProfileOptions(nextOptions);
-      } catch (err) {
-        if (cancelled) return;
-        setProfileOptions(null);
-        setCourseOptionsError(err instanceof Error ? err.message : "Failed to load course options.");
-      } finally {
-        if (!cancelled) {
-          setCourseOptionsLoading(false);
-        }
-      }
-    }
-
-    void loadCourseOptions();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const programCourseGroups = useMemo<ProgramCourseGroupOption[]>(() => {
-    const fromApi = profileOptions?.program_course_groups ?? [];
-    const allCourses = dedupeCoursesByCode(profileOptions?.all_courses ?? []);
-    if (fromApi.length > 0) {
-      const grouped: ProgramCourseGroupOption[] = [];
-      const groupedCodes = new Set<string>();
-      for (const group of fromApi) {
-        const courses = dedupeCoursesByCode(group.courses ?? []);
-        for (const course of courses) {
-          groupedCodes.add(normalizeCourseCode(course.code));
-        }
-        grouped.push({
-          programId: group.program.id,
-          programLabel: `${group.program.name} (${group.program.code})`,
-          courses,
-        });
-      }
-
-      const ungrouped = allCourses.filter((course) => !groupedCodes.has(normalizeCourseCode(course.code)));
-      if (ungrouped.length > 0) {
-        grouped.push({
-          programId: -1,
-          programLabel: "Other active courses",
-          courses: ungrouped,
-        });
-      }
-      return grouped;
-    }
-
-    if (allCourses.length === 0) {
-      return [];
-    }
-    return [
-      {
-        programId: -1,
-        programLabel: "All courses",
-        courses: allCourses,
-      },
-    ];
-  }, [profileOptions]);
-
-  useEffect(() => {
-    if (!courseid) return;
-    const exists = programCourseGroups.some((group) => group.courses.some((course) => course.code === courseid));
-    if (!exists) {
-      setCourseid("");
-    }
-  }, [courseid, programCourseGroups]);
-
-  const selectedCourse = useMemo(() => {
-    for (const group of programCourseGroups) {
-      const match = group.courses.find((course) => course.code === courseid);
-      if (match) {
-        return { group, course: match };
-      }
-    }
-    return null;
-  }, [courseid, programCourseGroups]);
-
-  useEffect(() => {
-    if (!isCoursePickerOpen || courseOptionsLoading || programCourseGroups.length === 0) return;
-
-    const validProgramIds = new Set(programCourseGroups.map((group) => group.programId));
-    setExpandedProgramIds((prev) => {
-      const filtered = prev.filter((programId) => validProgramIds.has(programId));
-      if (filtered.length > 0) return filtered;
-      if (selectedCourse) return [selectedCourse.group.programId];
-      return [];
-    });
-  }, [courseOptionsLoading, isCoursePickerOpen, programCourseGroups, selectedCourse]);
-
-  useEffect(() => {
-    if (!isCoursePickerOpen) return;
-
-    function handleDocumentClick(event: MouseEvent) {
-      if (!coursePickerRef.current?.contains(event.target as Node)) {
-        setIsCoursePickerOpen(false);
-      }
-    }
-
-    document.addEventListener("mousedown", handleDocumentClick);
-    return () => {
-      document.removeEventListener("mousedown", handleDocumentClick);
-    };
-  }, [isCoursePickerOpen]);
-
-  useEffect(() => {
-    if (loading || courseOptionsLoading || programCourseGroups.length === 0) {
-      setIsCoursePickerOpen(false);
-    }
-  }, [courseOptionsLoading, loading, programCourseGroups]);
-
-  function toggleProgramGroup(programId: number) {
-    setExpandedProgramIds((prev) => (prev.includes(programId) ? [] : [programId]));
-  }
-
-  function handleSelectCourse(code: string) {
-    setCourseid(code);
-    setError("");
-    setIsCoursePickerOpen(false);
-  }
 
   function makeDropHandler(
     mimeCheck: (file: File) => boolean,
@@ -326,7 +156,8 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
       const file = e.dataTransfer.files[0];
       if (!file) return;
       if (!mimeCheck(file)) { setError(errorMsg); return; }
-      setError(""); setFile(file);
+      setError("");
+      setFile(file);
     };
   }
 
@@ -350,60 +181,20 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
       setError("Please select a PDF file for slides.");
       return;
     }
-
-    let recording: UploadRecordingInput | null = null;
-    if (effectiveRecordingSource === "file") {
-      if (!audioFile) {
-        setError("Please select an audio or video file.");
-        return;
-      }
-      recording = { type: "file", file: audioFile };
-    } else {
-      const nextAudioUrl = audioUrl.trim();
-      if (!nextAudioUrl) {
-        setError("Please provide a recording URL.");
-        return;
-      }
-      try {
-        const parsed = new URL(nextAudioUrl);
-        if (parsed.protocol !== "https:") {
-          setError("Recording URL must use HTTPS.");
-          return;
-        }
-      } catch {
-        setError("Please provide a valid recording URL.");
-        return;
-      }
-      recording = { type: "url", url: nextAudioUrl };
-    }
-
-    const nextCourseid = courseid.trim();
-    const nextKind = kind.trim() || "lecture";
-    const nextLecture = lecture.trim();
-    const nextYear = year.trim();
-    if (!nextCourseid || !nextLecture || !nextYear) {
-      setError("Please fill in Course, Lecture, and Year.");
-      return;
-    }
-    if (!/^\d{4}$/.test(nextYear)) {
-      setError("Year must be exactly 4 digits.");
+    if (!audioFile) {
+      setError("Please select an audio or video file.");
       return;
     }
 
     setError("");
-    onSubmit(pdfFile, recording, {
-      courseid: nextCourseid,
-      kind: nextKind,
-      lecture: nextLecture,
-      year: nextYear,
-    });
+    onSubmit(pdfFile, { type: "file", file: audioFile });
   }
 
   return (
     <form className={`upload-form${loading ? " upload-form--loading" : ""}`} onSubmit={handleSubmit}>
       <h1 className="form-title">TeachersNote</h1>
       <p className="form-subtitle">
-        Upload lecture slides (PDF) and add a recording file or direct URL to generate an aligned transcript.
+        Upload lecture slides (PDF) and add a recording file to generate an aligned transcript.
       </p>
 
       <div className="form-info-box">
@@ -419,9 +210,9 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
         {showHowItWorks && (
           <div className="form-info-box-content">
             <p className="form-info-box-text">
-              Upload your lecture slides (PDF) and recording. Our system extracts the slide content, transcribes the
-              audio, and aligns each transcript segment to the corresponding slide. Then it generates rich notes and
-              takeaways for each slide.
+              Upload your lecture slides (PDF) and recording. The system extracts slide content, transcribes audio,
+              aligns transcript to slides, and creates a temporary lecture name from the first slide. Admin sets the
+              final canonical name before approval.
             </p>
             <button
               type="button"
@@ -433,130 +224,6 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
             </button>
           </div>
         )}
-      </div>
-
-      <div className="naming-fields">
-        <div className="naming-field naming-field--course">
-          <label className="drop-zone-label" htmlFor="courseid-input">Course</label>
-          <div className="course-picker" ref={coursePickerRef}>
-            <button
-              id="courseid-input"
-              type="button"
-              className={`course-picker-trigger${isCoursePickerOpen ? " course-picker-trigger--open" : ""}`}
-              disabled={loading || courseOptionsLoading || programCourseGroups.length === 0}
-              aria-haspopup="listbox"
-              aria-expanded={isCoursePickerOpen}
-              aria-controls="course-picker-menu"
-              onClick={() => setIsCoursePickerOpen((prev) => !prev)}
-            >
-              <span className={`course-picker-trigger-text${selectedCourse ? "" : " course-picker-trigger-text--placeholder"}`}>
-                {selectedCourse
-                  ? `${selectedCourse.course.name} (${studentCourseCode(selectedCourse.course)})`
-                  : (courseOptionsLoading ? "Loading courses..." : "Select a course")}
-              </span>
-              <span className="course-picker-trigger-chevron">▾</span>
-            </button>
-
-            {isCoursePickerOpen && !courseOptionsLoading && programCourseGroups.length > 0 && (
-              <div id="course-picker-menu" className="course-picker-popover" role="listbox" aria-label="Course picker">
-                {programCourseGroups.map((group) => {
-                  const isExpanded = expandedProgramIds.includes(group.programId);
-                  return (
-                    <div key={group.programId} className="course-picker-group">
-                      <button
-                        type="button"
-                        className={`course-picker-group-btn${isExpanded ? " course-picker-group-btn--open" : ""}`}
-                        onClick={() => toggleProgramGroup(group.programId)}
-                        aria-expanded={isExpanded}
-                      >
-                        <span className="course-picker-group-label">{group.programLabel}</span>
-                        <span className="course-picker-group-chevron">▾</span>
-                      </button>
-
-                      {isExpanded && (
-                        <div className="course-picker-course-list">
-                          {group.courses.length === 0 && (
-                            <p className="course-picker-empty">No courses mapped in this program.</p>
-                          )}
-                          {group.courses.map((course) => (
-                            <button
-                              key={`${group.programId}-${course.id}`}
-                              type="button"
-                              className={`course-picker-course-btn${course.code === courseid ? " course-picker-course-btn--active" : ""}`}
-                              onClick={() => handleSelectCourse(course.code)}
-                            >
-                              <span className="course-picker-course-name">{course.name}</span>
-                              <span className="course-picker-course-code">{studentCourseCode(course)}</span>
-                            </button>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-          {!courseOptionsLoading && programCourseGroups.length === 0 && !courseOptionsError && (
-            <p className="naming-field-hint naming-field-hint--error">
-              No catalog courses are available yet. Run catalog sync and refresh this page.
-            </p>
-          )}
-          {courseOptionsError && (
-            <p className="naming-field-hint naming-field-hint--error">{courseOptionsError}</p>
-          )}
-        </div>
-        <div className="naming-field">
-          <label className="drop-zone-label" htmlFor="kind-input">Kind</label>
-          <input
-            id="kind-input"
-            className="naming-input"
-            type="text"
-            value={kind}
-            disabled={loading}
-            autoComplete="off"
-            onChange={(e) => {
-              setKind(e.target.value);
-              setError("");
-            }}
-            placeholder="lecture"
-          />
-        </div>
-        <div className="naming-field">
-          <label className="drop-zone-label" htmlFor="lecture-input">Lecture</label>
-          <input
-            id="lecture-input"
-            className="naming-input"
-            type="text"
-            value={lecture}
-            disabled={loading}
-            autoComplete="off"
-            onChange={(e) => {
-              setLecture(e.target.value);
-              setError("");
-            }}
-            placeholder="3"
-          />
-        </div>
-        <div className="naming-field">
-          <label className="drop-zone-label" htmlFor="year-input">Year</label>
-          <input
-            id="year-input"
-            className="naming-input"
-            type="text"
-            value={year}
-            disabled={loading}
-            autoComplete="off"
-            inputMode="numeric"
-            pattern="[0-9]{4}"
-            maxLength={4}
-            onChange={(e) => {
-              setYear(e.target.value);
-              setError("");
-            }}
-            placeholder="2026"
-          />
-        </div>
       </div>
 
       <DropZone
@@ -576,77 +243,22 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
         onClear={() => { setPdfFile(null); if (pdfInputRef.current) pdfInputRef.current.value = ""; }}
       />
 
-      <div className="recording-source">
-        <div className="drop-zone-label">Recording Source</div>
-        <div className="recording-source-options">
-          <label className="recording-source-option">
-            <input
-              type="radio"
-              name="recording-source"
-              value="file"
-              checked={recordingSource === "file"}
-              disabled={loading}
-              onChange={() => {
-                setError("");
-                setRecordingSource("file");
-              }}
-            />
-            Upload File
-          </label>
-          <label className={`recording-source-option${URL_RECORDING_ENABLED ? "" : " recording-source-option--disabled"}`}>
-            <input
-              type="radio"
-              name="recording-source"
-              value="url"
-              checked={recordingSource === "url"}
-              disabled={loading || !URL_RECORDING_ENABLED}
-              onChange={() => {
-                if (!URL_RECORDING_ENABLED) return;
-                setError("");
-                setRecordingSource("url");
-              }}
-            />
-            Paste URL {!URL_RECORDING_ENABLED ? "(Unavailable)" : ""}
-          </label>
-        </div>
-      </div>
-
-      {effectiveRecordingSource === "file" ? (
-        <DropZone
-          label="Video / Audio"
-          accept=".mp4,.mov,.webm,.wav,.m4a,.mp3"
-          file={audioFile}
-          dragOver={audioDragOver}
-          loading={loading}
-          icon={<AudioIcon />}
-          dropTitle="Drop audio/video here or click to browse"
-          dropHint="Drag and drop your recording"
-          dropAccepts="Accepts: .mp4 .mov .webm .wav .m4a .mp3"
-          inputRef={audioInputRef}
-          onDrop={handleAudioDrop}
-          onDragOver={setAudioDragOver}
-          onFileChange={file => { setError(""); setAudioFile(file); }}
-          onClear={() => { setAudioFile(null); if (audioInputRef.current) audioInputRef.current.value = ""; }}
-        />
-      ) : (
-        <div className="drop-zone-wrapper">
-          <label className="drop-zone-label" htmlFor="audio-url-input">Recording URL</label>
-          <input
-            id="audio-url-input"
-            className="naming-input recording-url-input"
-            type="url"
-            value={audioUrl}
-            disabled={loading}
-            autoComplete="off"
-            onChange={(e) => {
-              setAudioUrl(e.target.value);
-              setError("");
-            }}
-            placeholder="https://example.org/lecture.mp4?token=..."
-          />
-          <div className="recording-url-hint">Use a direct media file URL (.mp4, .mov, .webm, .wav, .m4a, .mp3).</div>
-        </div>
-      )}
+      <DropZone
+        label="Video / Audio"
+        accept=".mp4,.mov,.webm,.wav,.m4a,.mp3"
+        file={audioFile}
+        dragOver={audioDragOver}
+        loading={loading}
+        icon={<AudioIcon />}
+        dropTitle="Drop audio/video here or click to browse"
+        dropHint="Drag and drop your recording"
+        dropAccepts="Accepts: .mp4 .mov .webm .wav .m4a .mp3"
+        inputRef={audioInputRef}
+        onDrop={handleAudioDrop}
+        onDragOver={setAudioDragOver}
+        onFileChange={file => { setError(""); setAudioFile(file); }}
+        onClear={() => { setAudioFile(null); if (audioInputRef.current) audioInputRef.current.value = ""; }}
+      />
 
       {error && <p className="form-error">{error}</p>}
 
@@ -656,12 +268,8 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
           className="submit-btn"
           disabled={
             loading
-            || courseOptionsLoading
             || !pdfFile
-            || (effectiveRecordingSource === "file" ? !audioFile : !audioUrl.trim())
-            || !courseid.trim()
-            || !lecture.trim()
-            || !year.trim()
+            || !audioFile
           }
         >
           {loading ? <span className="spinner spinner--dark" /> : "Process Lecture"}

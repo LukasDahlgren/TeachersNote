@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { isEnrichedSlideInvalid, type Segment, type EnrichedSlide } from "../types";
 
 interface Props {
@@ -13,6 +13,7 @@ function formatTime(seconds: number): string {
 }
 
 const BULLET_PREFIX_REGEX = /^(?:[-*•]\s+|\d+[.)]\s+)/;
+const BOLD_MARKER_REGEX = /\*\*(.+?)\*\*/g;
 
 function splitBulletLines(text: string): string[] {
   const lines = text
@@ -84,6 +85,37 @@ function parseSlideContentBullets(text: string): string[] {
   return lines.length > 1 ? lines : [];
 }
 
+function renderWithBold(text: string): ReactNode {
+  if (!text.includes("**")) return text;
+
+  const nodes: ReactNode[] = [];
+  let lastIndex = 0;
+  let boldKey = 0;
+
+  for (const match of text.matchAll(BOLD_MARKER_REGEX)) {
+    const index = match.index ?? -1;
+    if (index < 0) continue;
+
+    if (index > lastIndex) {
+      nodes.push(text.slice(lastIndex, index));
+    }
+
+    const boldPart = match[1] ?? "";
+    if (boldPart) {
+      nodes.push(<strong key={`bold-${boldKey}`}>{boldPart}</strong>);
+      boldKey += 1;
+    }
+
+    lastIndex = index + match[0].length;
+  }
+
+  if (lastIndex < text.length) {
+    nodes.push(text.slice(lastIndex));
+  }
+
+  return nodes.length > 0 ? nodes : text;
+}
+
 export default function TranscriptPanel({ segments, enriched }: Props) {
   const topRef = useRef<HTMLDivElement>(null);
   const [tab, setTab] = useState<"transcript" | "notes">("notes");
@@ -142,7 +174,7 @@ export default function TranscriptPanel({ segments, enriched }: Props) {
             <p className="empty">Notes for this slide are invalid or empty. Regenerate is currently unavailable.</p>
           ) : (
             <div className="notes">
-              <p className="notes-summary">{enriched.summary}</p>
+              <p className="notes-summary">{renderWithBold(enriched.summary)}</p>
 
               {enriched.slide_content && (
                 <section className="notes-section">
@@ -150,11 +182,11 @@ export default function TranscriptPanel({ segments, enriched }: Props) {
                   {slideContentBullets.length > 0 ? (
                     <ul className="notes-list slide-content-list">
                       {slideContentBullets.map((item, index) => (
-                        <li key={index}>{item}</li>
+                        <li key={index}>{renderWithBold(item)}</li>
                       ))}
                     </ul>
                   ) : (
-                    <p>{enriched.slide_content}</p>
+                    <p>{renderWithBold(enriched.slide_content)}</p>
                   )}
                 </section>
               )}
@@ -165,11 +197,11 @@ export default function TranscriptPanel({ segments, enriched }: Props) {
                   {lecturerBullets.length > 0 ? (
                     <ul className="notes-list lecturer-list">
                       {lecturerBullets.map((item, index) => (
-                        <li key={index}>{item}</li>
+                        <li key={index}>{renderWithBold(item)}</li>
                       ))}
                     </ul>
                   ) : (
-                    <p>{enriched.lecturer_additions}</p>
+                    <p>{renderWithBold(enriched.lecturer_additions)}</p>
                   )}
                 </section>
               )}
@@ -179,7 +211,7 @@ export default function TranscriptPanel({ segments, enriched }: Props) {
                   <h3>✅ Key Takeaways</h3>
                   <ul className="takeaways-list">
                     {enriched.key_takeaways.map((t, i) => (
-                      <li key={i}>{t}</li>
+                      <li key={i}>{renderWithBold(t)}</li>
                     ))}
                   </ul>
                 </section>

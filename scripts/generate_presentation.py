@@ -21,6 +21,7 @@ NOTES_BG = RGBColor(0xF5, 0xF7, 0xFA)
 HEADER_COLOR = RGBColor(0x0F, 0x4C, 0x81)
 BODY_COLOR = RGBColor(0x22, 0x29, 0x36)
 BULLET_PREFIX_RE = re.compile(r"^\s*(?:[-*•]\s+|\d+[.)]\s+)")
+BOLD_MARKER_RE = re.compile(r"\*\*(.+?)\*\*")
 
 
 def pdf_to_images(pdf_path: str, dpi: int = 150) -> list[tuple[bytes, float]]:
@@ -75,6 +76,51 @@ def _bulletize_text(text: str) -> list[str]:
     compact = " ".join(normalized.split())
     parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+|;\s+", compact) if p.strip()]
     return parts or ([compact] if compact else [])
+
+
+def _markdown_segments(text: str) -> list[tuple[str, bool]]:
+    if not text:
+        return []
+
+    segments: list[tuple[str, bool]] = []
+    last = 0
+    for match in BOLD_MARKER_RE.finditer(text):
+        start, end = match.span()
+        if start > last:
+            segments.append((text[last:start], False))
+        bold_text = match.group(1).strip()
+        if bold_text:
+            segments.append((bold_text, True))
+        last = end
+
+    if last < len(text):
+        segments.append((text[last:], False))
+
+    if not segments:
+        return [(text, False)]
+    return segments
+
+
+def _add_markdown_runs(paragraph, text: str, *, font_size: Pt, color: RGBColor, prefix: str = "") -> None:
+    if prefix:
+        run = paragraph.add_run()
+        run.text = prefix
+        run.font.size = font_size
+        run.font.color.rgb = color
+        run.font.bold = False
+
+    segments = _markdown_segments(text)
+    if not segments:
+        return
+
+    for chunk, is_bold in segments:
+        if not chunk:
+            continue
+        run = paragraph.add_run()
+        run.text = chunk
+        run.font.size = font_size
+        run.font.color.rgb = color
+        run.font.bold = bool(is_bold)
 
 
 def build_speaker_notes(entry: dict) -> str:
@@ -154,19 +200,24 @@ def _add_notes_panel(slide, entry: dict) -> None:
         p = tf.add_paragraph()
         p.space_before = Pt(0)
         p.space_after = Pt(2)
-        run = p.add_run()
-        run.text = text
-        run.font.size = Pt(10.5)
-        run.font.color.rgb = BODY_COLOR
+        _add_markdown_runs(
+            p,
+            text,
+            font_size=Pt(10.5),
+            color=BODY_COLOR,
+        )
 
     def _add_bullet(text: str) -> None:
         p = tf.add_paragraph()
         p.space_before = Pt(0)
         p.space_after = Pt(2)
-        run = p.add_run()
-        run.text = f"• {text}"
-        run.font.size = Pt(10.5)
-        run.font.color.rgb = BODY_COLOR
+        _add_markdown_runs(
+            p,
+            text,
+            font_size=Pt(10.5),
+            color=BODY_COLOR,
+            prefix="• ",
+        )
 
     # Section 1: SAMMANFATTNING
     summary = entry.get("summary", "").strip()
@@ -188,6 +239,50 @@ def _add_notes_panel(slide, entry: dict) -> None:
         _add_header("KEY TAKEAWAYS")
         for t in takeaways:
             _add_bullet(t)
+
+
+def _add_speaker_notes(slide, entry: dict) -> None:
+    tf = slide.notes_slide.notes_text_frame
+    tf.clear()
+
+    summary = entry.get("summary", "").strip()
+    lecturer_bullets = _bulletize_text(entry.get("lecturer_additions", "") or "")
+    takeaways = [str(t).strip() for t in entry.get("key_takeaways", []) if str(t).strip()]
+
+    def _header(label: str, *, first: bool = False) -> None:
+        p = tf.paragraphs[0] if first else tf.add_paragraph()
+        p.space_before = Pt(0) if first else Pt(6)
+        p.space_after = Pt(2)
+        run = p.add_run()
+        run.text = label
+        run.font.size = Pt(11)
+        run.font.bold = True
+
+    def _line(text: str, *, prefix: str = "") -> None:
+        p = tf.add_paragraph()
+        p.space_before = Pt(0)
+        p.space_after = Pt(1)
+        _add_markdown_runs(
+            p,
+            text,
+            font_size=Pt(11),
+            color=BODY_COLOR,
+            prefix=prefix,
+        )
+
+    _header("SAMMANFATTNING:", first=True)
+    if summary:
+        _line(summary)
+
+    if lecturer_bullets:
+        _header("FÖRELÄSARENS TILLÄGG:")
+        for item in lecturer_bullets:
+            _line(item, prefix="• ")
+
+    if takeaways:
+        _header("KEY TAKEAWAYS:")
+        for item in takeaways:
+            _line(item, prefix="• ")
 
 
 def generate(pdf_path: str, enhanced_path: str, output_path: str) -> None:
@@ -214,12 +309,7 @@ def generate(pdf_path: str, enhanced_path: str, output_path: str) -> None:
         if entry:
             _add_notes_panel(slide, entry)
             # Also keep speaker notes for compatibility
-            notes_text = build_speaker_notes(entry)
-            tf = slide.notes_slide.notes_text_frame
-            tf.text = notes_text
-            for para in tf.paragraphs:
-                for run in para.runs:
-                    run.font.size = Pt(11)
+            _add_speaker_notes(slide, entry)
 
         print(f"  Slide {i}/{len(images)} done")
 

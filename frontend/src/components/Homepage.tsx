@@ -349,8 +349,8 @@ export default function Homepage({
   const programOptions = profileOptions?.programs ?? [];
 
   return (
-    <section className="homepage homepage--catalog">
-      <div className="homepage-search-shell">
+    <section className="homepage homepage--catalog app-surface app-surface--stagger">
+      <div className="homepage-search-shell app-surface-item app-surface-item--1">
         <input
           type="search"
           className="homepage-search-input"
@@ -361,7 +361,9 @@ export default function Homepage({
       </div>
 
       {currentProgram ? (
-        <section className="homepage-program-inline">
+        <section
+          className={`homepage-program-inline app-surface-item app-surface-item--2${isProgramMenuOpen ? " homepage-program-inline--open" : ""}`}
+        >
           <div className="homepage-program-inline-summary">
             <span className="homepage-program-inline-label">Program</span>
             <strong className="homepage-program-inline-value">
@@ -428,7 +430,7 @@ export default function Homepage({
           )}
         </section>
       ) : (
-        <section className="homepage-profile-section">
+        <section className="homepage-profile-section app-surface-item app-surface-item--2">
           {!profileLoading && (
             <div className="homepage-profile-setup-card">
               <h3>Select your program</h3>
@@ -479,7 +481,7 @@ export default function Homepage({
         </section>
       )}
 
-      <section className="homepage-section">
+      <section className="homepage-section app-surface-item app-surface-item--3">
         <div className="homepage-section-heading">
           <h2>My saved lectures</h2>
           <span>{filteredSavedLectures.length}{mySavedActiveLectures.length !== filteredSavedLectures.length ? ` / ${mySavedActiveLectures.length}` : ""}</span>
@@ -511,7 +513,7 @@ export default function Homepage({
       </section>
 
       {currentProgram && (
-        <section className="homepage-section">
+        <section className="homepage-section app-surface-item app-surface-item--4">
           <div className="homepage-section-heading">
             <h2>My courses</h2>
             <span>
@@ -552,7 +554,7 @@ export default function Homepage({
         </section>
       )}
 
-      <section className="homepage-section">
+      <section className="homepage-section app-surface-item app-surface-item--5">
         <div className="homepage-section-heading">
           <h2>Courses</h2>
           <span>{filteredAllLectureCount}{acceptedAllLectures.length !== filteredAllLectureCount ? ` / ${acceptedAllLectures.length}` : ""}</span>

@@ -10,7 +10,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from pydantic import BaseModel
@@ -112,6 +112,7 @@ UPLOAD_JOB_STORE: dict[str, dict[str, Any]] = {}
 ACTIVE_UPLOAD_JOB_IDS: dict[str, str] = {}  # user_id → job_id
 UPLOAD_JOB_LOCK = asyncio.Lock()
 DEMO_LECTURE_NAME = "IB133N-lecture-14-2026"
+ALLOWED_CANONICAL_KINDS = {"lecture", "other"}
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
@@ -237,6 +238,71 @@ def _build_standard_stem(courseid: str, kind: str, lecture: str, year: str) -> s
     return f"{courseid}-{kind}-{lecture}-{year}"
 
 
+class UploadNamingResolution(NamedTuple):
+    lecture_name: str
+    pptx_path: Path
+    saved_pdf_path: Path
+    courseid: str
+    kind: str
+    lecture: str
+    year: str
+
+
+class UploadRawNaming(NamedTuple):
+    courseid: str | None
+    kind: str | None
+    lecture: str | None
+    year: str | None
+
+
+class UploadSubmissionResolution(NamedTuple):
+    lecture_name: str
+    pptx_path: Path
+    saved_pdf_path: Path
+    courseid: str | None
+    kind: str | None
+    lecture: str | None
+    year: str | None
+    raw: UploadRawNaming
+    temporary_name_seed: str | None
+
+
+def _parse_standard_upload_name(name: str) -> tuple[str, str, str, str] | None:
+    stem = Path(name).stem.strip()
+    if not stem:
+        return None
+
+    parts = stem.split("-")
+    if len(parts) < 4:
+        return None
+
+    maybe_year = parts[-1]
+    maybe_suffix = parts[-1] if len(parts) >= 5 else None
+    has_numeric_suffix = maybe_suffix is not None and maybe_suffix.isdigit()
+    if maybe_year.isdigit() and len(maybe_year) == 4:
+        body_parts = parts[:-1]
+    elif has_numeric_suffix and parts[-2].isdigit() and len(parts[-2]) == 4:
+        maybe_year = parts[-2]
+        body_parts = parts[:-2]
+    else:
+        return None
+
+    if len(body_parts) < 3:
+        return None
+
+    courseid = _normalize_courseid(body_parts[0])
+    kind = _normalize_kind(body_parts[1])
+    lecture = _normalize_lecture("-".join(body_parts[2:]))
+    year = maybe_year
+    if not courseid or not kind or not lecture:
+        return None
+    try:
+        normalized_year = _validate_year(year)
+    except ValueError:
+        return None
+    return courseid, kind, lecture, normalized_year
+
+
 def _build_unique_generated_paths(stem: str) -> tuple[Path, Path, str]:
     candidate_stem = stem
     counter = 2
@@ -251,17 +317,28 @@ def _build_unique_generated_paths(stem: str) -> tuple[Path, Path, str]:
         counter += 1
 
 
-def _resolve_upload_naming(courseid: str, kind: str, lecture: str, year: str) -> tuple[str, Path, Path, str]:
+def _normalize_upload_naming_fields(
+    courseid: str,
+    kind: str,
+    lecture: str,
+    year: str,
+    *,
+    strict_kind: bool = False,
+) -> tuple[str, str, str, str]:
     raw_kind = (kind or "").strip()
-    if not raw_kind:
+    if strict_kind:
+        normalized_kind = _normalize_kind(raw_kind)
+        if not normalized_kind or normalized_kind not in ALLOWED_CANONICAL_KINDS:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid kind: must be one of lecture, other.",
+            )
+    elif not raw_kind:
         normalized_kind = "lecture"
     else:
         normalized_kind = _normalize_kind(raw_kind)
-        if not normalized_kind:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid kind: provide at least one letter or number.",
-            )
+        if normalized_kind not in ALLOWED_CANONICAL_KINDS:
+            normalized_kind = "other"
 
     normalized_courseid = _normalize_courseid(courseid)
     if not normalized_courseid:
@@ -282,9 +359,115 @@ def _resolve_upload_naming(courseid: str, kind: str, lecture: str, year: str) ->
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    return normalized_courseid, normalized_kind, normalized_lecture, normalized_year
+
+
+def _raw_upload_naming_fields(courseid: str, kind: str, lecture: str, year: str) -> UploadRawNaming:
+    return UploadRawNaming(
+        courseid=(courseid or "").strip() or None,
+        kind=(kind or "").strip() or None,
+        lecture=(lecture or "").strip() or None,
+        year=(year or "").strip() or None,
+    )
+
+
+def _temporary_upload_stem_from_filename(filename: str | None) -> str:
+    raw = Path(filename or "").stem
+    normalized = _normalize_lecture(raw) or "upload"
+    return f"pending-{normalized[:48]}-{uuid.uuid4().hex[:8]}"
+
+
+def _temporary_lecture_token_from_slides(slides: list[dict]) -> str | None:
+    for slide in slides:
+        text = str(slide.get("text") or "").strip()
+        if not text:
+            continue
+        first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        token = _normalize_lecture(first_line)
+        if token:
+            return token[:72]
+    return None
+
+
+def _derive_temporary_lecture_name(slides: list[dict], fallback_seed: str | None) -> str:
+    fallback = _normalize_lecture(fallback_seed or "") or "upload"
+    token = _temporary_lecture_token_from_slides(slides) or fallback
+    return f"pending-{token[:72]}-{uuid.uuid4().hex[:6]}"
+
+
+def _resolve_upload_naming(courseid: str, kind: str, lecture: str, year: str) -> UploadNamingResolution:
+    normalized_courseid, normalized_kind, normalized_lecture, normalized_year = _normalize_upload_naming_fields(
+        courseid,
+        kind,
+        lecture,
+        year,
+    )
     stem = _build_standard_stem(normalized_courseid, normalized_kind, normalized_lecture, normalized_year)
     pptx_path, saved_pdf_path, final_stem = _build_unique_generated_paths(stem)
-    return final_stem, pptx_path, saved_pdf_path, normalized_courseid
+    return UploadNamingResolution(
+        lecture_name=final_stem,
+        pptx_path=pptx_path,
+        saved_pdf_path=saved_pdf_path,
+        courseid=normalized_courseid,
+        kind=normalized_kind,
+        lecture=normalized_lecture,
+        year=normalized_year,
+    )
+
+
+def _resolve_upload_submission_naming(
+    *,
+    courseid: str | None,
+    kind: str | None,
+    lecture: str | None,
+    year: str | None,
+    pdf_filename: str | None,
+) -> UploadSubmissionResolution:
+    raw = _raw_upload_naming_fields(courseid or "", kind or "", lecture or "", year or "")
+    has_any_input = any((raw.courseid, raw.kind, raw.lecture, raw.year))
+    has_required_fields = bool(raw.courseid and raw.lecture and raw.year)
+
+    if has_any_input and not has_required_fields:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Provide all naming fields (courseid, lecture, year) "
+                "or leave all naming fields empty for temporary naming."
+            ),
+        )
+
+    if has_required_fields:
+        resolved = _resolve_upload_naming(
+            raw.courseid or "",
+            raw.kind or "lecture",
+            raw.lecture or "",
+            raw.year or "",
+        )
+        return UploadSubmissionResolution(
+            lecture_name=resolved.lecture_name,
+            pptx_path=resolved.pptx_path,
+            saved_pdf_path=resolved.saved_pdf_path,
+            courseid=resolved.courseid,
+            kind=resolved.kind,
+            lecture=resolved.lecture,
+            year=resolved.year,
+            raw=raw,
+            temporary_name_seed=None,
+        )
+
+    temp_stem = _temporary_upload_stem_from_filename(pdf_filename)
+    pptx_path, saved_pdf_path, final_stem = _build_unique_generated_paths(temp_stem)
+    return UploadSubmissionResolution(
+        lecture_name=final_stem,
+        pptx_path=pptx_path,
+        saved_pdf_path=saved_pdf_path,
+        courseid=None,
+        kind=None,
+        lecture=None,
+        year=None,
+        raw=raw,
+        temporary_name_seed=temp_stem,
+    )
 
 
 def _resolve_recording_source_or_400(
@@ -449,6 +632,15 @@ def _resolve_course_display(
     return override or fallback
 
 
+def _upload_naming_raw_payload(lecture: Lecture) -> dict[str, str | None]:
+    return {
+        "courseid": (lecture.upload_courseid_raw or "").strip() or None,
+        "kind": (lecture.upload_kind_raw or "").strip() or None,
+        "lecture": (lecture.upload_lecture_raw or "").strip() or None,
+        "year": (lecture.upload_year_raw or "").strip() or None,
+    }
+
+
 def _teachers_note_payload(
     lecture: Lecture,
     *,
@@ -464,12 +656,37 @@ def _teachers_note_payload(
         "is_approved": bool(lecture.is_approved),
         "course_id": lecture.course_id,
         "course_display": course_display,
+        "naming_kind": lecture.naming_kind,
+        "naming_lecture": lecture.naming_lecture,
+        "naming_year": lecture.naming_year,
+        "upload_naming_raw": _upload_naming_raw_payload(lecture),
         "uploaded_by": lecture.uploaded_by,
         "is_saved": is_saved,
         "pptx_path": lecture.pptx_path,
         "pdf_url": _lecture_file_urls(lecture)["pdf_url"],
         "created_at": lecture.created_at.isoformat(),
     }
+
+
+def _lecture_naming_snapshot(lecture: Lecture) -> tuple[str | None, str | None, str | None, str | None]:
+    courseid = _normalize_optional_catalog_code(lecture.course_id)
+    kind = (lecture.naming_kind or "").strip() or None
+    lecture_part = (lecture.naming_lecture or "").strip() or None
+    year = (lecture.naming_year or "").strip() or None
+    if courseid and kind and lecture_part and year:
+        return courseid, kind, lecture_part, year
+
+    parsed = _parse_standard_upload_name(lecture.name)
+    if not parsed:
+        return courseid, kind, lecture_part, year
+
+    parsed_courseid, parsed_kind, parsed_lecture, parsed_year = parsed
+    return (
+        courseid or parsed_courseid,
+        kind or parsed_kind,
+        lecture_part or parsed_lecture,
+        year or parsed_year,
+    )
 
 
 def _program_payload(program: Program) -> dict[str, Any]:
@@ -1208,6 +1425,14 @@ async def _run_process_job(
     audio_url: str | None = None,
     lecture_name: str,
     course_id: str | None,
+    naming_kind: str | None,
+    naming_lecture: str | None,
+    naming_year: str | None,
+    upload_courseid_raw: str | None,
+    upload_kind_raw: str | None,
+    upload_lecture_raw: str | None,
+    upload_year_raw: str | None,
+    temporary_name_seed: str | None,
     pptx_path: Path,
     saved_pdf_path: Path,
     user_id: str,
@@ -1287,6 +1512,11 @@ async def _run_process_job(
             str(pptx_path),
             emit,
         )
+        resolved_lecture_name = (
+            _derive_temporary_lecture_name(result["slides"], temporary_name_seed)
+            if temporary_name_seed
+            else lecture_name
+        )
 
         await _update_upload_job(
             job_id,
@@ -1302,7 +1532,7 @@ async def _run_process_job(
         async with AsyncSessionLocal() as db:
             lecture_id = await save_lecture_to_db(
                 db=db,
-                name=lecture_name,
+                name=resolved_lecture_name,
                 slides=result["slides"],
                 transcript=result["transcript"],
                 alignment=result["alignment"],
@@ -1310,6 +1540,13 @@ async def _run_process_job(
                 pptx_path=str(pptx_path.relative_to(BACKEND_DIR)),
                 pdf_path=str(saved_pdf_path.relative_to(BACKEND_DIR)),
                 course_id=course_id,
+                naming_kind=naming_kind,
+                naming_lecture=naming_lecture,
+                naming_year=naming_year,
+                upload_courseid_raw=upload_courseid_raw,
+                upload_kind_raw=upload_kind_raw,
+                upload_lecture_raw=upload_lecture_raw,
+                upload_year_raw=upload_year_raw,
                 is_demo=False,
                 saved_user_id=user_id,
                 uploaded_by=user_id,
@@ -1354,6 +1591,13 @@ async def save_lecture_to_db(
     pptx_path: str | None,
     pdf_path: str | None = None,
     course_id: str | None = None,
+    naming_kind: str | None = None,
+    naming_lecture: str | None = None,
+    naming_year: str | None = None,
+    upload_courseid_raw: str | None = None,
+    upload_kind_raw: str | None = None,
+    upload_lecture_raw: str | None = None,
+    upload_year_raw: str | None = None,
     is_demo: bool = False,
     saved_user_id: str | None = None,
     uploaded_by: str | None = None,
@@ -1365,6 +1609,13 @@ async def save_lecture_to_db(
         is_demo=is_demo,
         is_approved=is_demo,  # Demo lectures are pre-approved; uploads require admin approval
         course_id=course_id,
+        naming_kind=naming_kind,
+        naming_lecture=naming_lecture,
+        naming_year=naming_year,
+        upload_courseid_raw=upload_courseid_raw,
+        upload_kind_raw=upload_kind_raw,
+        upload_lecture_raw=upload_lecture_raw,
+        upload_year_raw=upload_year_raw,
         uploaded_by=uploaded_by,
         pptx_path=pptx_path,
         pdf_path=pdf_path,
@@ -1580,13 +1831,20 @@ async def start_process_job(
     pdf: UploadFile = File(...),
     audio: UploadFile | None = File(None),
     audio_url: str | None = Form(None),
-    courseid: str = Form(...),
-    kind: str = Form("lecture"),
-    lecture: str = Form(...),
-    year: str = Form(...),
+    courseid: str | None = Form(None),
+    kind: str | None = Form(None),
+    lecture: str | None = Form(None),
+    year: str | None = Form(None),
     current_user: User = Depends(get_current_user),
 ):
     user_id = current_user.uuid
+    submission_naming = _resolve_upload_submission_naming(
+        courseid=courseid,
+        kind=kind,
+        lecture=lecture,
+        year=year,
+        pdf_filename=pdf.filename,
+    )
     await _cleanup_expired_upload_jobs()
     active_job = await _get_active_upload_job(user_id)
     if active_job:
@@ -1598,7 +1856,6 @@ async def start_process_job(
             },
         )
 
-    lecture_name, pptx_path, saved_pdf_path, normalized_courseid = _resolve_upload_naming(courseid, kind, lecture, year)
     recording_source, resolved_audio_url = _resolve_recording_source_or_400(audio=audio, audio_url=audio_url)
     validated_audio_url: str | None = None
     if recording_source == "url":
@@ -1660,10 +1917,18 @@ async def start_process_job(
             audio_path=audio_path,
             recording_source=recording_source,
             audio_url=validated_audio_url,
-            lecture_name=lecture_name,
-            course_id=normalized_courseid,
-            pptx_path=pptx_path,
-            saved_pdf_path=saved_pdf_path,
+            lecture_name=submission_naming.lecture_name,
+            course_id=submission_naming.courseid,
+            naming_kind=submission_naming.kind,
+            naming_lecture=submission_naming.lecture,
+            naming_year=submission_naming.year,
+            upload_courseid_raw=submission_naming.raw.courseid,
+            upload_kind_raw=submission_naming.raw.kind,
+            upload_lecture_raw=submission_naming.raw.lecture,
+            upload_year_raw=submission_naming.raw.year,
+            temporary_name_seed=submission_naming.temporary_name_seed,
+            pptx_path=submission_naming.pptx_path,
+            saved_pdf_path=submission_naming.saved_pdf_path,
             user_id=user_id,
         )
     )
@@ -1760,15 +2025,21 @@ async def process(
     pdf: UploadFile = File(...),
     audio: UploadFile | None = File(None),
     audio_url: str | None = Form(None),
-    courseid: str = Form(...),
-    kind: str = Form("lecture"),
-    lecture: str = Form(...),
-    year: str = Form(...),
+    courseid: str | None = Form(None),
+    kind: str | None = Form(None),
+    lecture: str | None = Form(None),
+    year: str | None = Form(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     user_id = current_user.uuid
-    lecture_name, pptx_path, saved_pdf_path, normalized_courseid = _resolve_upload_naming(courseid, kind, lecture, year)
+    submission_naming = _resolve_upload_submission_naming(
+        courseid=courseid,
+        kind=kind,
+        lecture=lecture,
+        year=year,
+        pdf_filename=pdf.filename,
+    )
     recording_source, resolved_audio_url = _resolve_recording_source_or_400(audio=audio, audio_url=audio_url)
     validated_audio_url: str | None = None
     if recording_source == "url":
@@ -1805,23 +2076,36 @@ async def process(
 
         try:
             result = await run_in_threadpool(
-                run_pipeline, str(pdf_path), str(audio_path), str(pptx_path)
+                run_pipeline, str(pdf_path), str(audio_path), str(submission_naming.pptx_path)
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
-        shutil.copy2(pdf_path, saved_pdf_path)
+        shutil.copy2(pdf_path, submission_naming.saved_pdf_path)
+
+    resolved_lecture_name = (
+        _derive_temporary_lecture_name(result["slides"], submission_naming.temporary_name_seed)
+        if submission_naming.temporary_name_seed
+        else submission_naming.lecture_name
+    )
 
     lecture_id = await save_lecture_to_db(
         db=db,
-        name=lecture_name,
+        name=resolved_lecture_name,
         slides=result["slides"],
         transcript=result["transcript"],
         alignment=result["alignment"],
         enhanced=result["enhanced"],
-        pptx_path=str(pptx_path.relative_to(BACKEND_DIR)),
-        pdf_path=str(saved_pdf_path.relative_to(BACKEND_DIR)),
-        course_id=normalized_courseid,
+        pptx_path=str(submission_naming.pptx_path.relative_to(BACKEND_DIR)),
+        pdf_path=str(submission_naming.saved_pdf_path.relative_to(BACKEND_DIR)),
+        course_id=submission_naming.courseid,
+        naming_kind=submission_naming.kind,
+        naming_lecture=submission_naming.lecture,
+        naming_year=submission_naming.year,
+        upload_courseid_raw=submission_naming.raw.courseid,
+        upload_kind_raw=submission_naming.raw.kind,
+        upload_lecture_raw=submission_naming.raw.lecture,
+        upload_year_raw=submission_naming.raw.year,
         is_demo=False,
         saved_user_id=user_id,
         uploaded_by=user_id,
@@ -1830,11 +2114,14 @@ async def process(
     return {
         **result,
         "lecture_id": lecture_id,
-        "course_id": normalized_courseid,
+        "course_id": submission_naming.courseid,
+        "naming_kind": submission_naming.kind,
+        "naming_lecture": submission_naming.lecture,
+        "naming_year": submission_naming.year,
         "is_archived": False,
         "is_approved": False,
         "is_saved": True,
-        "pdf_url": f"/pdf/{saved_pdf_path.name}",
+        "pdf_url": f"/pdf/{submission_naming.saved_pdf_path.name}",
     }
 
 
@@ -1953,6 +2240,10 @@ async def get_lecture(
         "name": lecture.name,
         "course_id": lecture.course_id,
         "course_display": _resolve_course_display(lecture.course_id, display_overrides_by_code),
+        "naming_kind": lecture.naming_kind,
+        "naming_lecture": lecture.naming_lecture,
+        "naming_year": lecture.naming_year,
+        "upload_naming_raw": _upload_naming_raw_payload(lecture),
         "is_archived": bool(lecture.is_archived),
         "is_saved": await _is_lecture_saved_for_user(db, user_id, lecture_id),
         **_lecture_file_urls(lecture),
@@ -2081,6 +2372,13 @@ class ProfileCoursesUpdateRequest(BaseModel):
 class CatalogSyncRequest(BaseModel):
     snapshot_date: str | None = None
     dry_run: bool = False
+
+
+class ApproveLectureRequest(BaseModel):
+    courseid: str
+    kind: str
+    lecture: str
+    year: str
 
 
 @app.get("/profile")
@@ -2537,6 +2835,7 @@ async def list_pending_lectures(
 @app.post("/lectures/{lecture_id}/approve")
 async def approve_lecture(
     lecture_id: int,
+    body: ApproveLectureRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -2544,6 +2843,29 @@ async def approve_lecture(
     if not await _is_admin(user_id, db):
         raise HTTPException(status_code=403, detail="Admin access required.")
     lecture = await get_lecture_or_404(db, lecture_id)
+
+    normalized_courseid, normalized_kind, normalized_lecture, normalized_year = _normalize_upload_naming_fields(
+        body.courseid,
+        body.kind,
+        body.lecture,
+        body.year,
+        strict_kind=True,
+    )
+    active_course = await db.execute(
+        select(Course.id).where(
+            Course.code == normalized_courseid,
+            Course.is_active == True,
+        )
+    )
+    if active_course.scalar_one_or_none() is None:
+        raise HTTPException(status_code=400, detail="Invalid courseid: must match an active catalog course.")
+
+    lecture.course_id = normalized_courseid
+    lecture.naming_kind = normalized_kind
+    lecture.naming_lecture = normalized_lecture
+    lecture.naming_year = normalized_year
+    lecture.name = _build_standard_stem(normalized_courseid, normalized_kind, normalized_lecture, normalized_year)
+
     lecture.is_approved = True
     await db.commit()
     display_overrides_by_code = await _course_display_overrides_by_code(db, [lecture.course_id])

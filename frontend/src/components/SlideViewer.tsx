@@ -30,9 +30,22 @@ export default function SlideViewer({ slideText, slideNumber, total, onPrev, onN
     };
 
     updateWidth();
+
+    const container = containerRef.current;
+    let observer: ResizeObserver | null = null;
+    if (container && typeof ResizeObserver !== "undefined") {
+      observer = new ResizeObserver(() => {
+        updateWidth();
+      });
+      observer.observe(container);
+    }
+
     window.addEventListener("resize", updateWidth);
-    return () => window.removeEventListener("resize", updateWidth);
-  }, []);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", updateWidth);
+    };
+  }, [pdfUrl, pdfError]);
 
   return (
     <div className="slide-viewer">

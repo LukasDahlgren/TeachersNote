@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import subprocess
 import sys
 import tempfile
@@ -35,6 +36,7 @@ from scripts.enrich import (
     resolve_enrichment_provider,
 )
 from scripts.generate_presentation import generate as generate_pptx
+from scripts.model_config import resolve_alignment_model, resolve_alignment_model_alias
 
 
 def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
@@ -63,6 +65,9 @@ TRANSCRIBE_CHUNK_HEADROOM_PCT = _env_int("TRANSCRIBE_CHUNK_HEADROOM_PCT", 90, mi
 TRANSCRIBE_MIN_CHUNK_SECONDS = _env_int("TRANSCRIBE_MIN_CHUNK_SECONDS", 300, minimum=60)
 TRANSCRIBE_RETRY_ATTEMPTS = _env_int("TRANSCRIBE_RETRY_ATTEMPTS", 3, minimum=1)
 TRANSCRIBE_RETRY_BASE_DELAY_SECONDS = float(os.getenv("TRANSCRIBE_RETRY_BASE_DELAY_SECONDS", "3").strip() or "3")
+TRANSCRIBE_PARALLEL_WORKERS = _env_int("TRANSCRIBE_PARALLEL_WORKERS", 2, minimum=1)
+TRANSCRIBE_GLOBAL_MAX_CONCURRENT = _env_int("TRANSCRIBE_GLOBAL_MAX_CONCURRENT", 4, minimum=1)
+TRANSCRIBE_PARALLEL_MIN_CHUNKS = _env_int("TRANSCRIBE_PARALLEL_MIN_CHUNKS", 2, minimum=1)
 TRANSCRIBE_SAFE_BYTES = max(
     1_000_000,
     int(TRANSCRIBE_MAX_UPLOAD_BYTES * (TRANSCRIBE_CHUNK_HEADROOM_PCT / 100)),
@@ -70,11 +75,16 @@ TRANSCRIBE_SAFE_BYTES = max(
 ALIGN_MAX_TRANSCRIPT_SEGMENTS = _env_int("ALIGN_MAX_TRANSCRIPT_SEGMENTS", 450, minimum=100)
 ALIGN_MAX_SEGMENT_CHARS = _env_int("ALIGN_MAX_SEGMENT_CHARS", 180, minimum=40)
 ALIGN_MAX_SLIDE_CHARS = _env_int("ALIGN_MAX_SLIDE_CHARS", 1200, minimum=120)
+ALIGN_MODEL_ALIAS = resolve_alignment_model_alias(os.getenv("ALIGN_MODEL"))
+ALIGN_MODEL = resolve_alignment_model(os.getenv("ALIGN_MODEL"))
 
 # Global semaphore caps total concurrent enrichment API calls across ALL running pipelines.
 # Raise this (and ENRICH_MAX_WORKERS) together when upgrading to a higher API tier.
 _ENRICH_GLOBAL_MAX_CONCURRENT = _env_int("ENRICH_GLOBAL_MAX_CONCURRENT", 3, minimum=1)
 _global_enrich_semaphore = threading.Semaphore(_ENRICH_GLOBAL_MAX_CONCURRENT)
+
+# Global semaphore caps total concurrent transcription API calls across ALL running pipelines.
+_global_transcribe_semaphore = threading.Semaphore(TRANSCRIBE_GLOBAL_MAX_CONCURRENT)
 
 
 def enrich_slide_notes(
@@ -171,6 +181,11 @@ def _is_transient_transcription_error(exc: Exception) -> bool:
     )
 
 
+def _retry_delay_seconds(attempt: int) -> float:
+    base = max(1.0, TRANSCRIBE_RETRY_BASE_DELAY_SECONDS) * (2 ** (attempt - 1))
+    return base * random.uniform(0.85, 1.15)
+
+
 def _normalize_transcription_segments(raw_segments: list[dict]) -> list[dict]:
     def _value(seg: dict, key: str, default: float | str) -> float | str:
         if isinstance(seg, dict):
@@ -195,19 +210,20 @@ def _normalize_transcription_segments(raw_segments: list[dict]) -> list[dict]:
     return normalized
 
 
-def _transcribe_mp3_file(groq_client: Groq, mp3_path: Path) -> list[dict]:
-    with open(mp3_path, "rb") as f:
-        result = groq_client.audio.transcriptions.create(
-            model=TRANSCRIBE_MODEL,
-            file=f,
-            response_format="verbose_json",
-            timestamp_granularities=["segment"],
-        )
+def _transcribe_mp3_file(mp3_path: Path) -> list[dict]:
+    groq_client = Groq()
+    with _global_transcribe_semaphore:
+        with open(mp3_path, "rb") as f:
+            result = groq_client.audio.transcriptions.create(
+                model=TRANSCRIBE_MODEL,
+                file=f,
+                response_format="verbose_json",
+                timestamp_granularities=["segment"],
+            )
     return _normalize_transcription_segments(list(result.segments))
 
 
 def _transcribe_mp3_file_with_retries(
-    groq_client: Groq,
     mp3_path: Path,
     *,
     emit: ProgressEmitter | None = None,
@@ -218,17 +234,17 @@ def _transcribe_mp3_file_with_retries(
 
     for attempt in range(1, attempts + 1):
         try:
-            return _transcribe_mp3_file(groq_client, mp3_path)
+            return _transcribe_mp3_file(mp3_path)
         except Exception as exc:
             if _is_request_too_large_error(exc):
                 raise
             if not _is_transient_transcription_error(exc) or attempt >= attempts:
                 raise
 
-            delay_seconds = max(1.0, TRANSCRIBE_RETRY_BASE_DELAY_SECONDS) * (2 ** (attempt - 1))
+            delay_seconds = _retry_delay_seconds(attempt)
             message = (
                 f"Transcription provider timeout{label}; retrying "
-                f"({attempt + 1}/{attempts}) in {delay_seconds:.0f}s..."
+                f"({attempt + 1}/{attempts}) in {delay_seconds:.1f}s..."
             )
             print(f"⚠️ {message}", flush=True)
             _emit_progress(emit, "transcribe", message, 35)
@@ -278,7 +294,6 @@ def _estimate_chunk_seconds(
 
 
 def _transcribe_mp3_in_chunks(
-    groq_client: Groq,
     *,
     mp3_path: Path,
     duration_seconds: float,
@@ -288,8 +303,8 @@ def _transcribe_mp3_in_chunks(
     if chunk_seconds <= 0:
         raise RuntimeError("Chunk duration must be positive for chunked transcription")
 
-    segments: list[dict] = []
     chunk_count = max(1, int((duration_seconds + chunk_seconds - 1) // chunk_seconds))
+    chunk_tasks: list[tuple[int, float, Path]] = []
 
     with tempfile.TemporaryDirectory(prefix="transcribe-chunks-") as tmp_dir:
         for chunk_idx in range(chunk_count):
@@ -321,30 +336,71 @@ def _transcribe_mp3_in_chunks(
                 check=True,
                 capture_output=True,
             )
+            chunk_tasks.append((chunk_idx, chunk_start, chunk_path))
 
+        if not chunk_tasks:
+            return []
+
+        chunk_total = len(chunk_tasks)
+
+        def _transcribe_one_chunk(task: tuple[int, float, Path]) -> tuple[int, list[dict]]:
+            chunk_idx, chunk_start, chunk_path = task
             chunk_segments = _transcribe_mp3_file_with_retries(
-                groq_client,
                 chunk_path,
                 emit=emit,
-                chunk_label=f"chunk {chunk_idx + 1}/{chunk_count}",
+                chunk_label=f"chunk {chunk_idx + 1}/{chunk_total}",
             )
+            adjusted_segments: list[dict] = []
             for seg in chunk_segments:
                 start = round(chunk_start + float(seg["start"]), 2)
                 end = round(chunk_start + float(seg["end"]), 2)
                 text = str(seg["text"]).strip()
                 if not text:
                     continue
-                segments.append({
+                adjusted_segments.append({
                     "start": start,
                     "end": end,
                     "text": text,
                 })
+            return chunk_idx, adjusted_segments
 
-    return segments
+        chunk_results: list[tuple[int, list[dict]]] = []
+        done_count = 0
+
+        def _emit_chunk_progress(done: int) -> None:
+            progress_pct = 35 + int((done / max(chunk_total, 1)) * 12)
+            _emit_progress(
+                emit,
+                "transcribe",
+                f"Transcribing chunks... ({done}/{chunk_total})",
+                progress_pct,
+            )
+
+        use_parallel = (
+            TRANSCRIBE_PARALLEL_WORKERS > 1 and chunk_total >= TRANSCRIBE_PARALLEL_MIN_CHUNKS
+        )
+        if use_parallel:
+            worker_count = min(TRANSCRIBE_PARALLEL_WORKERS, chunk_total)
+            with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                futures = [pool.submit(_transcribe_one_chunk, task) for task in chunk_tasks]
+                for future in as_completed(futures):
+                    chunk_results.append(future.result())
+                    done_count += 1
+                    _emit_chunk_progress(done_count)
+        else:
+            for task in chunk_tasks:
+                chunk_results.append(_transcribe_one_chunk(task))
+                done_count += 1
+                _emit_chunk_progress(done_count)
+
+    ordered_segments: list[dict] = []
+    for _, chunk_segments in sorted(chunk_results, key=lambda item: item[0]):
+        ordered_segments.extend(chunk_segments)
+    ordered_segments.sort(key=lambda seg: (float(seg["start"]), float(seg["end"])))
+    return ordered_segments
 
 
 def _transcribe_mp3_with_auto_chunking(
-    groq_client: Groq,
     *,
     mp3_path: Path,
     emit: ProgressEmitter | None = None,
@@ -354,7 +410,7 @@ def _transcribe_mp3_with_auto_chunking(
     force_split = file_size_bytes > TRANSCRIBE_SAFE_BYTES
     if not force_split:
         try:
-            return _transcribe_mp3_file_with_retries(groq_client, mp3_path, emit=emit)
+            return _transcribe_mp3_file_with_retries(mp3_path, emit=emit)
         except Exception as exc:
             if not _is_request_too_large_error(exc):
                 raise
@@ -389,7 +445,6 @@ def _transcribe_mp3_with_auto_chunking(
 
     try:
         return _transcribe_mp3_in_chunks(
-            groq_client,
             mp3_path=mp3_path,
             duration_seconds=duration_seconds,
             chunk_seconds=chunk_seconds,
@@ -405,7 +460,6 @@ def _transcribe_mp3_with_auto_chunking(
 
 
 def transcribe(audio_path: str, emit: ProgressEmitter | None = None) -> list[dict]:
-    groq_client = Groq()
     print("⏳ Compressing audio...", flush=True)
     _emit_progress(emit, "transcribe", "⏳ Compressing audio...", 28)
     mp3_path = Path(audio_path + ".tmp.mp3")
@@ -428,7 +482,7 @@ def transcribe(audio_path: str, emit: ProgressEmitter | None = None) -> list[dic
     print("☁️  Transcribing with Groq Whisper...", flush=True)
     _emit_progress(emit, "transcribe", "☁️ Transcribing recording...", 35)
     try:
-        segments = _transcribe_mp3_with_auto_chunking(groq_client, mp3_path=mp3_path, emit=emit)
+        segments = _transcribe_mp3_with_auto_chunking(mp3_path=mp3_path, emit=emit)
     finally:
         mp3_path.unlink(missing_ok=True)
     print(f"✅ Transcription done — {len(segments)} segments", flush=True)
@@ -478,7 +532,10 @@ def align(
     transcript: list[dict],
     emit: ProgressEmitter | None = None,
 ) -> list[dict]:
-    print("🔗 Aligning transcript to slides via Claude...", flush=True)
+    print(
+        f"🔗 Aligning transcript to slides via Claude ({ALIGN_MODEL_ALIAS}:{ALIGN_MODEL})...",
+        flush=True,
+    )
     _emit_progress(emit, "align", "🔗 Aligning transcript to slides...", 55)
     prompt = build_prompt(
         slides,
@@ -489,7 +546,7 @@ def align(
     )
     try:
         message = alignment_client.messages.create(
-            model="claude-sonnet-4-6",
+            model=ALIGN_MODEL,
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -517,7 +574,7 @@ def align(
             max_slide_chars=reduced_slide_chars,
         )
         message = alignment_client.messages.create(
-            model="claude-sonnet-4-6",
+            model=ALIGN_MODEL,
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
         )
