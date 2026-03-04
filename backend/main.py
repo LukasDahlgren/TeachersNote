@@ -585,7 +585,8 @@ def _lecture_file_urls(lecture: Lecture) -> dict[str, str | None]:
 def _lecture_has_visible_pptx(lecture: Lecture) -> bool:
     # Hide stale lectures that still have a DB row but no backing PPTX asset.
     if not lecture.pptx_path:
-        return bool(lecture.is_demo)
+        # Allow in-progress lectures (have pdf but no pptx yet) and demos
+        return bool(lecture.pdf_path) or bool(lecture.is_demo)
     pptx_path = _resolve_lecture_asset_path(lecture.pptx_path)
     return pptx_path.exists() and pptx_path.is_file()
 
@@ -1019,6 +1020,8 @@ def _upload_job_public_state(job: dict[str, Any]) -> dict[str, Any]:
         "current_stage": job["current_stage"],
         "progress_pct": int(job["progress_pct"]),
         "lecture_id": job["lecture_id"],
+        "total_slides": job.get("total_slides"),
+        "pdf_url": job.get("pdf_url"),
         "error": job["error"],
         "updated_at": datetime.fromtimestamp(job["updated_at"], tz=timezone.utc).isoformat(),
     }
@@ -1073,6 +1076,8 @@ async def _create_upload_job(user_id: str) -> dict[str, Any]:
         "current_stage": "upload",
         "progress_pct": 0,
         "lecture_id": None,
+        "total_slides": None,
+        "pdf_url": None,
         "error": None,
         "updated_at": now,
         "version": 0,
@@ -1127,6 +1132,24 @@ async def _update_upload_job(
                 ACTIVE_UPLOAD_JOB_IDS.pop(uid, None)
 
         return dict(job)
+
+
+async def _add_upload_job_raw_event(job_id: str, event_name: str, payload: dict[str, Any]) -> None:
+    async with UPLOAD_JOB_LOCK:
+        job = UPLOAD_JOB_STORE.get(job_id)
+        if not job:
+            return
+        event_id = int(job["next_event_id"])
+        job["next_event_id"] = event_id + 1
+        event_payload = dict(payload)
+        event_payload["event_id"] = event_id
+        job["events"].append({
+            "id": event_id,
+            "event": event_name,
+            "payload": event_payload,
+        })
+        if len(job["events"]) > 2000:
+            job["events"] = job["events"][-1000:]
 
 
 async def _get_upload_job_snapshot_and_events(
@@ -1469,6 +1492,60 @@ async def _run_process_job(
             loop,
         ).result()
 
+    lecture_id_holder: list[int | None] = [None]
+
+    def on_slides_parsed(count: int) -> None:
+        asyncio.run_coroutine_threadsafe(
+            _update_upload_job(job_id, total_slides=count),
+            loop,
+        ).result()
+
+    def on_slide_enriched(slide_num: int, payload: dict) -> None:
+        asyncio.run_coroutine_threadsafe(
+            _add_upload_job_raw_event(job_id, "slide_enriched", payload),
+            loop,
+        ).result()
+
+    def on_pre_enrich(slides: list, transcript: list, alignment: list) -> None:
+        early_name = (
+            _derive_temporary_lecture_name(slides, temporary_name_seed)
+            if temporary_name_seed
+            else lecture_name
+        )
+
+        async def _create_early() -> None:
+            async with AsyncSessionLocal() as db:
+                lid = await save_lecture_to_db(
+                    db=db,
+                    name=early_name,
+                    slides=slides,
+                    transcript=transcript,
+                    alignment=alignment,
+                    enhanced=[],
+                    pptx_path=None,
+                    pdf_path=str(saved_pdf_path.relative_to(BACKEND_DIR)),
+                    course_id=course_id,
+                    naming_kind=naming_kind,
+                    naming_lecture=naming_lecture,
+                    naming_year=naming_year,
+                    upload_courseid_raw=upload_courseid_raw,
+                    upload_kind_raw=upload_kind_raw,
+                    upload_lecture_raw=upload_lecture_raw,
+                    upload_year_raw=upload_year_raw,
+                    is_demo=False,
+                    saved_user_id=user_id,
+                    uploaded_by=user_id,
+                )
+            lecture_id_holder[0] = lid
+            await _update_upload_job(
+                job_id,
+                lecture_id=lid,
+                event_name="progress",
+                message="Lecture added to sidebar. Enriching slide notes...",
+            )
+
+        asyncio.run_coroutine_threadsafe(_create_early(), loop).result()
+
     try:
         if recording_source == "url":
             if not audio_url:
@@ -1511,6 +1588,9 @@ async def _run_process_job(
             str(audio_path),
             str(pptx_path),
             emit,
+            on_slides_parsed=on_slides_parsed,
+            on_slide_enriched=on_slide_enriched,
+            on_pre_enrich=on_pre_enrich,
         )
         resolved_lecture_name = (
             _derive_temporary_lecture_name(result["slides"], temporary_name_seed)
@@ -1530,27 +1610,40 @@ async def _run_process_job(
         shutil.copy2(pdf_path, saved_pdf_path)
 
         async with AsyncSessionLocal() as db:
-            lecture_id = await save_lecture_to_db(
-                db=db,
-                name=resolved_lecture_name,
-                slides=result["slides"],
-                transcript=result["transcript"],
-                alignment=result["alignment"],
-                enhanced=result["enhanced"],
-                pptx_path=str(pptx_path.relative_to(BACKEND_DIR)),
-                pdf_path=str(saved_pdf_path.relative_to(BACKEND_DIR)),
-                course_id=course_id,
-                naming_kind=naming_kind,
-                naming_lecture=naming_lecture,
-                naming_year=naming_year,
-                upload_courseid_raw=upload_courseid_raw,
-                upload_kind_raw=upload_kind_raw,
-                upload_lecture_raw=upload_lecture_raw,
-                upload_year_raw=upload_year_raw,
-                is_demo=False,
-                saved_user_id=user_id,
-                uploaded_by=user_id,
-            )
+            if lecture_id_holder[0] is not None:
+                await update_lecture_enhanced_and_pptx(
+                    db=db,
+                    lecture_id=lecture_id_holder[0],
+                    slides=result["slides"],
+                    transcript=result["transcript"],
+                    alignment=result["alignment"],
+                    enhanced=result["enhanced"],
+                    pptx_path=str(pptx_path.relative_to(BACKEND_DIR)),
+                    name=resolved_lecture_name,
+                )
+                lecture_id = lecture_id_holder[0]
+            else:
+                lecture_id = await save_lecture_to_db(
+                    db=db,
+                    name=resolved_lecture_name,
+                    slides=result["slides"],
+                    transcript=result["transcript"],
+                    alignment=result["alignment"],
+                    enhanced=result["enhanced"],
+                    pptx_path=str(pptx_path.relative_to(BACKEND_DIR)),
+                    pdf_path=str(saved_pdf_path.relative_to(BACKEND_DIR)),
+                    course_id=course_id,
+                    naming_kind=naming_kind,
+                    naming_lecture=naming_lecture,
+                    naming_year=naming_year,
+                    upload_courseid_raw=upload_courseid_raw,
+                    upload_kind_raw=upload_kind_raw,
+                    upload_lecture_raw=upload_lecture_raw,
+                    upload_year_raw=upload_year_raw,
+                    is_demo=False,
+                    saved_user_id=user_id,
+                    uploaded_by=user_id,
+                )
 
         await _update_upload_job(
             job_id,
@@ -1572,6 +1665,12 @@ async def _run_process_job(
             event_name="error",
             message=str(exc),
         )
+        if lecture_id_holder[0] is not None:
+            async with AsyncSessionLocal() as db:
+                lecture = await db.get(Lecture, lecture_id_holder[0])
+                if lecture:
+                    await db.delete(lecture)
+                    await db.commit()
         if pptx_path.exists():
             pptx_path.unlink(missing_ok=True)
         if saved_pdf_path.exists():
@@ -1667,6 +1766,41 @@ async def save_lecture_to_db(
 
     await db.commit()
     return lecture.id
+
+
+async def update_lecture_enhanced_and_pptx(
+    db: AsyncSession,
+    lecture_id: int,
+    slides: list[dict],
+    transcript: list[dict],
+    alignment: list[dict],
+    enhanced: list[dict],
+    pptx_path: str | None,
+    name: str | None = None,
+) -> None:
+    result = await db.execute(select(Lecture).where(Lecture.id == lecture_id))
+    lecture = result.scalar_one_or_none()
+    if not lecture:
+        return
+    if pptx_path is not None:
+        lecture.pptx_path = pptx_path
+    if name is not None:
+        lecture.name = name
+    await db.execute(delete(EnrichedSlide).where(EnrichedSlide.lecture_id == lecture_id))
+    sanitized_enhanced = _sanitize_enhanced_entries(slides, transcript, alignment, enhanced)
+    enhanced_by_slide = {e["slide"]: e for e in sanitized_enhanced}
+    db.add_all([
+        EnrichedSlide(
+            lecture_id=lecture_id,
+            slide_number=slide_num,
+            summary=e["summary"],
+            slide_content=e["slide_content"],
+            lecturer_additions=e["lecturer_additions"],
+            key_takeaways=e["key_takeaways"],
+        )
+        for slide_num, e in enhanced_by_slide.items()
+    ])
+    await db.commit()
 
 
 async def lecture_to_response(db: AsyncSession, lecture_id: int) -> dict:
@@ -1879,6 +2013,8 @@ async def start_process_job(
         tmp_dir.mkdir(parents=True, exist_ok=False)
         with open(pdf_path, "wb") as f:
             shutil.copyfileobj(pdf.file, f)
+        # Copy PDF to saved_pdf_path immediately so it's accessible via /pdf/ during live preview
+        shutil.copy2(pdf_path, submission_naming.saved_pdf_path)
         if recording_source == "file":
             if audio is None:
                 raise RuntimeError("Missing audio file during staging.")
@@ -1902,6 +2038,7 @@ async def start_process_job(
         current_stage="upload",
         progress_pct=0,
         error=None,
+        pdf_url=f"/pdf/{submission_naming.saved_pdf_path.name}",
         event_name="progress",
         message=(
             "Upload received and queued for processing."

@@ -41,6 +41,7 @@ import ProfilePage from "./components/ProfilePage";
 import { useRouteMotion } from "./hooks/useRouteMotion";
 import {
   type AuthUser,
+  type EnrichedSlide,
   type ProcessResult,
   type TeachersNoteSummary,
   type RegenerateNotesJobStatus,
@@ -180,9 +181,10 @@ export default function App() {
   const [lecturesLoading, setLecturesLoading] = useState(true);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [processJob, setProcessJob] = useState<UploadProcessJobStatus | null>(null);
+  const processJobRef = useRef<UploadProcessJobStatus | null>(null);
+  const [liveEnrichedSlides, setLiveEnrichedSlides] = useState<EnrichedSlide[]>([]);
   const [processChat, setProcessChat] = useState<ProcessChatEntry[]>([]);
   const [processBanner, setProcessBanner] = useState<ProcessBanner | null>(null);
-  const [lectureRefreshError, setLectureRefreshError] = useState<string | null>(null);
   const [regeneratingNotes, setRegeneratingNotes] = useState(false);
   const [regenBanner, setRegenBanner] = useState<{ kind: "success" | "error"; text: string } | null>(null);
   const [regenJob, setRegenJob] = useState<RegenerateNotesJobStatus | null>(null);
@@ -219,6 +221,7 @@ export default function App() {
   const processActiveJobIdRef = useRef<string | null>(null);
   const processTerminalHandledRef = useRef<Set<string>>(new Set());
   const processLastEventIdRef = useRef(0);
+  const processLectureAddedRef = useRef(false);
   const demoRegenRunRef = useRef(0);
   const demoRunRef = useRef(0);
   const newLectureButtonElementRef = useRef<HTMLButtonElement | null>(null);
@@ -235,6 +238,10 @@ export default function App() {
   useEffect(() => {
     locationPathRef.current = location.pathname;
   }, [location.pathname]);
+
+  useEffect(() => {
+    processJobRef.current = processJob;
+  }, [processJob]);
 
   const updateNewLectureButtonRect = useCallback(() => {
     if (!newLectureButtonElementRef.current) return;
@@ -271,11 +278,9 @@ export default function App() {
       setLectures(catalog);
       setSavedLectures(saved);
       setDeletedLectures(deleted);
-      setLectureRefreshError(null);
       return { ok: true };
     } catch (err) {
       const message = toErrorMessage(err);
-      setLectureRefreshError(message);
       console.warn("Failed to refresh lectures list:", message);
       return { ok: false, error: message };
     } finally {
@@ -416,8 +421,10 @@ export default function App() {
     stopProcessSubscription();
     setProcessJob(null);
     setProcessChat([]);
+    setLiveEnrichedSlides([]);
     setProcessBanner(null);
     processLastEventIdRef.current = 0;
+    processLectureAddedRef.current = false;
     setUploadLoadingLabel("");
     setProcessingLectureName(null);
     setProcessOverlayDismissed(false);
@@ -544,7 +551,7 @@ export default function App() {
       const detailError = toErrorMessage(err);
       const refreshSuffix = refreshResult.ok
         ? ""
-        : ` Also, refreshing Saved lectures failed (${refreshResult.error || lectureRefreshError || "unknown error"}).`;
+        : ` Also, refreshing Saved lectures failed (${refreshResult.error || "unknown error"}).`;
       const message = (
         "Processing finished and lecture was saved, but we could not open it automatically. "
         + "Select it from Saved lectures and try again."
@@ -556,7 +563,7 @@ export default function App() {
       setUploadLoadingLabel("");
       console.warn(`Failed to open lecture ${lectureId} after completion:`, detailError);
     }
-  }, [fetchLectureWithRetry, fetchLectures, lectureRefreshError, stopProcessSubscription]);
+  }, [fetchLectureWithRetry, fetchLectures, stopProcessSubscription]);
 
   const handleProcessDoneOnce = useCallback(async (status: UploadProcessJobStatus) => {
     const jobId = status.job_id;
@@ -626,11 +633,21 @@ export default function App() {
         setMainView((prev) => (
           prev.view === "upload" ? { ...prev, loading: true, error: undefined } : prev
         ));
+        if (event.lecture_id && !processLectureAddedRef.current) {
+          processLectureAddedRef.current = true;
+          void fetchLectures();
+        }
       },
       onLog: (event) => {
         setProcessJob(event);
         appendProcessChat(event, "log");
         setUploadLoadingLabel(`Processing: ${formatProcessStage(event.current_stage)} (${event.progress_pct}%)`);
+      },
+      onSlideEnriched: (event) => {
+        setLiveEnrichedSlides((prev) => {
+          const filtered = prev.filter((s) => s.slide !== event.slide);
+          return [...filtered, event];
+        });
       },
       onDone: (event) => {
         setProcessJob(event);
@@ -701,8 +718,10 @@ export default function App() {
           return;
         }
         subscribeToProcessJob(storedJobId, 0);
-      } catch {
-        clearStorageWithLegacy(ACTIVE_PROCESS_JOB_STORAGE_KEY, LEGACY_ACTIVE_PROCESS_JOB_STORAGE_KEY);
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 404) {
+          clearStorageWithLegacy(ACTIVE_PROCESS_JOB_STORAGE_KEY, LEGACY_ACTIVE_PROCESS_JOB_STORAGE_KEY);
+        }
         setUploadLoadingLabel("");
       }
     })();
@@ -819,6 +838,8 @@ export default function App() {
           current_stage: stage.stage,
           progress_pct: startProgress,
           lecture_id: null,
+          total_slides: null,
+          pdf_url: null,
           error: null,
           updated_at: new Date().toISOString(),
           message: stage.label,
@@ -836,6 +857,8 @@ export default function App() {
               current_stage: "enrich",
               progress_pct: 70 + Math.round((slide / totalSlides) * 20),
               lecture_id: null,
+              total_slides: null,
+              pdf_url: null,
               error: null,
               updated_at: new Date().toISOString(),
               message: `✅ Slide ${slide} done (${slide}/${totalSlides})`,
@@ -853,6 +876,8 @@ export default function App() {
             current_stage: stage.stage,
             progress_pct: currentProgress,
             lecture_id: null,
+            total_slides: null,
+            pdf_url: null,
             error: null,
             updated_at: new Date().toISOString(),
           });
@@ -868,6 +893,8 @@ export default function App() {
             current_stage: stage.stage,
             progress_pct: endProgress,
             lecture_id: null,
+            total_slides: null,
+            pdf_url: null,
             error: null,
             updated_at: new Date().toISOString(),
           });
@@ -984,9 +1011,15 @@ export default function App() {
     setProcessToast(null);
     setIsNewLectureOverlayOpen(false);
     resetRegenerationUi();
-    resetProcessUi(false);
+    const isProcessingLecture = (
+      processJobRef.current?.lecture_id === id &&
+      (processJobRef.current?.status === "queued" || processJobRef.current?.status === "running")
+    );
+    if (!isProcessingLecture) {
+      resetProcessUi(false);
+      setUploadLoadingLabel("");
+    }
     setProcessBanner(null);
-    setUploadLoadingLabel("");
     setSaveBanner(null);
     setArchiveBanner(null);
     setSelectedId(id);
@@ -1244,13 +1277,25 @@ export default function App() {
 
   const activeSlideComputed = useMemo(() => {
     if (mainView.view !== "results") return null;
-    const { data, activeSlide } = mainView;
+    const { data, activeSlide, lectureId } = mainView;
+
+    const isProcessingLecture = (
+      lectureId !== undefined &&
+      lectureId === processJob?.lecture_id &&
+      (processJob?.status === "queued" || processJob?.status === "running")
+    );
+
+    const effectiveEnhanced = isProcessingLecture && liveEnrichedSlides.length > 0
+      ? liveEnrichedSlides
+      : data.enhanced;
+
     const alignment = data.alignment.find(a => a.slide === activeSlide + 1);
     const segments = alignment
       ? data.transcript.slice(alignment.start_segment, alignment.end_segment + 1)
       : [];
-    return { data, activeSlide, segments };
-  }, [mainView]);
+    const isEnriching = isProcessingLecture && processJob?.current_stage === "enrich";
+    return { data: { ...data, enhanced: effectiveEnhanced }, activeSlide, segments, isEnriching };
+  }, [mainView, liveEnrichedSlides, processJob]);
 
   const navigateSlide = useCallback((delta: number) => {
     setMainView((prev) => {
@@ -1356,6 +1401,8 @@ export default function App() {
         continue;
       }
 
+      if (chat.stage === "enrich") continue;
+
       // Mark previous stage entries as done when stage changes
       if (entries.length > 0) {
         const prevStage = entries[entries.length - 1].stage;
@@ -1394,6 +1441,11 @@ export default function App() {
   }, [newLectureButtonRect]);
   const handleOpenLectureFromOverlay = useCallback((id: number) => {
     setProcessOverlayDismissed(true);
+    setIsNewLectureOverlayOpen(false);
+    navigate(`/lectures/${id}`);
+  }, [navigate]);
+
+  const handleViewLiveLecture = useCallback((id: number) => {
     setIsNewLectureOverlayOpen(false);
     navigate(`/lectures/${id}`);
   }, [navigate]);
@@ -1447,7 +1499,7 @@ export default function App() {
       )}
 
       {mainView.view === "results" && activeSlideComputed && (() => {
-        const { data, activeSlide, segments } = activeSlideComputed;
+        const { data, activeSlide, segments, isEnriching } = activeSlideComputed;
         const downloadHref = buildAssetUrl(data.download_url);
         const pdfUrl = buildAssetUrl(data.pdf_url);
 
@@ -1518,6 +1570,7 @@ export default function App() {
                 <TranscriptPanel
                   segments={segments}
                   enriched={data.enhanced?.find(e => e.slide === activeSlide + 1)}
+                  isEnriching={isEnriching}
                 />
               )}
             />
@@ -1702,6 +1755,7 @@ export default function App() {
           doneData={processOverlayDoneData}
           onDismiss={() => setProcessOverlayDismissed(true)}
           onOpenLecture={handleOpenLectureFromOverlay}
+          onViewLiveLecture={handleViewLiveLecture}
         />
       )}
 

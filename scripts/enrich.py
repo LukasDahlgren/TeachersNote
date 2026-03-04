@@ -41,7 +41,7 @@ DEFAULT_ENRICH_PROVIDER = os.getenv("ENRICH_PROVIDER", "anthropic").strip().lowe
 DEFAULT_ENRICH_MODEL_OVERRIDE = os.getenv("ENRICH_MODEL", "").strip()
 DEFAULT_ENRICH_MODEL_ANTHROPIC = os.getenv("ENRICH_MODEL_ANTHROPIC", "claude-haiku-4-5").strip() or "claude-haiku-4-5"
 DEFAULT_ENRICH_MODEL_GROQ = os.getenv("ENRICH_MODEL_GROQ", "openai/gpt-oss-20b").strip() or "openai/gpt-oss-20b"
-DEFAULT_ENRICH_MAX_WORKERS = _env_int("ENRICH_MAX_WORKERS", 2, minimum=1)
+DEFAULT_ENRICH_MAX_WORKERS = _env_int("ENRICH_MAX_WORKERS", 1, minimum=1)
 DEFAULT_ENRICH_MAX_TRANSCRIPT_WORDS = _env_int("ENRICH_MAX_TRANSCRIPT_WORDS", 700, minimum=1)
 DEFAULT_ENRICH_MAX_OUTPUT_TOKENS = _env_int("ENRICH_MAX_OUTPUT_TOKENS", 320, minimum=64)
 DEFAULT_ENRICH_MAX_ATTEMPTS = _env_int("ENRICH_MAX_ATTEMPTS", 4, minimum=1)
@@ -357,18 +357,26 @@ def _call_enrichment_model(
     system_prompt: str,
     user_prompt: str,
     max_output_tokens: int,
+    token_callback: Callable[[str], None] | None = None,
 ) -> tuple[str, dict[str, int]]:
     if provider == "anthropic":
-        response = client.messages.create(
+        accumulated = ""
+        with client.messages.stream(
             model=model,
             max_tokens=max_output_tokens,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
-        )
-        raw = response.content[0].text.strip()
-        return raw, _usage_from_response(response, provider)
+        ) as stream:
+            for text in stream.text_stream:
+                accumulated += text
+                if token_callback:
+                    token_callback(text)
+            response = stream.get_final_message()
+        return accumulated.strip(), _usage_from_response(response, provider)
 
-    response = client.chat.completions.create(
+    accumulated = ""
+    final_chunk = None
+    stream = client.chat.completions.create(
         model=model,
         temperature=0,
         max_tokens=max_output_tokens,
@@ -377,9 +385,18 @@ def _call_enrichment_model(
             {"role": "user", "content": user_prompt},
         ],
         extra_body={"thinking": {"type": "disabled"}},
+        stream=True,
+        stream_options={"include_usage": True},
     )
-    raw = _response_text_from_groq_completion(response)
-    return raw, _usage_from_response(response, provider)
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content or ""
+        accumulated += delta
+        if token_callback and delta:
+            token_callback(delta)
+        final_chunk = chunk
+    raw = accumulated.strip()
+    usage = _usage_from_response(final_chunk, provider) if final_chunk is not None else {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    return raw, usage
 
 
 def build_user_prompt(slide: dict, transcript_text: str) -> str:
@@ -1056,6 +1073,7 @@ def enrich_slide(
     model: str,
     max_output_tokens: int,
     system_prompt: str = SYSTEM_PROMPT,
+    token_callback: Callable[[str], None] | None = None,
 ) -> tuple[dict, dict[str, int]]:
     user_prompt = build_user_prompt(slide, transcript_text)
     raw, usage = _call_enrichment_model(
@@ -1065,6 +1083,7 @@ def enrich_slide(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         max_output_tokens=max_output_tokens,
+        token_callback=token_callback,
     )
     parsed = parse_enrichment_response(raw)
     if parsed is None:
@@ -1116,6 +1135,7 @@ def enrich_slide_with_retry(
     max_attempts: int = DEFAULT_ENRICH_MAX_ATTEMPTS,
     log_usage: bool = DEFAULT_ENRICH_LOG_USAGE,
     log_callback: Callable[[str], None] | None = None,
+    token_callback: Callable[[str], None] | None = None,
 ) -> tuple[dict, dict[str, Any]]:
     last_error: Exception | None = None
     attempts = 0
@@ -1143,6 +1163,7 @@ def enrich_slide_with_retry(
                 model=model,
                 max_output_tokens=current_max_output_tokens,
                 system_prompt=system_prompt,
+                token_callback=token_callback,
             )
             _add_usage(usage_total, usage)
 

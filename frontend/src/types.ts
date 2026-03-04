@@ -214,9 +214,13 @@ export interface UploadProcessJobStatus {
   current_stage: string;
   progress_pct: number;
   lecture_id: number | null;
+  total_slides: number | null;
+  pdf_url: string | null;
   error: string | null;
   updated_at: string;
 }
+
+export type SlideEnrichedEvent = EnrichedSlide;
 
 export interface UploadProcessJobEvent extends UploadProcessJobStatus {
   message?: string;

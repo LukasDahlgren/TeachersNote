@@ -269,6 +269,19 @@ frontend/src/
    `- ErrorBoundary.tsx / ConfirmDialog.tsx / InputDialog.tsx
 ```
 
+### Frontend: SSE job state and stable callbacks
+
+During async processing, the backend streams SSE events (progress, log, `slide_enriched`) via `/process/jobs/{job_id}/events`. Each event updates `processJob` state in `App.tsx`.
+
+To prevent SSE events from destabilizing `useCallback` references (and inadvertently re-triggering route effects that reset the active slide to 0), `processJob` is mirrored into a `processJobRef` ref:
+
+```typescript
+const processJobRef = useRef<UploadProcessJobStatus | null>(null);
+useEffect(() => { processJobRef.current = processJob; }, [processJob]);
+```
+
+`loadLectureIntoWorkspace` reads `processJobRef.current` instead of `processJob`, so its `useCallback` deps stay stable across SSE events. The route effect that calls `loadLectureIntoWorkspace` only re-runs when the URL param changes — not on every job update — keeping the user's slide position intact during enrichment.
+
 ---
 
 ## Testing and Notes

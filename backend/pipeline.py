@@ -92,6 +92,7 @@ def enrich_slide_notes(
     transcript_text: str,
     max_attempts: int = ENRICH_MAX_ATTEMPTS,
     log_callback=None,
+    token_callback=None,
     *,
     return_metrics: bool = False,
 ) -> dict | tuple[dict, dict]:
@@ -106,6 +107,7 @@ def enrich_slide_notes(
         max_attempts=max_attempts,
         log_usage=ENRICH_LOG_USAGE,
         log_callback=log_callback,
+        token_callback=token_callback,
     )
     if return_metrics:
         return enriched, metrics
@@ -614,6 +616,7 @@ def enrich(
     transcript: list[dict],
     alignment: list[dict],
     emit: ProgressEmitter | None = None,
+    on_slide_enriched: Callable[[int, dict], None] | None = None,
 ) -> list[dict]:
     total = len(alignment)
     done_count = 0
@@ -658,7 +661,7 @@ def enrich(
         print(f"  ⏳ Enriching slide {a['slide']} ({in_progress_done + 1}/{total})...", flush=True)
 
         def slide_log(msg: str) -> None:
-            pass  # enrich_slide_with_retry already prints internally; callback avoids duplicate output
+            _emit_progress(emit, "enrich", msg, pct_start)
 
         with _global_enrich_semaphore:
             enriched, metrics = enrich_slide_notes(
@@ -666,6 +669,7 @@ def enrich(
                 text,
                 max_attempts=ENRICH_MAX_ATTEMPTS,
                 log_callback=slide_log,
+                token_callback=slide_log,
                 return_metrics=True,
             )
         with done_lock:
@@ -695,13 +699,25 @@ def enrich(
             f"✅ Slide {a['slide']} done ({local_done}/{total})",
             pct,
         )
-        return {
+        result = {
             "slide": a["slide"],
             "original_text": slide["text"],
             "start_segment": a["start_segment"],
             "end_segment": a["end_segment"],
             **enriched,
         }
+        if on_slide_enriched is not None:
+            try:
+                on_slide_enriched(a["slide"], {
+                    "slide": a["slide"],
+                    "summary": enriched.get("summary", ""),
+                    "slide_content": enriched.get("slide_content", ""),
+                    "lecturer_additions": enriched.get("lecturer_additions", ""),
+                    "key_takeaways": enriched.get("key_takeaways", []),
+                })
+            except Exception:
+                pass
+        return result
 
     results: list[dict] = []
     with ThreadPoolExecutor(max_workers=ENRICH_MAX_WORKERS) as pool:
@@ -730,6 +746,9 @@ def run_pipeline(
     audio_path: str,
     pptx_output_path: str,
     emit: ProgressEmitter | None = None,
+    on_slides_parsed: Callable[[int], None] | None = None,
+    on_slide_enriched: Callable[[int, dict], None] | None = None,
+    on_pre_enrich: Callable[[list, list, list], None] | None = None,
 ) -> dict:
     # Step 1: Extract slides
     print("📄 Parsing slides from PDF...", flush=True)
@@ -741,6 +760,11 @@ def run_pipeline(
         slides = json.load(f)
     Path(slides_tmp).unlink(missing_ok=True)
     _emit_progress(emit, "parse_slides", f"📄 Extracted {len(slides)} slides.", 22)
+    if on_slides_parsed is not None:
+        try:
+            on_slides_parsed(len(slides))
+        except Exception:
+            pass
 
     # Step 2: Transcribe audio
     transcript = transcribe(audio_path, emit=emit)
@@ -749,7 +773,12 @@ def run_pipeline(
     alignment = align(slides, transcript, emit=emit)
 
     # Step 4: Enrich
-    enhanced = enrich(slides, transcript, alignment, emit=emit)
+    if on_pre_enrich is not None:
+        try:
+            on_pre_enrich(slides, transcript, alignment)
+        except Exception:
+            pass
+    enhanced = enrich(slides, transcript, alignment, emit=emit, on_slide_enriched=on_slide_enriched)
 
     # Step 5: Generate PPTX
     _emit_progress(emit, "generate_pptx", "🎉 Generating presentation...", 93)

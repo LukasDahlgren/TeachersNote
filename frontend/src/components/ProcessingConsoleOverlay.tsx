@@ -16,6 +16,7 @@ interface Props {
   doneData: { lectureId: number; downloadUrl: string | null } | null;
   onDismiss: () => void;
   onOpenLecture: (id: number) => void;
+  onViewLiveLecture?: (id: number) => void;
 }
 
 export default function ProcessingConsoleOverlay({
@@ -26,6 +27,7 @@ export default function ProcessingConsoleOverlay({
   doneData,
   onDismiss,
   onOpenLecture,
+  onViewLiveLecture,
 }: Props) {
   const consoleRef = useRef<HTMLDivElement>(null);
 
@@ -37,6 +39,7 @@ export default function ProcessingConsoleOverlay({
   const isDone = doneData !== null;
   const isError = job?.status === "error";
   const downloadHref = doneData?.downloadUrl ? buildAssetUrl(doneData.downloadUrl) : undefined;
+  const isEnriching = job?.current_stage === "enrich" && job.lecture_id !== null;
 
   return (
     <div className="processing-console-overlay">
@@ -58,28 +61,41 @@ export default function ProcessingConsoleOverlay({
 
       {!isStarting && !isDone && !isError && (
         <div className="processing-console-overlay-body">
-          {statusLabel && (
-            <div className="processing-console-overlay-status">{statusLabel}</div>
-          )}
-          <div className="processing-console-overlay-progress-bar">
-            <div
-              className="processing-console-overlay-progress-fill"
-              style={{ width: `${job?.progress_pct ?? 0}%` }}
-            />
-          </div>
-          <div className="upload-console processing-console-overlay-console" ref={consoleRef}>
-            {consoleEntries.length === 0 ? (
-              <span className="upload-console-line upload-console-line--dim">Uploading lecture...</span>
-            ) : (
-              consoleEntries.map((entry) => (
-                <span
-                  key={entry.id}
-                  className={`upload-console-line${entry.done ? " upload-console-line--done" : ""}`}
-                >
-                  <span className="upload-console-text">{entry.message}</span>
-                  {entry.done && <span className="upload-console-check">✓</span>}
+          <div className="processing-console-overlay-left">
+            {statusLabel && (
+              <div className="processing-console-overlay-status">{statusLabel}</div>
+            )}
+            <div className="processing-console-overlay-progress-bar">
+              <div
+                className="processing-console-overlay-progress-fill"
+                style={{ width: `${job?.progress_pct ?? 0}%` }}
+              />
+            </div>
+            <div className="upload-console processing-console-overlay-console" ref={consoleRef}>
+              {consoleEntries.length === 0 ? (
+                <span className="upload-console-line upload-console-line--dim">
+                  {isEnriching ? "Enriching slide notes..." : "Uploading lecture..."}
                 </span>
-              ))
+              ) : (
+                consoleEntries.map((entry) => (
+                  <span
+                    key={entry.id}
+                    className={`upload-console-line${entry.done ? " upload-console-line--done" : ""}`}
+                  >
+                    <span className="upload-console-text">{entry.message}</span>
+                    {entry.done && <span className="upload-console-check">✓</span>}
+                  </span>
+                ))
+              )}
+            </div>
+            {isEnriching && onViewLiveLecture && (
+              <button
+                type="button"
+                className="processing-console-overlay-live-btn"
+                onClick={() => onViewLiveLecture(job!.lecture_id!)}
+              >
+                View slides live →
+              </button>
             )}
           </div>
         </div>

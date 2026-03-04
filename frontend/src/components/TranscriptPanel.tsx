@@ -4,6 +4,7 @@ import { isEnrichedSlideInvalid, type Segment, type EnrichedSlide } from "../typ
 interface Props {
   segments: Segment[];
   enriched?: EnrichedSlide;
+  isEnriching?: boolean;
 }
 
 function formatTime(seconds: number): string {
@@ -116,7 +117,7 @@ function renderWithBold(text: string): ReactNode {
   return nodes.length > 0 ? nodes : text;
 }
 
-export default function TranscriptPanel({ segments, enriched }: Props) {
+export default function TranscriptPanel({ segments, enriched, isEnriching }: Props) {
   const topRef = useRef<HTMLDivElement>(null);
   const [tab, setTab] = useState<"transcript" | "notes">("notes");
   const notesInvalid = isEnrichedSlideInvalid(enriched);
@@ -168,7 +169,12 @@ export default function TranscriptPanel({ segments, enriched }: Props) {
 
       {tab === "notes" && (
         <div className="tab-content">
-          {!enriched ? (
+          {!enriched && isEnriching ? (
+            <div className="notes-pending">
+              <span className="spinner spinner--dark-sm" />
+              <p className="notes-pending-text">Notes are being generated for this slide...</p>
+            </div>
+          ) : !enriched ? (
             <p className="empty">No notes for this slide.</p>
           ) : notesInvalid ? (
             <p className="empty">Notes for this slide are invalid or empty. Regenerate is currently unavailable.</p>

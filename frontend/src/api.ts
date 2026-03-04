@@ -17,6 +17,7 @@ import {
   type RegenerateNotesJobStartResponse,
   type RegenerateNotesJobStatus,
   type RegenerateNotesResponse,
+  type SlideEnrichedEvent,
   type StudentProfile,
   type UploadLectureNamingInput,
   type UploadRecordingInput,
@@ -565,6 +566,7 @@ interface ProcessJobEventHandlers {
   onError?: (event: UploadProcessJobEvent) => void;
   onLog?: (event: UploadProcessJobEvent) => void;
   onTransportError?: () => void;
+  onSlideEnriched?: (event: SlideEnrichedEvent) => void;
 }
 
 interface ProcessJobSubscribeOptions {
@@ -592,6 +594,11 @@ export function subscribeProcessJobEvents(
   source.addEventListener("log", (evt) => {
     const payload = parseEventPayload<UploadProcessJobEvent>(evt);
     if (payload) handlers.onLog?.(payload);
+  });
+
+  source.addEventListener("slide_enriched", (evt) => {
+    const payload = parseEventPayload<SlideEnrichedEvent>(evt);
+    if (payload) handlers.onSlideEnriched?.(payload);
   });
 
   source.addEventListener("done", (evt) => {
