@@ -50,43 +50,27 @@ function stripExtension(value: string): string {
 function splitLectureName(name: string): LectureNameParts {
   const cleanedName = stripExtension(name).replace(/\s+/g, " ").trim();
   if (!cleanedName) {
-    return {
-      courseId: "Lecture",
-      lectureLabel: "Lecture",
-      displayName: "Lecture",
-      kind: "",
-      number: "",
-    };
+    return { courseId: "Lecture", lectureLabel: "Lecture", displayName: "Lecture", kind: "", number: "" };
   }
 
   const courseId = cleanedName.split(/[-\s_]+/).filter(Boolean)[0] ?? cleanedName;
   let lectureLabel = cleanedName.slice(courseId.length).replace(/^[\s_-]+/, "").trim();
-  if (!lectureLabel) {
-    lectureLabel = cleanedName;
-  }
+  if (!lectureLabel) lectureLabel = cleanedName;
 
-  // Parse lectureLabel to extract displayName, kind, and number
-  // Expected format: "DisplayName Lecture 12" or "DisplayName-Lecture-12"
   const parts = lectureLabel.split(/[-\s_]+/).filter(Boolean);
-
   let displayName = lectureLabel;
   let kind = "";
   let number = "";
 
   if (parts.length >= 2) {
-    // Check if the last part is a number
     const lastPart = parts[parts.length - 1];
     if (/^\d+$/.test(lastPart)) {
       number = lastPart;
-      // Check if second-to-last part looks like a kind (e.g., "Lecture", "Lab", "Seminar")
       const potentialKind = parts[parts.length - 2];
       if (/^[a-z]/i.test(potentialKind) && !/^\d+$/.test(potentialKind)) {
         kind = potentialKind;
         displayName = parts.slice(0, parts.length - 2).join(" ");
-        if (!displayName) {
-          displayName = potentialKind;
-          kind = "";
-        }
+        if (!displayName) { displayName = potentialKind; kind = ""; }
       } else {
         displayName = parts.slice(0, parts.length - 1).join(" ");
       }
@@ -130,7 +114,6 @@ export default function Homepage({
   onOpenLecture,
 }: HomepageProps) {
   const [searchQuery, setSearchQuery] = useState("");
-  const [expandedCourseIds, setExpandedCourseIds] = useState<string[]>([]);
 
   const [profileOptions, setProfileOptions] = useState<ProfileCourseOptions | null>(null);
   const [profileOptionsLoading, setProfileOptionsLoading] = useState(true);
@@ -141,7 +124,6 @@ export default function Homepage({
     text: string;
   } | null>(null);
   const [isProgramMenuOpen, setIsProgramMenuOpen] = useState(false);
-
   const [draftProgramId, setDraftProgramId] = useState<number | null>(null);
 
   useEffect(() => {
@@ -161,21 +143,14 @@ export default function Homepage({
     }
   }
 
+  useEffect(() => { void loadProfileOptions(); }, []);
+
   useEffect(() => {
-    void loadProfileOptions();
-  }, []);
+    if (!profile?.program) setIsProgramMenuOpen(false);
+  }, [profile?.program]);
 
   const currentProgram = profile?.program ?? null;
-  const programCourses = useMemo(
-    () => profileOptions?.program_courses ?? [],
-    [profileOptions?.program_courses],
-  );
-
-  useEffect(() => {
-    if (!currentProgram) {
-      setIsProgramMenuOpen(false);
-    }
-  }, [currentProgram]);
+  const programCourses = useMemo(() => profileOptions?.program_courses ?? [], [profileOptions?.program_courses]);
 
   const toLectureItem = (lecture: TeachersNoteSummary): HomepageLectureItem => {
     const parsed = splitLectureName(lecture.name);
@@ -195,18 +170,25 @@ export default function Homepage({
   };
 
   const mySavedActiveLectures = useMemo(
-    () => savedLectures
-      .filter((lecture) => !lecture.is_archived)
-      .map(toLectureItem),
+    () => savedLectures.filter((l) => !l.is_archived).map(toLectureItem),
     [savedLectures],
   );
 
   const acceptedAllLectures = useMemo(
-    () => allLectures
-      .filter((lecture) => !lecture.is_archived)
-      .map(toLectureItem),
+    () => allLectures.filter((l) => !l.is_archived).map(toLectureItem),
     [allLectures],
   );
+
+  const programCourseCodeSet = useMemo(() => new Set(
+    programCourses.map((c) => normalizeCourseCode(c.code)).filter((code) => code.length > 0),
+  ), [programCourses]);
+
+  const totalMyProgramLectures = useMemo(() => {
+    if (!currentProgram || programCourseCodeSet.size === 0) return [];
+    return sortLectureItems(
+      acceptedAllLectures.filter((l) => programCourseCodeSet.has(l.courseCodeNormalized)),
+    );
+  }, [acceptedAllLectures, currentProgram, programCourseCodeSet]);
 
   const normalizedQuery = normalizeQuery(searchQuery);
 
@@ -215,117 +197,15 @@ export default function Homepage({
     return mySavedActiveLectures.filter((item) => lectureMatchesQuery(item, normalizedQuery));
   }, [mySavedActiveLectures, normalizedQuery]);
 
+  const filteredMyProgramLectures = useMemo(() => {
+    if (!normalizedQuery) return totalMyProgramLectures;
+    return totalMyProgramLectures.filter((item) => lectureMatchesQuery(item, normalizedQuery));
+  }, [totalMyProgramLectures, normalizedQuery]);
+
   const filteredAllLectures = useMemo(() => {
     if (!normalizedQuery) return acceptedAllLectures;
     return acceptedAllLectures.filter((item) => lectureMatchesQuery(item, normalizedQuery));
   }, [acceptedAllLectures, normalizedQuery]);
-
-  const groupedAllLectures = (() => {
-    const byCourse = new Map<string, { courseDisplay: string; lectures: HomepageLectureItem[] }>();
-    for (const lecture of filteredAllLectures) {
-      const existing = byCourse.get(lecture.courseId);
-      if (existing) {
-        existing.lectures.push(lecture);
-      } else {
-        byCourse.set(lecture.courseId, {
-          courseDisplay: lecture.courseDisplay,
-          lectures: [lecture],
-        });
-      }
-    }
-
-    return [...byCourse.entries()]
-      .sort((entryA, entryB) => {
-        const [courseIdA, groupA] = entryA;
-        const [courseIdB, groupB] = entryB;
-        const byDisplay = groupA.courseDisplay.localeCompare(groupB.courseDisplay, undefined, { sensitivity: "base" });
-        if (byDisplay !== 0) return byDisplay;
-        return courseIdA.localeCompare(courseIdB, undefined, { sensitivity: "base" });
-      })
-      .map(([courseId, group]) => ({
-        courseId,
-        courseDisplay: group.courseDisplay,
-        lectures: sortLectureItems(group.lectures),
-      }));
-  })();
-
-  const programCourseCodeSet = useMemo(() => {
-    return new Set(
-      programCourses
-        .map((course) => normalizeCourseCode(course.code))
-        .filter((code) => code.length > 0),
-    );
-  }, [programCourses]);
-
-  const totalMyProgramLectures = useMemo(() => {
-    if (!currentProgram || programCourseCodeSet.size === 0) return [];
-    return sortLectureItems(
-      acceptedAllLectures.filter((lecture) => programCourseCodeSet.has(lecture.courseCodeNormalized)),
-    );
-  }, [acceptedAllLectures, currentProgram, programCourseCodeSet]);
-
-  const filteredMyProgramLectures = useMemo(() => {
-    if (!normalizedQuery) return totalMyProgramLectures;
-    return totalMyProgramLectures.filter((item) => lectureMatchesQuery(item, normalizedQuery));
-  }, [normalizedQuery, totalMyProgramLectures]);
-
-  const filteredAllLectureCount = groupedAllLectures.reduce(
-    (count, group) => count + group.lectures.length,
-    0,
-  );
-  const totalMyCourseLectureCount = totalMyProgramLectures.length;
-  const filteredMyCourseLectureCount = filteredMyProgramLectures.length;
-
-  function toggleCourseGroup(courseId: string) {
-    setExpandedCourseIds((prev) => (
-      prev.includes(courseId)
-        ? prev.filter((id) => id !== courseId)
-        : [...prev, courseId]
-    ));
-  }
-
-  function renderLectureCard(item: HomepageLectureItem) {
-    const { lecture, courseDisplay, displayName, kind, number } = item;
-    const pdfUrl = buildAssetUrl(lecture.pdf_url);
-
-    // Format title as "display name - kind - number"
-    const titleParts = [displayName];
-    if (kind) titleParts.push(kind);
-    if (number) titleParts.push(number);
-    const mainTitle = titleParts.join(" - ");
-
-    return (
-      <button
-        key={lecture.id}
-        type="button"
-        className="homepage-lecture-card homepage-lecture-card--interactive"
-        onClick={() => onOpenLecture(lecture.id)}
-      >
-        <div className="homepage-lecture-preview">
-          {pdfUrl ? (
-            <Document
-              file={pdfUrl}
-              loading={<div className="homepage-preview-fallback">Loading preview...</div>}
-              error={<div className="homepage-preview-fallback">Preview unavailable</div>}
-            >
-              <Page
-                pageNumber={1}
-                width={262}
-                renderTextLayer={false}
-                renderAnnotationLayer={false}
-              />
-            </Document>
-          ) : (
-            <div className="homepage-preview-fallback">Preview unavailable</div>
-          )}
-        </div>
-        <div className="homepage-lecture-info">
-          <p className="homepage-lecture-course-id">{courseDisplay}</p>
-          <p className="homepage-lecture-label">{mainTitle}</p>
-        </div>
-      </button>
-    );
-  }
 
   async function handleSaveProgram() {
     setProgramSavePending(true);
@@ -348,9 +228,47 @@ export default function Homepage({
 
   const programOptions = profileOptions?.programs ?? [];
 
+  function renderLectureCard(item: HomepageLectureItem) {
+    const { lecture, courseDisplay, displayName, kind, number } = item;
+    const pdfUrl = buildAssetUrl(lecture.pdf_url);
+    const titleParts = [displayName];
+    if (kind) titleParts.push(kind);
+    if (number) titleParts.push(number);
+    const mainTitle = titleParts.join(" - ");
+
+    return (
+      <button
+        key={lecture.id}
+        type="button"
+        className="homepage-v2-card"
+        onClick={() => onOpenLecture(lecture.id)}
+      >
+        <div className="homepage-v2-card-preview">
+          {pdfUrl ? (
+            <Document
+              file={pdfUrl}
+              loading={<div className="homepage-preview-fallback">Loading...</div>}
+              error={<div className="homepage-preview-fallback">No preview</div>}
+            >
+              <Page pageNumber={1} width={280} renderTextLayer={false} renderAnnotationLayer={false} />
+            </Document>
+          ) : (
+            <div className="homepage-preview-fallback">No preview</div>
+          )}
+        </div>
+        <div className="homepage-v2-card-meta">
+          <span className="homepage-v2-course-tag">{courseDisplay}</span>
+          <p className="homepage-v2-card-title">{mainTitle}</p>
+        </div>
+      </button>
+    );
+  }
+
   return (
-    <section className="homepage homepage--catalog app-surface app-surface--stagger">
-      <div className="homepage-search-shell app-surface-item app-surface-item--1">
+    <section className="homepage homepage-v2 app-surface app-surface--stagger">
+
+      {/* Header: search + program badge */}
+      <div className="homepage-v2-header app-surface-item app-surface-item--1">
         <input
           type="search"
           className="homepage-search-input"
@@ -358,98 +276,78 @@ export default function Homepage({
           value={searchQuery}
           onChange={(event) => setSearchQuery(event.target.value)}
         />
-      </div>
-
-      {currentProgram ? (
-        <section
-          className={`homepage-program-inline app-surface-item app-surface-item--2${isProgramMenuOpen ? " homepage-program-inline--open" : ""}`}
-        >
-          <div className="homepage-program-inline-summary">
-            <span className="homepage-program-inline-label">Program</span>
-            <strong className="homepage-program-inline-value">
-              {currentProgram.code} - {currentProgram.name}
-            </strong>
-          </div>
-          <div className="homepage-program-inline-actions">
-            {profileOptionsLoading && <span className="homepage-profile-meta">Loading options...</span>}
+        {currentProgram && (
+          <div className="homepage-v2-program-badge">
+            <div className="homepage-v2-program-badge-text">
+              <span className="homepage-v2-program-badge-label">Program</span>
+              <span className="homepage-v2-program-badge-value">{currentProgram.code} – {currentProgram.name}</span>
+            </div>
             <button
               type="button"
-              className="homepage-profile-save-btn"
+              className="homepage-v2-program-change-btn"
               onClick={() => setIsProgramMenuOpen((prev) => !prev)}
               disabled={programSavePending}
             >
-              {isProgramMenuOpen ? "Close" : "Change program"}
+              {isProgramMenuOpen ? "Close" : "Change"}
             </button>
+            {isProgramMenuOpen && (
+              <div className="homepage-program-popup" role="dialog" aria-label="Change program">
+                {profileOptionsError && <p className="homepage-profile-error">{profileOptionsError}</p>}
+                <div className="homepage-profile-field">
+                  <label htmlFor="profile-program-popup">Program</label>
+                  <ProgramPicker
+                    id="profile-program-popup"
+                    value={draftProgramId}
+                    programs={programOptions}
+                    onChange={setDraftProgramId}
+                    disabled={profileOptionsLoading || programSavePending}
+                    showAllOption
+                    showAllLabel="Show all"
+                    placeholder="Select a program"
+                  />
+                </div>
+                <div className="homepage-program-popup-actions">
+                  <button
+                    type="button"
+                    className="homepage-program-popup-cancel-btn"
+                    onClick={() => setIsProgramMenuOpen(false)}
+                    disabled={programSavePending}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="homepage-profile-save-btn"
+                    onClick={() => void handleSaveProgram()}
+                    disabled={programSavePending || profileOptionsLoading}
+                  >
+                    {programSavePending ? "Saving..." : "Save program"}
+                  </button>
+                </div>
+                {profileSaveBanner && (
+                  <p className={`homepage-profile-banner homepage-profile-banner--${profileSaveBanner.kind}`}>
+                    {profileSaveBanner.text}
+                  </p>
+                )}
+              </div>
+            )}
           </div>
+        )}
+      </div>
 
-          {isProgramMenuOpen && (
-            <div className="homepage-program-popup" role="dialog" aria-label="Change program">
-              {profileOptionsError && (
-                <p className="homepage-profile-error">{profileOptionsError}</p>
-              )}
-
-              <div className="homepage-profile-field">
-                <label htmlFor="profile-program-popup">Program</label>
-                <ProgramPicker
-                  id="profile-program-popup"
-                  value={draftProgramId}
-                  programs={programOptions}
-                  onChange={setDraftProgramId}
-                  disabled={profileOptionsLoading || programSavePending}
-                  showAllOption
-                  showAllLabel="Show all"
-                  placeholder="Select a program"
-                />
-              </div>
-
-              <div className="homepage-program-popup-actions">
-                <button
-                  type="button"
-                  className="homepage-program-popup-cancel-btn"
-                  onClick={() => setIsProgramMenuOpen(false)}
-                  disabled={programSavePending}
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  className="homepage-profile-save-btn"
-                  onClick={() => void handleSaveProgram()}
-                  disabled={programSavePending || profileOptionsLoading}
-                >
-                  {programSavePending ? "Saving..." : "Save program"}
-                </button>
-              </div>
-            </div>
-          )}
-
-          {profileSaveBanner && (
-            <p className={`homepage-profile-banner homepage-profile-banner--${profileSaveBanner.kind}`}>
-              {profileSaveBanner.text}
-            </p>
-          )}
-        </section>
-      ) : (
+      {/* Program setup — shown when no program configured */}
+      {!currentProgram && !profileLoading && (
         <section className="homepage-profile-section app-surface-item app-surface-item--2">
-          {!profileLoading && (
-            <div className="homepage-profile-setup-card">
-              <h3>Select your program</h3>
-              <p>
-                Configure your program to unlock your program courses on the homepage.
-              </p>
-            </div>
-          )}
-
+          <div className="homepage-profile-setup-card">
+            <h3>Select your program</h3>
+            <p>Configure your program to unlock your program courses on the homepage.</p>
+          </div>
           <div className="homepage-profile-editor">
             <div className="homepage-profile-editor-header">
               <h3>My study profile</h3>
               {profileOptionsLoading && <span className="homepage-profile-meta">Loading options...</span>}
             </div>
-
-            {profileOptionsError && (
-              <p className="homepage-profile-error">{profileOptionsError}</p>
-            )}
-
+            {profileOptionsError && <p className="homepage-profile-error">{profileOptionsError}</p>}
             <div className="homepage-profile-field">
               <label htmlFor="profile-program">Program</label>
               <ProgramPicker
@@ -471,7 +369,6 @@ export default function Homepage({
                 {programSavePending ? "Saving..." : "Save program"}
               </button>
             </div>
-
             {profileSaveBanner && (
               <p className={`homepage-profile-banner homepage-profile-banner--${profileSaveBanner.kind}`}>
                 {profileSaveBanner.text}
@@ -481,134 +378,54 @@ export default function Homepage({
         </section>
       )}
 
-      <section className="homepage-section app-surface-item app-surface-item--3">
-        <div className="homepage-section-heading">
-          <h2>My saved lectures</h2>
-          <span>{filteredSavedLectures.length}{mySavedActiveLectures.length !== filteredSavedLectures.length ? ` / ${mySavedActiveLectures.length}` : ""}</span>
+      {loading && (
+        <div className="homepage-loading app-surface-item app-surface-item--2">
+          <span className="spinner spinner--dark-sm" />
         </div>
-
-        {loading && (
-          <div className="homepage-loading">
-            <span className="spinner spinner--dark-sm" />
-          </div>
-        )}
-
-        {!loading && mySavedActiveLectures.length === 0 && (
-          <p className="homepage-empty">
-            You have no saved lectures yet.
-          </p>
-        )}
-
-        {!loading && mySavedActiveLectures.length > 0 && filteredSavedLectures.length === 0 && (
-          <p className="homepage-empty">
-            No saved lectures match "{searchQuery.trim()}".
-          </p>
-        )}
-
-        {!loading && filteredSavedLectures.length > 0 && (
-          <div className="homepage-carousel" role="list">
-            {filteredSavedLectures.map((lecture) => renderLectureCard(lecture))}
-          </div>
-        )}
-      </section>
-
-      {currentProgram && (
-        <section className="homepage-section app-surface-item app-surface-item--4">
-          <div className="homepage-section-heading">
-            <h2>My courses</h2>
-            <span>
-              {filteredMyCourseLectureCount}
-              {totalMyCourseLectureCount !== filteredMyCourseLectureCount ? ` / ${totalMyCourseLectureCount}` : ""}
-            </span>
-          </div>
-
-          {loading && (
-            <div className="homepage-loading">
-              <span className="spinner spinner--dark-sm" />
-            </div>
-          )}
-
-          {!loading && programCourses.length === 0 && (
-            <p className="homepage-empty">
-              No active courses are mapped to this program yet.
-            </p>
-          )}
-
-          {!loading && programCourses.length > 0 && totalMyCourseLectureCount === 0 && (
-            <p className="homepage-empty">
-              No lectures are available for this program yet.
-            </p>
-          )}
-
-          {!loading && totalMyCourseLectureCount > 0 && filteredMyCourseLectureCount === 0 && (
-            <p className="homepage-empty">
-              No lectures match "{searchQuery.trim()}" for this program.
-            </p>
-          )}
-
-          {!loading && filteredMyCourseLectureCount > 0 && (
-            <div className="homepage-carousel" role="list">
-              {filteredMyProgramLectures.map((lecture) => renderLectureCard(lecture))}
-            </div>
-          )}
-        </section>
       )}
 
-      <section className="homepage-section app-surface-item app-surface-item--5">
-        <div className="homepage-section-heading">
-          <h2>Courses</h2>
-          <span>{filteredAllLectureCount}{acceptedAllLectures.length !== filteredAllLectureCount ? ` / ${acceptedAllLectures.length}` : ""}</span>
+      {/* Saved lectures */}
+      {!loading && mySavedActiveLectures.length > 0 && (
+        <div className="homepage-v2-section app-surface-item app-surface-item--2">
+          <h2 className="homepage-v2-section-heading">Saved</h2>
+          <div className="homepage-v2-grid">
+            {filteredSavedLectures.map((item) => renderLectureCard(item))}
+            {filteredSavedLectures.length === 0 && (
+              <p className="homepage-v2-empty">No saved lectures match your search.</p>
+            )}
+          </div>
         </div>
+      )}
 
-        {loading && (
-          <div className="homepage-loading">
-            <span className="spinner spinner--dark-sm" />
+      {/* My Program lectures */}
+      {!loading && currentProgram && totalMyProgramLectures.length > 0 && (
+        <div className="homepage-v2-section app-surface-item app-surface-item--3">
+          <h2 className="homepage-v2-section-heading">My Program</h2>
+          <div className="homepage-v2-grid">
+            {filteredMyProgramLectures.map((item) => renderLectureCard(item))}
+            {filteredMyProgramLectures.length === 0 && (
+              <p className="homepage-v2-empty">No program lectures match your search.</p>
+            )}
           </div>
-        )}
+        </div>
+      )}
 
-        {!loading && acceptedAllLectures.length === 0 && (
-          <p className="homepage-empty">
-            No lectures are available yet.
-          </p>
-        )}
-
-        {!loading && acceptedAllLectures.length > 0 && filteredAllLectureCount === 0 && (
-          <p className="homepage-empty">
-            No lectures match "{searchQuery.trim()}".
-          </p>
-        )}
-
-        {!loading && groupedAllLectures.length > 0 && (
-          <div className="homepage-course-groups">
-            {groupedAllLectures.map((group, groupIndex) => {
-              const isExpanded = expandedCourseIds.includes(group.courseId);
-              const panelId = `homepage-course-panel-${groupIndex}`;
-              return (
-                <div key={group.courseId} className="homepage-course-group">
-                  <button
-                    type="button"
-                    className={`homepage-course-toggle${isExpanded ? " homepage-course-toggle--open" : ""}`}
-                    onClick={() => toggleCourseGroup(group.courseId)}
-                    aria-expanded={isExpanded}
-                    aria-controls={panelId}
-                  >
-                    <span className="homepage-course-group-title">{group.courseDisplay}</span>
-                    <span className="homepage-course-group-meta">
-                      <span className="homepage-course-group-count">{group.lectures.length}</span>
-                      <span className="homepage-course-group-chevron">▾</span>
-                    </span>
-                  </button>
-                  {isExpanded && (
-                    <div className="homepage-carousel" role="list" id={panelId}>
-                      {group.lectures.map((lecture) => renderLectureCard(lecture))}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
+      {/* All lectures */}
+      {!loading && (
+        <div className="homepage-v2-section app-surface-item app-surface-item--4">
+          <h2 className="homepage-v2-section-heading">All</h2>
+          <div className="homepage-v2-grid">
+            {acceptedAllLectures.length === 0 && (
+              <p className="homepage-v2-empty">No lectures are available yet.</p>
+            )}
+            {acceptedAllLectures.length > 0 && filteredAllLectures.length === 0 && (
+              <p className="homepage-v2-empty">No lectures match your search.</p>
+            )}
+            {filteredAllLectures.map((item) => renderLectureCard(item))}
           </div>
-        )}
-      </section>
+        </div>
+      )}
+
     </section>
   );
 }

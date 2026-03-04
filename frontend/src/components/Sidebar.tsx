@@ -1,12 +1,6 @@
 import { type KeyboardEvent } from "react";
 import type { TeachersNoteSummary } from "../types";
 
-interface ConsoleEntry {
-  id: number;
-  message: string;
-  done?: boolean;
-}
-
 interface SidebarProps {
   savedLectures: TeachersNoteSummary[];
   loading: boolean;
@@ -16,10 +10,6 @@ interface SidebarProps {
   newLectureButtonRef?: (el: HTMLButtonElement | null) => void;
   isNewLectureOverlayOpen?: boolean;
   onGoHome: () => void;
-  showUploadConsole: boolean;
-  uploadLoadingLabel: string;
-  consoleEntries?: ConsoleEntry[];
-  processingLectureName?: string | null;
   currentUserId?: string;
   onOpenProfile?: () => void;
 }
@@ -75,10 +65,6 @@ export default function Sidebar({
   newLectureButtonRef,
   isNewLectureOverlayOpen = false,
   onGoHome,
-  showUploadConsole,
-  uploadLoadingLabel,
-  consoleEntries,
-  processingLectureName,
   currentUserId,
   onOpenProfile,
 }: SidebarProps) {
@@ -111,7 +97,7 @@ export default function Sidebar({
   }
 
   return (
-    <aside className={`sidebar${showUploadConsole ? " sidebar--with-upload-console" : ""}`}>
+    <aside className="sidebar">
       <div
         className="sidebar-logo"
         role="button"
@@ -154,29 +140,6 @@ export default function Sidebar({
           </div>
         </div>
       </div>
-
-      {showUploadConsole && (
-        <div className="sidebar-upload-console sidebar-upload-console--bottom">
-          {processingLectureName && (
-            <div className="sidebar-upload-console-title">{processingLectureName}</div>
-          )}
-          {uploadLoadingLabel.trim().length > 0 && (
-            <div className="sidebar-upload-console-status">{uploadLoadingLabel}</div>
-          )}
-          <div className="upload-console upload-console--sidebar">
-            {(consoleEntries ?? []).length === 0 ? (
-              <span className="upload-console-line upload-console-line--dim">Waiting...</span>
-            ) : (
-              (consoleEntries ?? []).map((entry) => (
-                <span key={entry.id} className={`upload-console-line${entry.done ? " upload-console-line--done" : ""}`}>
-                  <span className="upload-console-text">{entry.message}</span>
-                  {entry.done && <span className="upload-console-check">✓</span>}
-                </span>
-              ))
-            )}
-          </div>
-        </div>
-      )}
 
       <div className="sidebar-bottom-menu">
         <button

@@ -36,6 +36,7 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     return max(minimum, parsed)
 
 
+
 DEFAULT_ENRICH_PROVIDER = os.getenv("ENRICH_PROVIDER", "anthropic").strip().lower() or "anthropic"
 DEFAULT_ENRICH_MODEL_OVERRIDE = os.getenv("ENRICH_MODEL", "").strip()
 DEFAULT_ENRICH_MODEL_ANTHROPIC = os.getenv("ENRICH_MODEL_ANTHROPIC", "claude-haiku-4-5").strip() or "claude-haiku-4-5"
@@ -53,31 +54,35 @@ Du får en föreläsningsbild (slide) och en transkription av vad föreläsaren 
 Din uppgift är att skapa berikade anteckningar på svenska med strikt relevans till sliden:
 1. Fokus ska vara det som visas eller direkt förklarar sliden.
 2. Ignorera operativt prat och småprat (t.ex. kamera, mikrofon, ljud, pauser, adminpåminnelser).
-3. I lecturer_additions får du ta med högst EN punkt som inte står på sliden, men bara om den är akademiskt kursrelevant.
+3. I lecturer_additions får du ta med upp till 3 punkter som inte står på sliden, men bara om de är akademiskt kursrelevanta och hjälper studenten förstå ämnet djupare.
 4. Ta aldrig med praktiska/logistiska detaljer som inte hjälper studenten förstå slideinnehållet.
-5. Håll anteckningarna informativa, inte för korta: summary ska vara en fullständig informativ mening, slide_content ska ha 2-4 substantiella punkter, lecturer_additions ska ha 3-6 punkter när relevant material finns, och key_takeaways ska vara 3 konkreta punkter.
-6. Markera den viktigaste termen i varje punkt i slide_content, lecturer_additions och key_takeaways med markdown-formatet **viktig term** (helst en gång per punkt).
+5. Håll anteckningarna informativa, inte för korta: summary ska vara en fullständig informativ mening, slide_content ska ha 2-4 substantiella punkter, lecturer_additions ska ha 3-6 punkter när relevant material finns, och key_takeaways ska ha 2-4 konkreta punkter beroende på hur innehållsrikt sliden är.
+6. Markera den viktigaste termen i varje punkt i slide_content, lecturer_additions och key_takeaways med markdown-formatet **viktig term** (helst en gång per punkt). Om föreläsaren definierade en term, skriv definitionen direkt efter termen i parentes: **term** (= definition).
+7. Om föreläsaren gav ett konkret exempel eller analogi, inkludera det som en punkt i lecturer_additions med prefixet "Exempel: ...".
+8. Om föreläsaren explicit markerade något som tentarelevant eller extra viktigt, lägg till prefixet "[Tentaviktigt]" på den punkten i lecturer_additions eller key_takeaways.
 
 Svara ALLTID med ett JSON-objekt (inga kodblock, bara ren JSON) med dessa fält:
 {
-  "summary": "Exakt en komplett och informativ mening som sammanfattar slidens ämne",
+  "summary": "En komplett och informativ mening som sammanfattar slidens ämne och varför det är relevant i kursens sammanhang (om det framgår av transkriptionen)",
   "slide_content": "2-4 punktlistor där varje rad börjar med '- ' och är direkt slide-relevanta",
-  "lecturer_additions": "3-6 punktlistor där varje rad börjar med '- '. Högst en punkt får vara akademisk kontext utanför sliden.",
-  "key_takeaways": ["exakt tre takeaways"]
+  "lecturer_additions": "3-6 punktlistor där varje rad börjar med '- '. Upp till 3 punkter får vara akademisk kontext utanför sliden.",
+  "key_takeaways": ["2-4 takeaways beroende på slidens innehållsrikedom"]
 }"""
 
 STRICT_SYSTEM_PROMPT = """Du måste svara med ENDAST ett giltigt JSON-objekt.
 Ingen inledande text, inga kodblock, inga extra nycklar.
 Innehållet måste vara strikt slide-relevant.
 Ignorera operativt prat/småprat (kamera, mikrofon, ljud, zoom, paus, admin).
-I lecturer_additions får högst en punkt vara akademisk kontext utanför sliden.
-Undvik ultrakorta svar: summary ska vara informativ, slide_content ska normalt ha 2-4 punkter och key_takeaways ska vara 3 tydliga punkter.
-Markera viktigaste term i varje punkt i slide_content, lecturer_additions och key_takeaways med **...** (helst en gång per punkt).
+I lecturer_additions får upp till 3 punkter vara akademisk kontext utanför sliden.
+Undvik ultrakorta svar: summary ska vara informativ, slide_content ska normalt ha 2-4 punkter och key_takeaways ska ha 2-4 tydliga punkter beroende på slidens innehållsrikedom.
+Markera viktigaste term i varje punkt i slide_content, lecturer_additions och key_takeaways med **...** (helst en gång per punkt). Om föreläsaren definierade en term, skriv definitionen direkt efter: **term** (= definition).
+Om föreläsaren gav ett konkret exempel eller analogi, inkludera det i lecturer_additions med prefixet "Exempel: ...".
+Om föreläsaren explicit markerade något som tentarelevant eller extra viktigt, lägg till prefixet "[Tentaviktigt]" på den punkten.
 Använd exakt dessa nycklar:
-- summary (string, en komplett informativ mening)
+- summary (string, en komplett informativ mening som förklarar ämnet och dess relevans om det framgår)
 - slide_content (string med 2-4 punktlistor där varje rad börjar med '- ' och är slide-relevanta)
-- lecturer_additions (string med 3-6 punktlistor där varje rad börjar med '- ', där högst en punkt är icke-slide men akademisk)
-- key_takeaways (array med exakt 3 strings)"""
+- lecturer_additions (string med 3-6 punktlistor där varje rad börjar med '- ', där upp till 3 punkter får vara icke-slide men akademiska)
+- key_takeaways (array med 2-4 strings)"""
 
 KEY_ALIASES = {
     "summary": ("summary", "sammanfattning", "overview", "title"),
@@ -202,13 +207,13 @@ RELEVANCE_STOPWORDS = {
     "eller",
 }
 
-MAX_MISC_ACADEMIC_BULLETS = 1
+MAX_MISC_ACADEMIC_BULLETS = 3
 MAX_LECTURER_ADDITIONS_BULLETS = 6
 MIN_LECTURER_ADDITIONS_BULLETS = 4
 MIN_SLIDE_CONTENT_BULLETS = 2
 MAX_SLIDE_CONTENT_BULLETS = 4
-MIN_KEY_TAKEAWAYS = 3
-MAX_KEY_TAKEAWAYS = 3
+MIN_KEY_TAKEAWAYS = 2
+MAX_KEY_TAKEAWAYS = 4
 TARGET_MIN_DEPTH_RATIO = 1.0
 MIN_NOTE_WORD_FLOOR = 60
 MAX_NOTE_WORD_FLOOR = 280
@@ -302,9 +307,13 @@ def _usage_from_response(response: Any, provider: str) -> dict[str, int]:
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
-    if anthropic is not None and isinstance(exc, anthropic.RateLimitError):
-        return True
-    return exc.__class__.__name__.lower() == "ratelimiterror"
+    if anthropic is not None:
+        _overloaded = getattr(anthropic, 'OverloadedError', None)
+        _types = (anthropic.RateLimitError,) + ((_overloaded,) if _overloaded else ())
+        if isinstance(exc, _types):
+            return True
+    name = exc.__class__.__name__.lower()
+    return name in ("ratelimiterror", "overloadederror")
 
 
 def _is_connection_error(exc: Exception) -> bool:
@@ -1192,7 +1201,7 @@ def enrich_slide_with_retry(
             if attempt < max_attempts - 1:
                 wait = min(8, attempt + 1)
                 msg = (
-                    f"⚠️ Invalid enrichment payload on slide {slide_num} "
+                    f"⚠️ Enrichment error on slide {slide_num} [{exc.reason}] "
                     f"(attempt {attempt + 1}/{max_attempts}), retrying in {wait}s..."
                 )
                 print(f"  {msg}", flush=True)
@@ -1215,7 +1224,7 @@ def enrich_slide_with_retry(
                 if attempt < max_attempts - 1:
                     wait = min(8, attempt + 1)
                     msg = (
-                        f"⚠️ Invalid enrichment payload on slide {slide_num} "
+                        f"⚠️ Enrichment exception on slide {slide_num} [{type(exc).__name__}: {exc}] "
                         f"(attempt {attempt + 1}/{max_attempts}), retrying in {wait}s..."
                     )
                     print(f"  {msg}", flush=True)

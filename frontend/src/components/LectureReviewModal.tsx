@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { approveLecture, buildAssetUrl, getCourses, getLecture, rejectLecture } from "../api";
 import type { CanonicalLectureKind, Course, LectureDetail, TeachersNoteSummary } from "../types";
 import ConfirmDialog from "./ConfirmDialog";
@@ -49,14 +49,19 @@ export default function LectureReviewModal({ lecture, onApproved, onRejected, on
   const [courseid, setCourseid] = useState("");
   const [kind, setKind] = useState<CanonicalLectureKind>("lecture");
   const [lectureValue, setLectureValue] = useState("");
-  const [year, setYear] = useState("");
+  const [year, setYear] = useState(new Date().getFullYear().toString());
+  const [courseOpen, setCourseOpen] = useState(false);
+  const [courseSearch, setCourseSearch] = useState("");
+  const [kindOpen, setKindOpen] = useState(false);
+  const coursePickerRef = useRef<HTMLDivElement>(null);
+  const kindPickerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const parsed = parseLectureName(lecture.name);
     setCourseid((lecture.course_id ?? parsed?.courseid ?? "").trim());
     setKind(toCanonicalKind(lecture.naming_kind ?? parsed?.kind ?? "lecture"));
     setLectureValue((lecture.naming_lecture ?? parsed?.lecture ?? "").trim());
-    setYear((lecture.naming_year ?? parsed?.year ?? "").trim());
+    setYear((lecture.naming_year ?? parsed?.year ?? new Date().getFullYear().toString()).trim());
     setActionError(null);
   }, [lecture]);
 
@@ -107,6 +112,28 @@ export default function LectureReviewModal({ lecture, onApproved, onRejected, on
       setCourseid("");
     }
   }, [courseid, coursesLoading, hasSelectedCourse]);
+
+  useEffect(() => {
+    if (!courseOpen) return;
+    function handleClick(e: MouseEvent) {
+      if (coursePickerRef.current && !coursePickerRef.current.contains(e.target as Node)) {
+        setCourseOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [courseOpen]);
+
+  useEffect(() => {
+    if (!kindOpen) return;
+    function handleClick(e: MouseEvent) {
+      if (kindPickerRef.current && !kindPickerRef.current.contains(e.target as Node)) {
+        setKindOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [kindOpen]);
 
   const onPrev = useCallback(() => setActiveSlide((s) => Math.max(0, s - 1)), []);
   const onNext = useCallback(() => {
@@ -197,34 +224,89 @@ export default function LectureReviewModal({ lecture, onApproved, onRejected, on
           </div>
         </header>
         <div className="review-metadata">
-          <label className="review-metadata-field">
+          <div className="review-metadata-field">
             <span>Course</span>
-            <select
-              value={courseid}
-              disabled={actionInFlight !== null || coursesLoading}
-              onChange={(event) => setCourseid(event.target.value)}
-            >
-              <option value="">
-                {coursesLoading ? "Loading courses..." : "Select active course"}
-              </option>
-              {activeCourses.map((course) => (
-                <option key={course.id} value={course.code}>
-                  {course.name} ({course.display_code || course.code})
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="review-metadata-field">
+            <div className="program-picker" ref={coursePickerRef}>
+              <button
+                type="button"
+                className={`program-picker-trigger${courseOpen ? " program-picker-trigger--open" : ""}`}
+                disabled={actionInFlight !== null || coursesLoading}
+                onClick={() => { if (!coursesLoading) setCourseOpen((o) => !o); }}
+              >
+                <span className={`program-picker-trigger-text${!courseid ? " program-picker-trigger-text--placeholder" : ""}`}>
+                  {coursesLoading
+                    ? "Loading courses…"
+                    : courseid
+                      ? (() => { const c = activeCourses.find((x) => x.code === courseid); return c ? `${c.name} (${c.display_code || c.code})` : courseid; })()
+                      : "Select active course"}
+                </span>
+                <span className="program-picker-trigger-chevron">▾</span>
+              </button>
+              {courseOpen && (
+                <div className="program-picker-popover">
+                  <div className="program-picker-search">
+                    <input
+                      className="program-picker-search-input"
+                      type="text"
+                      placeholder="Search courses…"
+                      value={courseSearch}
+                      onChange={(e) => setCourseSearch(e.target.value)}
+                      autoFocus
+                    />
+                  </div>
+                  {activeCourses
+                    .filter((c) => {
+                      const q = courseSearch.trim().toLowerCase();
+                      return !q || c.code.toLowerCase().includes(q) || c.name.toLowerCase().includes(q);
+                    })
+                    .map((course) => (
+                      <div
+                        key={course.id}
+                        className={`program-picker-option${course.code === courseid ? " program-picker-option--active" : ""}`}
+                        onClick={() => { setCourseid(course.code); setCourseOpen(false); setCourseSearch(""); }}
+                      >
+                        {course.name} ({course.display_code || course.code})
+                      </div>
+                    ))}
+                  {activeCourses.filter((c) => {
+                    const q = courseSearch.trim().toLowerCase();
+                    return !q || c.code.toLowerCase().includes(q) || c.name.toLowerCase().includes(q);
+                  }).length === 0 && (
+                    <div className="program-picker-empty">No courses found</div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+          <div className="review-metadata-field">
             <span>Kind</span>
-            <select
-              value={kind}
-              disabled={actionInFlight !== null}
-              onChange={(event) => setKind(event.target.value === "other" ? "other" : "lecture")}
-            >
-              <option value="lecture">lecture</option>
-              <option value="other">other</option>
-            </select>
-          </label>
+            <div className="program-picker" ref={kindPickerRef}>
+              <button
+                type="button"
+                className={`program-picker-trigger${kindOpen ? " program-picker-trigger--open" : ""}`}
+                disabled={actionInFlight !== null}
+                onClick={() => setKindOpen((o) => !o)}
+              >
+                <span className="program-picker-trigger-text">
+                  {kind === "other" ? "Other" : "Lecture"}
+                </span>
+                <span className="program-picker-trigger-chevron">▾</span>
+              </button>
+              {kindOpen && (
+                <div className="program-picker-popover">
+                  {[{ value: "lecture", label: "Lecture" }, { value: "other", label: "Other" }].map((opt) => (
+                    <div
+                      key={opt.value}
+                      className={`program-picker-option${kind === opt.value ? " program-picker-option--active" : ""}`}
+                      onClick={() => { setKind(opt.value as CanonicalLectureKind); setKindOpen(false); }}
+                    >
+                      {opt.label}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
           <label className="review-metadata-field">
             <span>Lecture</span>
             <input

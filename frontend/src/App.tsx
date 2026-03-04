@@ -25,6 +25,7 @@ import {
   unsaveLecture,
 } from "./api";
 import UploadForm from "./components/UploadForm";
+import ProcessingConsoleOverlay from "./components/ProcessingConsoleOverlay";
 import ResizableSplitPane, { NOTES_PRESENTATION_SPLIT_STORAGE_KEY } from "./components/ResizableSplitPane";
 import SlideViewer from "./components/SlideViewer";
 import TranscriptPanel from "./components/TranscriptPanel";
@@ -190,8 +191,13 @@ export default function App() {
   const [archivePending, setArchivePending] = useState(false);
   const [archiveBanner, setArchiveBanner] = useState<{ kind: "success" | "error"; text: string } | null>(null);
   const [uploadLoadingLabel, setUploadLoadingLabel] = useState("");
-  const [processingLectureName, setProcessingLectureName] = useState<string | null>(null);
+  const [_processingLectureName, setProcessingLectureName] = useState<string | null>(null);
   const [processToast, setProcessToast] = useState<ProcessToast | null>(null);
+  const [processOverlayDismissed, setProcessOverlayDismissed] = useState(false);
+  const [processOverlayDoneData, setProcessOverlayDoneData] = useState<{
+    lectureId: number;
+    downloadUrl: string | null;
+  } | null>(null);
   const [isNewLectureOverlayOpen, setIsNewLectureOverlayOpen] = useState(false);
   const [newLectureButtonRect, setNewLectureButtonRect] = useState<OverlayAnchorRect | null>(null);
   const [demoPreviewActive, setDemoPreviewActive] = useState(false);
@@ -414,6 +420,8 @@ export default function App() {
     processLastEventIdRef.current = 0;
     setUploadLoadingLabel("");
     setProcessingLectureName(null);
+    setProcessOverlayDismissed(false);
+    setProcessOverlayDoneData(null);
     if (clearPersisted) {
       clearStorageWithLegacy(ACTIVE_PROCESS_JOB_STORAGE_KEY, LEGACY_ACTIVE_PROCESS_JOB_STORAGE_KEY);
     }
@@ -519,6 +527,7 @@ export default function App() {
         text: completionWarning ?? "Lecture processed successfully.",
         lectureId,
       });
+      setProcessOverlayDoneData({ lectureId, downloadUrl: null });
       return;
     }
 
@@ -530,6 +539,7 @@ export default function App() {
       setProcessToast(null);
       setProcessChat([]);
       setUploadLoadingLabel("");
+      setProcessOverlayDoneData({ lectureId, downloadUrl: data.download_url ?? null });
     } catch (err) {
       const detailError = toErrorMessage(err);
       const refreshSuffix = refreshResult.ok
@@ -1365,10 +1375,15 @@ export default function App() {
   const isWorkspaceRoute = isWorkspacePath(location.pathname);
   const isAdminRoute = location.pathname === "/admin";
   const isUploadActive = processJob?.status === "queued" || processJob?.status === "running";
-  const hasUploadLabel = uploadLoadingLabel.trim().length > 0;
   const hasUploadEntries = processChat.length > 0;
   const showUploadErrorLogs = processJob?.status === "error" && hasUploadEntries;
-  const showSidebarUploadConsole = isUploadActive || hasUploadLabel || showUploadErrorLogs;
+  const showProcessOverlay = !processOverlayDismissed && (
+    (mainView.view === "upload" && mainView.loading)
+    || isUploadActive
+    || showUploadErrorLogs
+    || processOverlayDoneData !== null
+  );
+  const isOverlayStarting = mainView.view === "upload" && mainView.loading && !processJob;
   const showBackendOfflineBanner = backendOnline === false && !demoPreviewActive;
   const newLectureOverlayStyle = useMemo(() => {
     if (!newLectureButtonRect) return undefined;
@@ -1377,12 +1392,11 @@ export default function App() {
       left: `${Math.round(newLectureButtonRect.right + 12)}px`,
     };
   }, [newLectureButtonRect]);
-  const handleOpenLectureFromToast = useCallback(() => {
-    if (!processToast?.lectureId) return;
+  const handleOpenLectureFromOverlay = useCallback((id: number) => {
+    setProcessOverlayDismissed(true);
     setIsNewLectureOverlayOpen(false);
-    setProcessToast(null);
-    navigate(`/lectures/${processToast.lectureId}`);
-  }, [navigate, processToast]);
+    navigate(`/lectures/${id}`);
+  }, [navigate]);
   const canShowTrashAction = (
     isAdmin
     && isWorkspaceRoute
@@ -1552,10 +1566,6 @@ export default function App() {
         newLectureButtonRef={handleNewLectureButtonRef}
         isNewLectureOverlayOpen={isNewLectureOverlayOpen}
         onGoHome={handleGoHome}
-        showUploadConsole={showSidebarUploadConsole}
-        uploadLoadingLabel={uploadLoadingLabel}
-        consoleEntries={consoleEntries}
-        processingLectureName={processingLectureName}
         currentUserId={authUser?.uuid ?? ""}
         onOpenProfile={() => navigate("/profile")}
       />
@@ -1683,25 +1693,18 @@ export default function App() {
         </div>
       )}
 
-      {processToast && (
-        <div className={`process-toast process-toast--${processToast.kind}`} role="status" aria-live="polite">
-          <p className="process-toast-text">{processToast.text}</p>
-          <div className="process-toast-actions">
-            {processToast.lectureId && (
-              <button type="button" className="process-toast-open-btn" onClick={handleOpenLectureFromToast}>
-                Open lecture
-              </button>
-            )}
-            <button
-              type="button"
-              className="process-toast-dismiss-btn"
-              onClick={() => setProcessToast(null)}
-            >
-              Dismiss
-            </button>
-          </div>
-        </div>
+      {showProcessOverlay && (
+        <ProcessingConsoleOverlay
+          job={processJob}
+          consoleEntries={consoleEntries}
+          statusLabel={uploadLoadingLabel}
+          isStarting={isOverlayStarting}
+          doneData={processOverlayDoneData}
+          onDismiss={() => setProcessOverlayDismissed(true)}
+          onOpenLecture={handleOpenLectureFromOverlay}
+        />
       )}
+
 
       {deleteDialogOpen && deleteTarget && (
         <div

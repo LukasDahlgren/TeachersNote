@@ -124,11 +124,11 @@ class RelevancePolicyTests(unittest.TestCase):
         slide_bullets = [line for line in filtered["slide_content"].splitlines() if line.strip()]
         self.assertGreaterEqual(len(slide_bullets), 2)
         self.assertLessEqual(len(slide_bullets), 4)
-        self.assertGreaterEqual(len(filtered["key_takeaways"]), 3)
-        self.assertLessEqual(len(filtered["key_takeaways"]), 3)
+        self.assertGreaterEqual(len(filtered["key_takeaways"]), 2)
+        self.assertLessEqual(len(filtered["key_takeaways"]), 4)
         self.assertFalse(any("paus" in line.lower() for line in slide_bullets))
 
-    def test_lecturer_additions_allows_at_most_one_academic_misc_point(self) -> None:
+    def test_lecturer_additions_caps_academic_misc_points(self) -> None:
         payload = {
             "summary": "Backpropagation anvander kedjeregeln.",
             "slide_content": "- Kedjeregeln gor gradientberakning mojlig",
@@ -143,7 +143,7 @@ class RelevancePolicyTests(unittest.TestCase):
 
         lines = [line.strip() for line in filtered["lecturer_additions"].splitlines() if line.strip()]
         misc_count = sum("tenta" in line.lower() or "labb" in line.lower() for line in lines)
-        self.assertLessEqual(misc_count, 1)
+        self.assertLessEqual(misc_count, 3)
         self.assertTrue(any("kedjeregeln" in line.lower() for line in lines))
 
     def test_takeaways_remain_valid_list_after_filtering(self) -> None:
@@ -161,7 +161,7 @@ class RelevancePolicyTests(unittest.TestCase):
 
         self.assertIsInstance(filtered["key_takeaways"], list)
         self.assertGreater(len(filtered["key_takeaways"]), 0)
-        self.assertLessEqual(len(filtered["key_takeaways"]), 3)
+        self.assertLessEqual(len(filtered["key_takeaways"]), 4)
         self.assertFalse(is_enriched_payload_invalid(filtered))
 
     def test_length_guardrail_restores_depth_with_moderate_candidates(self) -> None:
