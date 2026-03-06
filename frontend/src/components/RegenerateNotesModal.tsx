@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { subscribeRegenerateNotesEvents } from "../api";
+import { useEffect, useRef, useState } from "react";
+import { useRegenerationJobController } from "../hooks/useRegenerationJobController";
 import type { RegenerateNotesJobStatus } from "../types";
 import "./RegenerateNotesModal.css";
 
@@ -14,32 +14,34 @@ export default function RegenerateNotesModal({
   jobStatus,
   onClose,
 }: RegenerateNotesModalProps) {
-  const [status, setStatus] = useState<RegenerateNotesJobStatus>(jobStatus);
   const [error, setError] = useState<string | null>(null);
+  const latestStatusRef = useRef(jobStatus);
+  const { attachToJob, job, stop } = useRegenerationJobController({
+    onDone: async (_lectureId, status) => {
+      setError(null);
+      latestStatusRef.current = status;
+    },
+    onError: (message, status) => {
+      if (status) {
+        latestStatusRef.current = status;
+      }
+      setError(message);
+    },
+  });
+  const status = job ?? latestStatusRef.current;
 
   useEffect(() => {
-    if (status.status === "done" || status.status === "error") {
+    latestStatusRef.current = jobStatus;
+  }, [jobStatus, latestStatusRef]);
+
+  useEffect(() => {
+    if (jobStatus.status === "done" || jobStatus.status === "error") {
       return;
     }
 
-    const unsubscribe = subscribeRegenerateNotesEvents(status.job_id, {
-      onProgress: (event) => {
-        setStatus(event);
-      },
-      onDone: (event) => {
-        setStatus(event);
-      },
-      onError: (event) => {
-        setStatus(event);
-        setError(event.error || "An error occurred during regeneration.");
-      },
-      onTransportError: () => {
-        setError("Connection lost. Please refresh or close this modal.");
-      },
-    });
-
-    return unsubscribe;
-  }, [status.job_id, status.status]);
+    attachToJob(jobStatus.job_id, jobStatus.lecture_id);
+    return stop;
+  }, [attachToJob, jobStatus.job_id, jobStatus.lecture_id, jobStatus.status, stop]);
 
   const isDone = status.status === "done";
   const isError = status.status === "error";

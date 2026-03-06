@@ -3,20 +3,13 @@ import { Document, Page } from "react-pdf";
 import { buildAssetUrl } from "../api";
 import type { TeachersNoteSummary } from "../types";
 import { ensurePdfWorker } from "../pdfWorker";
+import { splitLectureName } from "../utils/lectureNaming";
 
 interface HomepageProps {
   savedLectures: TeachersNoteSummary[];
   allLectures: TeachersNoteSummary[];
   loading: boolean;
   onOpenLecture: (id: number) => void;
-}
-
-interface LectureNameParts {
-  courseId: string;
-  lectureLabel: string;
-  displayName: string;
-  kind: string;
-  number: string;
 }
 
 interface HomepageLectureItem {
@@ -38,46 +31,6 @@ interface HomepageSectionState {
 }
 
 const HOMEPAGE_SECTION_STORAGE_KEY = "teachers-note.homepage-sections";
-
-function stripExtension(value: string): string {
-  return value.replace(/\.[^./\\]+$/, "");
-}
-
-function splitLectureName(name: string): LectureNameParts {
-  const cleanedName = stripExtension(name).replace(/\s+/g, " ").trim();
-  if (!cleanedName) {
-    return { courseId: "Lecture", lectureLabel: "Lecture", displayName: "Lecture", kind: "", number: "" };
-  }
-
-  const courseId = cleanedName.split(/[-\s_]+/).filter(Boolean)[0] ?? cleanedName;
-  let lectureLabel = cleanedName.slice(courseId.length).replace(/^[\s_-]+/, "").trim();
-  if (!lectureLabel) lectureLabel = cleanedName;
-
-  const parts = lectureLabel.split(/[-\s_]+/).filter(Boolean);
-  let displayName = lectureLabel;
-  let kind = "";
-  let number = "";
-
-  if (parts.length >= 2) {
-    const lastPart = parts[parts.length - 1];
-    if (/^\d+$/.test(lastPart)) {
-      number = lastPart;
-      const potentialKind = parts[parts.length - 2];
-      if (/^[a-z]/i.test(potentialKind) && !/^\d+$/.test(potentialKind)) {
-        kind = potentialKind;
-        displayName = parts.slice(0, parts.length - 2).join(" ");
-        if (!displayName) {
-          displayName = potentialKind;
-          kind = "";
-        }
-      } else {
-        displayName = parts.slice(0, parts.length - 1).join(" ");
-      }
-    }
-  }
-
-  return { courseId, lectureLabel, displayName, kind, number };
-}
 
 function normalizeQuery(value: string): string {
   return value.trim().toLowerCase();

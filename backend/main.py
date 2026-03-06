@@ -25,6 +25,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from db import AsyncSessionLocal, get_db, init_db
 from catalog_sync import run_catalog_sync
 import chatbot as _chatbot
+try:
+    from jobs.regeneration_jobs import RegenerationJobStore
+    from jobs.upload_jobs import UploadJobStore
+except ImportError:  # pragma: no cover - package import fallback
+    from backend.jobs.regeneration_jobs import RegenerationJobStore
+    from backend.jobs.upload_jobs import UploadJobStore
 from media_download import (
     RecordingSourceKind,
     RemoteMediaDownloadError,
@@ -70,6 +76,18 @@ from scripts.enrich import (
     is_enriched_payload_invalid,
     normalize_enriched_payload,
 )
+try:
+    from services import lecture_access as _lecture_access_service
+    from services import naming as _naming_service
+    from services import regeneration as _regeneration_service
+    from services import serializers as _serializers_service
+    from services import upload_workflow as _upload_workflow_service
+except ImportError:  # pragma: no cover - package import fallback
+    from backend.services import lecture_access as _lecture_access_service
+    from backend.services import naming as _naming_service
+    from backend.services import regeneration as _regeneration_service
+    from backend.services import serializers as _serializers_service
+    from backend.services import upload_workflow as _upload_workflow_service
 
 
 @asynccontextmanager
@@ -110,12 +128,14 @@ JOB_STATUS_DONE = "done"
 JOB_STATUS_ERROR = "error"
 JOB_TTL_SECONDS = int(os.getenv("REGENERATE_NOTES_JOB_TTL_SECONDS", "1800"))
 UPLOAD_JOB_TTL_SECONDS = int(os.getenv("PROCESS_UPLOAD_JOB_TTL_SECONDS", "1800"))
-REGEN_JOB_STORE: dict[str, dict[str, Any]] = {}
-ACTIVE_REGEN_JOB_BY_LECTURE: dict[int, str] = {}
-REGEN_JOB_LOCK = asyncio.Lock()
-UPLOAD_JOB_STORE: dict[str, dict[str, Any]] = {}
-ACTIVE_UPLOAD_JOB_IDS: dict[str, str] = {}  # user_id → job_id
-UPLOAD_JOB_LOCK = asyncio.Lock()
+REGEN_JOBS = RegenerationJobStore(
+    ttl_seconds=JOB_TTL_SECONDS,
+    terminal_statuses=TERMINAL_JOB_STATUSES,
+)
+UPLOAD_JOBS = UploadJobStore(
+    ttl_seconds=UPLOAD_JOB_TTL_SECONDS,
+    terminal_statuses=TERMINAL_JOB_STATUSES,
+)
 DEMO_LECTURE_NAME = "IB133N-lecture-14-2026"
 ALLOWED_CANONICAL_KINDS = {"lecture", "other"}
 
@@ -653,19 +673,11 @@ def _rollback_staged_lecture_assets(staged_assets: list[StagedLectureAsset]) -> 
 
 
 async def _assert_lecture_can_be_permanently_deleted(lecture_id: int) -> None:
-    active_regen_job = await _get_active_job_for_lecture(lecture_id)
-    if active_regen_job is not None:
-        raise HTTPException(
-            status_code=409,
-            detail="Lecture is currently regenerating notes. Wait for the job to finish before deleting it.",
-        )
-
-    active_upload_job = await _get_active_upload_job_for_lecture(lecture_id)
-    if active_upload_job is not None:
-        raise HTTPException(
-            status_code=409,
-            detail="Lecture is still processing. Wait for the upload job to finish before deleting it.",
-        )
+    await _lecture_access_service._assert_lecture_can_be_permanently_deleted(
+        lecture_id,
+        get_active_job_for_lecture=_get_active_job_for_lecture,
+        get_active_upload_job_for_lecture=_get_active_upload_job_for_lecture,
+    )
 
 
 async def _permanently_delete_lecture(db: AsyncSession, lecture: Lecture) -> None:
@@ -1181,44 +1193,19 @@ async def _apply_archive_state(db: AsyncSession, lecture: Lecture, *, archive: b
 
 
 def _job_public_state(job: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "job_id": job["job_id"],
-        "lecture_id": job["lecture_id"],
-        "status": job["status"],
-        "total_slides": job["total_slides"],
-        "completed_slides": job["completed_slides"],
-        "current_slide": job["current_slide"],
-        "regenerated_slides": job["regenerated_slides"],
-        "error": job["error"],
-        "updated_at": datetime.fromtimestamp(job["updated_at"], tz=timezone.utc).isoformat(),
-    }
+    return REGEN_JOBS.public_state(job)
 
 
 def _sse_event(event_name: str, payload: dict[str, Any]) -> str:
-    return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    return REGEN_JOBS.sse_event(event_name, payload)
 
 
 async def _cleanup_expired_jobs() -> None:
-    now = time.time()
-    async with REGEN_JOB_LOCK:
-        expired = [
-            job_id
-            for job_id, job in REGEN_JOB_STORE.items()
-            if job["status"] in TERMINAL_JOB_STATUSES and (now - float(job["updated_at"])) > JOB_TTL_SECONDS
-        ]
-        for job_id in expired:
-            lecture_id = int(REGEN_JOB_STORE[job_id]["lecture_id"])
-            if ACTIVE_REGEN_JOB_BY_LECTURE.get(lecture_id) == job_id:
-                ACTIVE_REGEN_JOB_BY_LECTURE.pop(lecture_id, None)
-            REGEN_JOB_STORE.pop(job_id, None)
+    await REGEN_JOBS.cleanup_expired_jobs()
 
 
 async def _get_job_snapshot(job_id: str) -> dict[str, Any] | None:
-    async with REGEN_JOB_LOCK:
-        job = REGEN_JOB_STORE.get(job_id)
-        if not job:
-            return None
-        return dict(job)
+    return await REGEN_JOBS.get_job_snapshot(job_id)
 
 
 async def _assert_user_can_view_regen_job(
@@ -1233,136 +1220,43 @@ async def _assert_user_can_view_regen_job(
 
 
 async def _get_active_job_for_lecture(lecture_id: int) -> dict[str, Any] | None:
-    async with REGEN_JOB_LOCK:
-        job_id = ACTIVE_REGEN_JOB_BY_LECTURE.get(lecture_id)
-        if not job_id:
-            return None
-        job = REGEN_JOB_STORE.get(job_id)
-        if not job or job["status"] in TERMINAL_JOB_STATUSES:
-            ACTIVE_REGEN_JOB_BY_LECTURE.pop(lecture_id, None)
-            return None
-        return dict(job)
+    return await REGEN_JOBS.get_active_job_for_lecture(lecture_id)
 
 
 async def _create_job(lecture_id: int, total_slides: int) -> dict[str, Any]:
-    job_id = uuid.uuid4().hex
-    now = time.time()
-    job = {
-        "job_id": job_id,
-        "lecture_id": lecture_id,
-        "status": JOB_STATUS_QUEUED,
-        "total_slides": total_slides,
-        "completed_slides": 0,
-        "current_slide": None,
-        "regenerated_slides": 0,
-        "error": None,
-        "updated_at": now,
-        "version": 0,
-    }
-    async with REGEN_JOB_LOCK:
-        REGEN_JOB_STORE[job_id] = job
-        ACTIVE_REGEN_JOB_BY_LECTURE[lecture_id] = job_id
-    return dict(job)
+    return await REGEN_JOBS.create_job(lecture_id, total_slides)
 
 
 async def _update_job(job_id: str, **updates: Any) -> dict[str, Any] | None:
-    async with REGEN_JOB_LOCK:
-        job = REGEN_JOB_STORE.get(job_id)
-        if not job:
-            return None
-        job.update(updates)
-        job["updated_at"] = time.time()
-        job["version"] = int(job["version"]) + 1
-        if job["status"] in TERMINAL_JOB_STATUSES:
-            lecture_id = int(job["lecture_id"])
-            if ACTIVE_REGEN_JOB_BY_LECTURE.get(lecture_id) == job_id:
-                ACTIVE_REGEN_JOB_BY_LECTURE.pop(lecture_id, None)
-        return dict(job)
+    return await REGEN_JOBS.update_job(job_id, **updates)
 
 
 def _upload_job_public_state(job: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "job_id": job["job_id"],
-        "status": job["status"],
-        "current_stage": job["current_stage"],
-        "progress_pct": int(job["progress_pct"]),
-        "lecture_id": job["lecture_id"],
-        "total_slides": job.get("total_slides"),
-        "pdf_url": job.get("pdf_url"),
-        "reused_existing": bool(job.get("reused_existing")),
-        "error": job["error"],
-        "updated_at": datetime.fromtimestamp(job["updated_at"], tz=timezone.utc).isoformat(),
-    }
+    return UPLOAD_JOBS.public_state(job)
 
 
 def _upload_sse_event(event_name: str, payload: dict[str, Any], event_id: int) -> str:
-    return f"id: {event_id}\n{_sse_event(event_name, payload)}"
+    return UPLOAD_JOBS.sse_event(event_name, payload, event_id)
 
 
 async def _cleanup_expired_upload_jobs() -> None:
-    now = time.time()
-    async with UPLOAD_JOB_LOCK:
-        expired = [
-            job_id
-            for job_id, job in UPLOAD_JOB_STORE.items()
-            if job["status"] in TERMINAL_JOB_STATUSES and (now - float(job["updated_at"])) > UPLOAD_JOB_TTL_SECONDS
-        ]
-        for job_id in expired:
-            uid = UPLOAD_JOB_STORE.get(job_id, {}).get("user_id")
-            if uid and ACTIVE_UPLOAD_JOB_IDS.get(uid) == job_id:
-                ACTIVE_UPLOAD_JOB_IDS.pop(uid, None)
-            UPLOAD_JOB_STORE.pop(job_id, None)
+    await UPLOAD_JOBS.cleanup_expired_jobs()
 
 
 async def _get_upload_job_snapshot(job_id: str) -> dict[str, Any] | None:
-    async with UPLOAD_JOB_LOCK:
-        job = UPLOAD_JOB_STORE.get(job_id)
-        if not job:
-            return None
-        return dict(job)
+    return await UPLOAD_JOBS.get_job_snapshot(job_id)
 
 
 def _assert_user_can_view_upload_job(*, user_id: str, job: dict[str, Any]) -> None:
-    if job.get("user_id") == user_id:
-        return
-    raise HTTPException(status_code=404, detail="Job not found")
+    UPLOAD_JOBS.assert_user_can_view_job(user_id=user_id, job=job)
 
 
 async def _get_active_upload_job(user_id: str) -> dict[str, Any] | None:
-    async with UPLOAD_JOB_LOCK:
-        job_id = ACTIVE_UPLOAD_JOB_IDS.get(user_id)
-        if not job_id:
-            return None
-        job = UPLOAD_JOB_STORE.get(job_id)
-        if not job or job["status"] in TERMINAL_JOB_STATUSES:
-            ACTIVE_UPLOAD_JOB_IDS.pop(user_id, None)
-            return None
-        return dict(job)
+    return await UPLOAD_JOBS.get_active_job(user_id)
 
 
 async def _create_upload_job(user_id: str) -> dict[str, Any]:
-    job_id = uuid.uuid4().hex
-    now = time.time()
-    job = {
-        "job_id": job_id,
-        "user_id": user_id,
-        "status": JOB_STATUS_QUEUED,
-        "current_stage": "upload",
-        "progress_pct": 0,
-        "lecture_id": None,
-        "total_slides": None,
-        "pdf_url": None,
-        "reused_existing": False,
-        "error": None,
-        "updated_at": now,
-        "version": 0,
-        "next_event_id": 1,
-        "events": [],
-    }
-    async with UPLOAD_JOB_LOCK:
-        UPLOAD_JOB_STORE[job_id] = job
-        ACTIVE_UPLOAD_JOB_IDS[user_id] = job_id
-    return dict(job)
+    return await UPLOAD_JOBS.create_job(user_id)
 
 
 async def _update_upload_job(
@@ -1372,72 +1266,20 @@ async def _update_upload_job(
     message: str | None = None,
     **updates: Any,
 ) -> dict[str, Any] | None:
-    async with UPLOAD_JOB_LOCK:
-        job = UPLOAD_JOB_STORE.get(job_id)
-        if not job:
-            return None
-
-        if "progress_pct" in updates:
-            updates["progress_pct"] = max(0, min(100, int(updates["progress_pct"])))
-
-        job.update(updates)
-        job["updated_at"] = time.time()
-        job["version"] = int(job["version"]) + 1
-
-        if event_name:
-            event_payload = _upload_job_public_state(job)
-            if message:
-                event_payload["message"] = message
-
-            event_id = int(job["next_event_id"])
-            job["next_event_id"] = event_id + 1
-            event_payload["event_id"] = event_id
-
-            job["events"].append({
-                "id": event_id,
-                "event": event_name,
-                "payload": event_payload,
-            })
-            if len(job["events"]) > 2000:
-                job["events"] = job["events"][-1000:]
-
-        if job["status"] in TERMINAL_JOB_STATUSES:
-            uid = job.get("user_id")
-            if uid and ACTIVE_UPLOAD_JOB_IDS.get(uid) == job_id:
-                ACTIVE_UPLOAD_JOB_IDS.pop(uid, None)
-
-        return dict(job)
+    return await UPLOAD_JOBS.update_job(
+        job_id,
+        event_name=event_name,
+        message=message,
+        **updates,
+    )
 
 
 async def _get_active_upload_job_for_lecture(lecture_id: int) -> dict[str, Any] | None:
-    async with UPLOAD_JOB_LOCK:
-        for job in UPLOAD_JOB_STORE.values():
-            if job["status"] in TERMINAL_JOB_STATUSES:
-                continue
-            job_lecture_id = job.get("lecture_id")
-            if job_lecture_id is None:
-                continue
-            if int(job_lecture_id) == lecture_id:
-                return dict(job)
-        return None
+    return await UPLOAD_JOBS.get_active_job_for_lecture(lecture_id)
 
 
 async def _add_upload_job_raw_event(job_id: str, event_name: str, payload: dict[str, Any]) -> None:
-    async with UPLOAD_JOB_LOCK:
-        job = UPLOAD_JOB_STORE.get(job_id)
-        if not job:
-            return
-        event_id = int(job["next_event_id"])
-        job["next_event_id"] = event_id + 1
-        event_payload = dict(payload)
-        event_payload["event_id"] = event_id
-        job["events"].append({
-            "id": event_id,
-            "event": event_name,
-            "payload": event_payload,
-        })
-        if len(job["events"]) > 2000:
-            job["events"] = job["events"][-1000:]
+    await UPLOAD_JOBS.add_raw_event(job_id, event_name, payload)
 
 
 async def _get_upload_job_snapshot_and_events(
@@ -1445,21 +1287,10 @@ async def _get_upload_job_snapshot_and_events(
     *,
     after_event_id: int,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-    async with UPLOAD_JOB_LOCK:
-        job = UPLOAD_JOB_STORE.get(job_id)
-        if not job:
-            return None, []
-
-        events = [
-            {
-                "id": int(evt["id"]),
-                "event": str(evt["event"]),
-                "payload": dict(evt["payload"]),
-            }
-            for evt in job["events"]
-            if int(evt["id"]) > after_event_id
-        ]
-        return dict(job), events
+    return await UPLOAD_JOBS.get_job_snapshot_and_events(
+        job_id,
+        after_event_id=after_event_id,
+    )
 
 
 def _build_transcript_text_by_slide(alignment: list[dict], transcript: list[dict]) -> dict[int, str]:
@@ -1714,111 +1545,12 @@ def _build_regeneration_targets(
 
 
 async def _run_regenerate_notes_job(job_id: str, lecture_id: int) -> None:
-    try:
-        await _update_job(job_id, status=JOB_STATUS_RUNNING, error=None)
-
-        async with AsyncSessionLocal() as db:
-            context = await _load_regeneration_context(db, lecture_id)
-            course_context = await _lookup_course_context(db, context["course_id"])
-            targets = _build_regeneration_targets(
-                context["align_rows"],
-                context["enriched_by_slide"],
-            )
-            total = len(targets)
-            await _update_job(
-                job_id,
-                total_slides=total,
-                completed_slides=0,
-                current_slide=None,
-                regenerated_slides=0,
-                status=JOB_STATUS_RUNNING,
-                error=None,
-            )
-
-            regenerated = 0
-            if total == 0:
-                await _update_job(
-                    job_id,
-                    status=JOB_STATUS_DONE,
-                    completed_slides=0,
-                    regenerated_slides=0,
-                    current_slide=None,
-                    error=None,
-                )
-                return
-
-            for batch in _chunk_items(targets, ENRICH_BATCH_SIZE):
-                if not batch:
-                    continue
-                await _update_job(
-                    job_id,
-                    status=JOB_STATUS_RUNNING,
-                    current_slide=batch[0]["slide_number"],
-                    completed_slides=regenerated,
-                    regenerated_slides=regenerated,
-                )
-
-                batch_payloads: list[tuple[dict[str, int], dict, str]] = []
-                for target in batch:
-                    slide_num = target["slide_number"]
-                    slide = context["slides_by_num"].get(slide_num, {"slide": slide_num, "text": ""})
-                    transcript_text = _segment_text_for_alignment(
-                        context["segments_by_index"],
-                        target["start_segment"],
-                        target["end_segment"],
-                    )
-                    batch_payloads.append((target, slide, transcript_text))
-
-                batch_notes = await generate_notes_for_slides(
-                    [(slide, transcript_text) for _, slide, transcript_text in batch_payloads],
-                    course_context=course_context,
-                )
-                notes_by_slide = {int(note["slide"]): note for note in batch_notes}
-
-                for target, slide, transcript_text in batch_payloads:
-                    slide_num = target["slide_number"]
-                    notes_entry = notes_by_slide.get(slide_num)
-                    if notes_entry is None:
-                        notes = build_fallback_enrichment(slide, transcript_text)
-                    else:
-                        notes = _notes_payload_from_batch_entry(notes_entry)
-                    _upsert_enriched_row(
-                        db=db,
-                        lecture_id=lecture_id,
-                        enriched_by_slide=context["enriched_by_slide"],
-                        slide_num=slide_num,
-                        notes=notes,
-                    )
-                    await db.commit()
-
-                    regenerated += 1
-                    await _update_job(
-                        job_id,
-                        status=JOB_STATUS_RUNNING,
-                        current_slide=slide_num,
-                        completed_slides=regenerated,
-                        regenerated_slides=regenerated,
-                    )
-
-            if regenerated > 0:
-                await _sync_lecture_pptx_with_enriched_notes(db, lecture_id)
-
-            await _update_job(
-                job_id,
-                status=JOB_STATUS_DONE,
-                completed_slides=total,
-                regenerated_slides=regenerated,
-                current_slide=None,
-                error=None,
-            )
-    except Exception as exc:
-        LOGGER.exception("Regenerate-notes job failed for lecture_id=%s job_id=%s", lecture_id, job_id)
-        await _update_job(
-            job_id,
-            status=JOB_STATUS_ERROR,
-            error=str(exc),
-            current_slide=None,
-        )
+    await _regeneration_service._run_regenerate_notes_job(
+        job_id,
+        lecture_id,
+        update_job=_update_job,
+        async_session_factory=AsyncSessionLocal,
+    )
 
 
 async def _run_process_job(
@@ -1845,231 +1577,32 @@ async def _run_process_job(
     course_context: str | None = None,
     custom_name: str | None = None,
 ) -> None:
-    loop = asyncio.get_running_loop()
-    last_stage: str | None = None
-
-    def emit(stage: str, message: str, progress_pct: int) -> None:
-        nonlocal last_stage
-        bounded = max(0, min(100, int(progress_pct)))
-        if stage != last_stage:
-            asyncio.run_coroutine_threadsafe(
-                _update_upload_job(
-                    job_id,
-                    status=JOB_STATUS_RUNNING,
-                    current_stage=stage,
-                    progress_pct=bounded,
-                    event_name="progress",
-                    message=message,
-                ),
-                loop,
-            ).result()
-            last_stage = stage
-
-        asyncio.run_coroutine_threadsafe(
-            _update_upload_job(
-                job_id,
-                status=JOB_STATUS_RUNNING,
-                current_stage=stage,
-                progress_pct=bounded,
-                event_name="log",
-                message=message,
-            ),
-            loop,
-        ).result()
-
-    lecture_id_holder: list[int | None] = [None]
-
-    def on_slides_parsed(count: int) -> None:
-        asyncio.run_coroutine_threadsafe(
-            _update_upload_job(job_id, total_slides=count),
-            loop,
-        ).result()
-
-    def on_slide_enriched(slide_num: int, payload: dict) -> None:
-        asyncio.run_coroutine_threadsafe(
-            _add_upload_job_raw_event(job_id, "slide_enriched", payload),
-            loop,
-        ).result()
-
-    def on_pre_enrich(slides: list, transcript: list, alignment: list) -> None:
-        early_name = (
-            _derive_temporary_lecture_name(slides, temporary_name_seed)
-            if temporary_name_seed
-            else lecture_name
-        )
-
-        async def _create_early() -> None:
-            async with AsyncSessionLocal() as db:
-                lid = await save_lecture_to_db(
-                    db=db,
-                    name=early_name,
-                    slides=slides,
-                    transcript=transcript,
-                    alignment=alignment,
-                    enhanced=[],
-                    pptx_path=None,
-                    pdf_path=str(saved_pdf_path.relative_to(BACKEND_DIR)),
-                    course_id=course_id,
-                    naming_kind=naming_kind,
-                    naming_lecture=naming_lecture,
-                    naming_year=naming_year,
-                    upload_courseid_raw=upload_courseid_raw,
-                    upload_kind_raw=upload_kind_raw,
-                    upload_lecture_raw=upload_lecture_raw,
-                    upload_year_raw=upload_year_raw,
-                    is_demo=False,
-                    saved_user_id=user_id,
-                    uploaded_by=user_id,
-                    pdf_hash=pdf_hash,
-                )
-            lecture_id_holder[0] = lid
-            await _update_upload_job(
-                job_id,
-                lecture_id=lid,
-                event_name="progress",
-                message="Lecture added to sidebar. Enriching slide notes...",
-            )
-
-        asyncio.run_coroutine_threadsafe(_create_early(), loop).result()
-
-    try:
-        if recording_source == "url":
-            if not audio_url:
-                raise RuntimeError("Missing audio_url for URL recording source.")
-
-            redacted_url = redact_url_for_logs(audio_url)
-            await _update_upload_job(
-                job_id,
-                status=JOB_STATUS_RUNNING,
-                current_stage="upload",
-                progress_pct=10,
-                error=None,
-                event_name="progress",
-                message=f"Slides uploaded. Downloading recording from URL ({redacted_url})...",
-            )
-            await run_in_threadpool(download_remote_media_to_path, audio_url, audio_path)
-            await _update_upload_job(
-                job_id,
-                status=JOB_STATUS_RUNNING,
-                current_stage="upload",
-                progress_pct=18,
-                error=None,
-                event_name="log",
-                message="Recording URL downloaded. Starting processing pipeline...",
-            )
-        else:
-            await _update_upload_job(
-                job_id,
-                status=JOB_STATUS_RUNNING,
-                current_stage="upload",
-                progress_pct=10,
-                error=None,
-                event_name="progress",
-                message="Files uploaded. Starting processing pipeline...",
-            )
-
-        result = await run_in_threadpool(
-            run_pipeline,
-            str(pdf_path),
-            str(audio_path),
-            str(pptx_path),
-            emit,
-            on_slides_parsed=on_slides_parsed,
-            on_slide_enriched=on_slide_enriched,
-            on_pre_enrich=on_pre_enrich,
-            course_context=course_context,
-        )
-        resolved_lecture_name = (
-            _normalize_lecture(custom_name.strip())[:80]
-            if custom_name and custom_name.strip()
-            else (
-                _derive_temporary_lecture_name(result["slides"], temporary_name_seed)
-                if temporary_name_seed
-                else lecture_name
-            )
-        )
-
-        await _update_upload_job(
-            job_id,
-            status=JOB_STATUS_RUNNING,
-            current_stage="persist",
-            progress_pct=95,
-            event_name="progress",
-            message="Persisting results to database...",
-        )
-
-        shutil.copy2(pdf_path, saved_pdf_path)
-
-        async with AsyncSessionLocal() as db:
-            if lecture_id_holder[0] is not None:
-                await update_lecture_enhanced_and_pptx(
-                    db=db,
-                    lecture_id=lecture_id_holder[0],
-                    slides=result["slides"],
-                    transcript=result["transcript"],
-                    alignment=result["alignment"],
-                    enhanced=result["enhanced"],
-                    pptx_path=str(pptx_path.relative_to(BACKEND_DIR)),
-                    name=resolved_lecture_name,
-                )
-                lecture_id = lecture_id_holder[0]
-            else:
-                lecture_id = await save_lecture_to_db(
-                    db=db,
-                    name=resolved_lecture_name,
-                    slides=result["slides"],
-                    transcript=result["transcript"],
-                    alignment=result["alignment"],
-                    enhanced=result["enhanced"],
-                    pptx_path=str(pptx_path.relative_to(BACKEND_DIR)),
-                    pdf_path=str(saved_pdf_path.relative_to(BACKEND_DIR)),
-                    course_id=course_id,
-                    naming_kind=naming_kind,
-                    naming_lecture=naming_lecture,
-                    naming_year=naming_year,
-                    upload_courseid_raw=upload_courseid_raw,
-                    upload_kind_raw=upload_kind_raw,
-                    upload_lecture_raw=upload_lecture_raw,
-                    upload_year_raw=upload_year_raw,
-                    is_demo=False,
-                    saved_user_id=user_id,
-                    uploaded_by=user_id,
-                    pdf_hash=pdf_hash,
-                )
-
-        await _update_upload_job(
-            job_id,
-            status=JOB_STATUS_DONE,
-            current_stage="done",
-            progress_pct=100,
-            lecture_id=lecture_id,
-            error=None,
-            event_name="done",
-            message="Processing complete.",
-        )
-    except Exception as exc:
-        LOGGER.exception("Upload process job failed job_id=%s", job_id)
-        await _update_upload_job(
-            job_id,
-            status=JOB_STATUS_ERROR,
-            current_stage="error",
-            error=str(exc),
-            event_name="error",
-            message=str(exc),
-        )
-        if lecture_id_holder[0] is not None:
-            async with AsyncSessionLocal() as db:
-                lecture = await db.get(Lecture, lecture_id_holder[0])
-                if lecture:
-                    await db.delete(lecture)
-                    await db.commit()
-        if pptx_path.exists():
-            pptx_path.unlink(missing_ok=True)
-        if saved_pdf_path.exists():
-            saved_pdf_path.unlink(missing_ok=True)
-    finally:
-        tmp_dir = pdf_path.parent
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    await _upload_workflow_service._run_process_job(
+        job_id,
+        pdf_path=pdf_path,
+        audio_path=audio_path,
+        recording_source=recording_source,
+        audio_url=audio_url,
+        lecture_name=lecture_name,
+        course_id=course_id,
+        naming_kind=naming_kind,
+        naming_lecture=naming_lecture,
+        naming_year=naming_year,
+        upload_courseid_raw=upload_courseid_raw,
+        upload_kind_raw=upload_kind_raw,
+        upload_lecture_raw=upload_lecture_raw,
+        upload_year_raw=upload_year_raw,
+        temporary_name_seed=temporary_name_seed,
+        pptx_path=pptx_path,
+        saved_pdf_path=saved_pdf_path,
+        user_id=user_id,
+        pdf_hash=pdf_hash,
+        course_context=course_context,
+        custom_name=custom_name,
+        update_upload_job=_update_upload_job,
+        add_upload_job_raw_event=_add_upload_job_raw_event,
+        async_session_factory=AsyncSessionLocal,
+    )
 
 
 async def save_lecture_to_db(
@@ -2240,6 +1773,100 @@ async def lecture_to_response(
             for e in enriched_rows
         ],
     }
+
+
+# Keep `backend.main` as the stable import surface while delegating internal logic
+# to the extracted service modules.
+ALLOWED_CANONICAL_KINDS = _naming_service.ALLOWED_CANONICAL_KINDS
+UploadNamingResolution = _naming_service.UploadNamingResolution
+UploadRawNaming = _naming_service.UploadRawNaming
+UploadSubmissionResolution = _naming_service.UploadSubmissionResolution
+_join_text = _naming_service._join_text
+_normalize_courseid = _naming_service._normalize_courseid
+_normalize_catalog_code = _naming_service._normalize_catalog_code
+_normalize_optional_catalog_code = _naming_service._normalize_optional_catalog_code
+_require_non_empty_name = _naming_service._require_non_empty_name
+_normalize_lecture = _naming_service._normalize_lecture
+_normalize_kind = _naming_service._normalize_kind
+_validate_year = _naming_service._validate_year
+_build_standard_stem = _naming_service._build_standard_stem
+_parse_standard_upload_name = _naming_service._parse_standard_upload_name
+_build_unique_generated_paths = _naming_service._build_unique_generated_paths
+_normalize_upload_naming_fields = _naming_service._normalize_upload_naming_fields
+_raw_upload_naming_fields = _naming_service._raw_upload_naming_fields
+_temporary_upload_stem_from_filename = _naming_service._temporary_upload_stem_from_filename
+_temporary_lecture_token_from_slides = _naming_service._temporary_lecture_token_from_slides
+_derive_temporary_lecture_name = _naming_service._derive_temporary_lecture_name
+_resolve_upload_naming = _naming_service._resolve_upload_naming
+_resolve_upload_submission_naming = _naming_service._resolve_upload_submission_naming
+_canonical_course_code = _naming_service._canonical_course_code
+
+_is_admin = _lecture_access_service._is_admin
+get_lecture_or_404 = _lecture_access_service.get_lecture_or_404
+_non_admin_lecture_access_filter = _lecture_access_service._non_admin_lecture_access_filter
+_user_has_explicit_lecture_access = _lecture_access_service._user_has_explicit_lecture_access
+can_view_lecture = _lecture_access_service.can_view_lecture
+assert_user_can_view_lecture = _lecture_access_service.assert_user_can_view_lecture
+grant_lecture_access_for_user = _lecture_access_service.grant_lecture_access_for_user
+_require_admin_user_or_403 = _lecture_access_service._require_admin_user_or_403
+_saved_lecture_ids_for_user = _lecture_access_service._saved_lecture_ids_for_user
+save_lecture_for_user = _lecture_access_service.save_lecture_for_user
+unsave_lecture_for_user = _lecture_access_service.unsave_lecture_for_user
+_path_is_within = _lecture_access_service._path_is_within
+_resolve_lecture_asset_path = _lecture_access_service._resolve_lecture_asset_path
+_to_backend_relative_path = _lecture_access_service._to_backend_relative_path
+_path_is_archived_generated = _lecture_access_service._path_is_archived_generated
+StagedLectureAsset = _lecture_access_service.StagedLectureAsset
+_lecture_asset_paths_for_permanent_delete = _lecture_access_service._lecture_asset_paths_for_permanent_delete
+_rollback_staged_lecture_assets = _lecture_access_service._rollback_staged_lecture_assets
+_permanently_delete_lecture = _lecture_access_service._permanently_delete_lecture
+_resolve_generated_download_path = _lecture_access_service._resolve_generated_download_path
+_resolve_pdf_download_path = _lecture_access_service._resolve_pdf_download_path
+_build_collision_safe_destination = _lecture_access_service._build_collision_safe_destination
+_plan_asset_move = _lecture_access_service._plan_asset_move
+_lecture_has_visible_pptx = _lecture_access_service._lecture_has_visible_pptx
+_stored_path_variants = _lecture_access_service._stored_path_variants
+_find_lecture_for_asset_path = _lecture_access_service._find_lecture_for_asset_path
+_find_reusable_lecture_by_pdf_hash = _lecture_access_service._find_reusable_lecture_by_pdf_hash
+_grant_reused_lecture_access = _lecture_access_service._grant_reused_lecture_access
+_apply_archive_state = _lecture_access_service._apply_archive_state
+
+_lecture_file_urls = _serializers_service._lecture_file_urls
+_upload_naming_raw_payload = _serializers_service._upload_naming_raw_payload
+_teachers_note_payload = _serializers_service._teachers_note_payload
+_lecture_naming_snapshot = _serializers_service._lecture_naming_snapshot
+_program_payload = _serializers_service._program_payload
+_course_payload = _serializers_service._course_payload
+_program_course_plan_payload = _serializers_service._program_course_plan_payload
+_profile_payload = _serializers_service._profile_payload
+_get_program_or_404 = _serializers_service._get_program_or_404
+_get_course_or_404 = _serializers_service._get_course_or_404
+_get_or_create_student_profile = _serializers_service._get_or_create_student_profile
+_load_profile_payload = _serializers_service._load_profile_payload
+_archive_response_payload = _serializers_service._archive_response_payload
+_row_to_normalized_enriched_payload = _serializers_service._row_to_normalized_enriched_payload
+lecture_to_response = _serializers_service.lecture_to_response
+_course_display_overrides_by_code = _serializers_service._course_display_overrides_by_code
+_resolve_course_display = _serializers_service._resolve_course_display
+
+_sync_lecture_pptx_with_enriched_notes = _regeneration_service._sync_lecture_pptx_with_enriched_notes
+_segment_text_for_alignment = _regeneration_service._segment_text_for_alignment
+_upsert_enriched_row = _regeneration_service._upsert_enriched_row
+generate_notes_for_slide = _regeneration_service.generate_notes_for_slide
+generate_notes_for_slides = _regeneration_service.generate_notes_for_slides
+_chunk_items = _regeneration_service._chunk_items
+_notes_payload_from_batch_entry = _regeneration_service._notes_payload_from_batch_entry
+_lookup_course_context = _regeneration_service._lookup_course_context
+_load_regeneration_context = _regeneration_service._load_regeneration_context
+_build_regeneration_targets = _regeneration_service._build_regeneration_targets
+
+_resolve_recording_source_or_400 = _upload_workflow_service._resolve_recording_source_or_400
+_validate_audio_url_or_400 = _upload_workflow_service._validate_audio_url_or_400
+_audio_suffix_from_url = _upload_workflow_service._audio_suffix_from_url
+_build_transcript_text_by_slide = _upload_workflow_service._build_transcript_text_by_slide
+_sanitize_enhanced_entries = _upload_workflow_service._sanitize_enhanced_entries
+save_lecture_to_db = _upload_workflow_service.save_lecture_to_db
+update_lecture_enhanced_and_pptx = _upload_workflow_service.update_lecture_enhanced_and_pptx
 
 
 class AuthRegisterRequest(BaseModel):

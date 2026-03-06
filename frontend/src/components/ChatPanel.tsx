@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { chatWithLecture, type ChatMessage } from "../api";
+import type { ReactNode } from "react";
+import { useLectureChat } from "../hooks/useLectureChat";
 
 type PresetCopy = {
   title: string;
@@ -64,7 +64,7 @@ const CHAT_PRESETS: PresetDefinition[] = [
 ];
 
 /** Renders basic markdown: **bold**, *italic*, `code`, and newlines */
-function renderMarkdown(text: string): React.ReactNode[] {
+function renderMarkdown(text: string): ReactNode[] {
   // Split on the patterns we handle
   const parts = text.split(/(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`|\n)/g);
   return parts.map((part, i) => {
@@ -89,97 +89,31 @@ interface Props {
 }
 
 export default function ChatPanel({ lectureId, expanded, onExpand, onCollapse, prefillText, consoleVisible }: Props) {
-  const [history, setHistory] = useState<ChatMessage[]>([]);
-  const [input, setInput] = useState("");
-  const [bubbleInput, setBubbleInput] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [lastPrefill, setLastPrefill] = useState<string | null>(null);
-  const [presetsOpen, setPresetsOpen] = useState(true);
-  const bottomRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLTextAreaElement>(null);
-  const requestIdRef = useRef(0);
-
-  // When prefill arrives, expand and pre-fill input
-  useEffect(() => {
-    if (prefillText && prefillText !== lastPrefill) {
-      setLastPrefill(prefillText);
-      setInput(`About "${prefillText}": `);
-      onExpand();
-      setTimeout(() => inputRef.current?.focus(), 50);
-    }
-  }, [prefillText, lastPrefill, onExpand]);
-
-  // Focus input when freshly expanded
-  useEffect(() => {
-    if (expanded) {
-      setTimeout(() => inputRef.current?.focus(), 50);
-    }
-  }, [expanded]);
-
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [history, loading]);
-
-  async function sendMessage(text: string) {
-    const trimmed = text.trim();
-    if (!trimmed || loading) return;
-    const userMsg: ChatMessage = { role: "user", content: trimmed };
-    const nextHistory = [...history, userMsg];
-    const requestId = requestIdRef.current + 1;
-    requestIdRef.current = requestId;
-    setHistory(nextHistory);
-    setInput("");
-    setLoading(true);
-    setError(null);
-    try {
-      const reply = await chatWithLecture(lectureId, trimmed, null, history);
-      if (requestIdRef.current !== requestId) return;
-      setHistory([...nextHistory, { role: "assistant", content: reply }]);
-    } catch (error) {
-      if (requestIdRef.current !== requestId) return;
-      setError(error instanceof Error ? error.message : "Failed to get a response. Please try again.");
-    } finally {
-      if (requestIdRef.current === requestId) {
-        setLoading(false);
-      }
-    }
-  }
-
-  function clearChat() {
-    requestIdRef.current += 1;
-    setHistory([]);
-    setInput("");
-    setBubbleInput("");
-    setLoading(false);
-    setError(null);
-  }
-
-  function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      void sendMessage(input);
-    }
-  }
-
-  function handleBubbleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    onExpand();
-    if (bubbleInput.trim()) {
-      void sendMessage(bubbleInput);
-      setBubbleInput("");
-    }
-  }
-
-  const messageCount = Math.ceil(history.length / 2);
-  const isEmptyState = history.length === 0;
-  const canClearChat = history.length > 0 || input.trim() !== "" || loading || error !== null;
-
-  useEffect(() => {
-    if (expanded) {
-      setTimeout(() => inputRef.current?.focus(), 0);
-    }
-  }, [expanded, isEmptyState]);
+  const {
+    history,
+    input,
+    setInput,
+    bubbleInput,
+    setBubbleInput,
+    loading,
+    error,
+    presetsOpen,
+    setPresetsOpen,
+    isEmptyState,
+    bottomRef,
+    inputRef,
+    handleBubbleSubmit,
+    handleKeyDown,
+    messageCount,
+    canClearChat,
+    sendMessage,
+    clearChat,
+  } = useLectureChat({
+    lectureId,
+    expanded,
+    prefillText,
+    onExpand,
+  });
 
   function renderPresetSection(layout: "empty" | "docked") {
     return (

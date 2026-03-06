@@ -1,4 +1,3 @@
-import json
 import os
 import random
 import subprocess
@@ -13,9 +12,20 @@ from typing import Callable
 import anthropic
 from groq import Groq
 
-alignment_client = anthropic.Anthropic()
+try:
+    from pipeline_steps.align import align_transcript_to_slides, sanitize_alignment_boundaries
+    from pipeline_steps.enrich import enrich_aligned_slides
+    from pipeline_steps.present import generate_presentation_from_enhanced as _generate_presentation_from_enhanced
+    from pipeline_steps.progress import ProgressEmitter, emit_progress as _emit_progress_impl
+    from pipeline_steps.run import run_pipeline_steps
+except ImportError:  # pragma: no cover - package import fallback
+    from backend.pipeline_steps.align import align_transcript_to_slides, sanitize_alignment_boundaries
+    from backend.pipeline_steps.enrich import enrich_aligned_slides
+    from backend.pipeline_steps.present import generate_presentation_from_enhanced as _generate_presentation_from_enhanced
+    from backend.pipeline_steps.progress import ProgressEmitter, emit_progress as _emit_progress_impl
+    from backend.pipeline_steps.run import run_pipeline_steps
 
-ProgressEmitter = Callable[[str, str, int], None]
+alignment_client = anthropic.Anthropic()
 
 # Allow importing from sibling scripts/ directory
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -23,8 +33,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).resolve().with_name(".env"), override=False)
 
-from scripts.parse_slides import parse_slides
-from scripts.align import build_prompt, parse_response
 from scripts.enrich import (
     DEFAULT_ENRICH_BATCH_SIZE,
     DEFAULT_ENRICH_LOG_USAGE,
@@ -41,7 +49,6 @@ from scripts.enrich import (
     normalize_enriched_payload,
     resolve_enrichment_provider,
 )
-from scripts.generate_presentation import generate as generate_pptx
 from scripts.model_config import resolve_alignment_model, resolve_alignment_model_alias
 
 
@@ -155,15 +162,7 @@ def generate_presentation_from_enhanced(
     enhanced: list[dict],
     output_path: str,
 ) -> None:
-    with tempfile.NamedTemporaryFile(
-        suffix=".json", delete=False, mode="w", encoding="utf-8"
-    ) as f:
-        json.dump(enhanced, f, ensure_ascii=False)
-        enhanced_tmp = f.name
-    try:
-        generate_pptx(pdf_path, enhanced_tmp, output_path)
-    finally:
-        Path(enhanced_tmp).unlink(missing_ok=True)
+    _generate_presentation_from_enhanced(pdf_path, enhanced, output_path)
 
 
 def _emit_progress(
@@ -172,10 +171,7 @@ def _emit_progress(
     message: str,
     progress_pct: int,
 ) -> None:
-    if emit is None:
-        return
-    bounded = max(0, min(100, int(progress_pct)))
-    emit(stage, message, bounded)
+    _emit_progress_impl(emit, stage, message, progress_pct)
 
 
 def _is_request_too_large_error(exc: Exception) -> bool:
@@ -534,35 +530,11 @@ def _sanitize_alignment_boundaries(
     total_slides: int,
     total_segments: int,
 ) -> list[dict]:
-    if total_slides <= 0:
-        return []
-    if total_segments <= 0:
-        raise RuntimeError("Transcript was empty; cannot align slides.")
-
-    parsed: dict[int, int] = {}
-    for row in boundaries:
-        try:
-            slide = int(row.get("slide", 0))
-            start_segment = int(row.get("start_segment", 0))
-        except (TypeError, ValueError):
-            continue
-        if slide < 1 or slide > total_slides:
-            continue
-        parsed[slide] = start_segment
-
-    parsed.setdefault(1, 0)
-    sanitized: list[dict] = []
-    previous = -1
-    max_start = total_segments - 1
-
-    for slide in range(1, total_slides + 1):
-        candidate = parsed.get(slide, previous + 1)
-        candidate = max(previous + 1, candidate)
-        candidate = min(candidate, max_start)
-        sanitized.append({"slide": slide, "start_segment": candidate})
-        previous = candidate
-
-    return sanitized
+    return sanitize_alignment_boundaries(
+        boundaries,
+        total_slides=total_slides,
+        total_segments=total_segments,
+    )
 
 
 def align(
@@ -570,81 +542,19 @@ def align(
     transcript: list[dict],
     emit: ProgressEmitter | None = None,
 ) -> list[dict]:
-    print(
-        f"🔗 Aligning transcript to slides via Claude ({ALIGN_MODEL_ALIAS}:{ALIGN_MODEL})...",
-        flush=True,
-    )
-    _emit_progress(emit, "align", "🔗 Aligning transcript to slides...", 55)
-    prompt = build_prompt(
+    return align_transcript_to_slides(
         slides,
         transcript,
-        max_segments=ALIGN_MAX_TRANSCRIPT_SEGMENTS,
+        emit=emit,
+        emit_progress=_emit_progress,
+        alignment_client=alignment_client,
+        align_model_alias=ALIGN_MODEL_ALIAS,
+        align_model=ALIGN_MODEL,
+        max_transcript_segments=ALIGN_MAX_TRANSCRIPT_SEGMENTS,
         max_segment_chars=ALIGN_MAX_SEGMENT_CHARS,
         max_slide_chars=ALIGN_MAX_SLIDE_CHARS,
+        is_request_too_large_error=_is_request_too_large_error,
     )
-    try:
-        message = alignment_client.messages.create(
-            model=ALIGN_MODEL,
-            max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except Exception as exc:
-        if not _is_request_too_large_error(exc):
-            raise
-        reduced_max_segments = max(200, ALIGN_MAX_TRANSCRIPT_SEGMENTS // 2)
-        reduced_segment_chars = max(80, ALIGN_MAX_SEGMENT_CHARS // 2)
-        reduced_slide_chars = max(300, ALIGN_MAX_SLIDE_CHARS // 2)
-        print(
-            "⚠️ Alignment request exceeded payload limit; retrying with a tighter prompt budget...",
-            flush=True,
-        )
-        _emit_progress(
-            emit,
-            "align",
-            "Large transcript detected. Retrying alignment with a compact prompt...",
-            56,
-        )
-        prompt = build_prompt(
-            slides,
-            transcript,
-            max_segments=reduced_max_segments,
-            max_segment_chars=reduced_segment_chars,
-            max_slide_chars=reduced_slide_chars,
-        )
-        message = alignment_client.messages.create(
-            model=ALIGN_MODEL,
-            max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}],
-        )
-    boundaries = parse_response(message.content[0].text)
-    boundaries = _sanitize_alignment_boundaries(
-        boundaries,
-        total_slides=len(slides),
-        total_segments=len(transcript),
-    )
-
-    result = []
-    for i, b in enumerate(boundaries):
-        start = b["start_segment"]
-        end = (
-            boundaries[i + 1]["start_segment"] - 1
-            if i + 1 < len(boundaries)
-            else len(transcript) - 1
-        )
-        end = max(start, end)
-        result.append({"slide": b["slide"], "start_segment": start, "end_segment": end})
-
-    # Cap the last slide's segment range so it doesn't absorb unbounded post-lecture audio.
-    # Use 2× the average segments-per-slide as the ceiling.
-    if result and len(result) > 1:
-        avg_segments = sum(r["end_segment"] - r["start_segment"] + 1 for r in result) / len(result)
-        cap = int(result[-1]["start_segment"] + max(avg_segments * 2, 30))
-        cap = min(cap, len(transcript) - 1)
-        if cap < result[-1]["end_segment"]:
-            result[-1]["end_segment"] = cap
-    print(f"✅ Alignment done — {len(result)} slides mapped", flush=True)
-    _emit_progress(emit, "align", f"🔗 Alignment complete.", 65)
-    return result
 
 
 def enrich(
@@ -655,160 +565,25 @@ def enrich(
     on_slide_enriched: Callable[[int, dict], None] | None = None,
     course_context: str | None = None,
 ) -> list[dict]:
-    total = len(alignment)
-    done_count = 0
-    done_lock = threading.Lock()
-    metrics_lock = threading.Lock()
-    stage_started = time.perf_counter()
-    usage_totals = {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-        "retries": 0,
-        "fallbacks": 0,
-        "duration_ms": 0,
-    }
-    failure_reason_counts = {
-        "truncated_json": 0,
-        "empty_payload": 0,
-        "connection_error": 0,
-        "other_error": 0,
-    }
-
-    print(
-        f"✨ Enriching {total} slides via {ENRICH_PROVIDER}:{ENRICH_MODEL} "
-        f"(workers={ENRICH_MAX_WORKERS}, retries={ENRICH_MAX_ATTEMPTS}, "
-        f"batch_size={ENRICH_BATCH_SIZE}, max_output_tokens={ENRICH_MAX_OUTPUT_TOKENS}, "
-        f"max_transcript_words={ENRICH_MAX_TRANSCRIPT_WORDS})...",
-        flush=True,
+    return enrich_aligned_slides(
+        slides,
+        transcript,
+        alignment,
+        emit=emit,
+        on_slide_enriched=on_slide_enriched,
+        course_context=course_context,
+        emit_progress=_emit_progress,
+        enrich_slides_batch_notes=enrich_slides_batch_notes,
+        build_fallback_enrichment=build_fallback_enrichment,
+        global_enrich_semaphore=_global_enrich_semaphore,
+        enrich_provider=ENRICH_PROVIDER,
+        enrich_model=ENRICH_MODEL,
+        enrich_batch_size=ENRICH_BATCH_SIZE,
+        enrich_max_workers=ENRICH_MAX_WORKERS,
+        enrich_max_attempts=ENRICH_MAX_ATTEMPTS,
+        enrich_max_output_tokens=ENRICH_MAX_OUTPUT_TOKENS,
+        enrich_max_transcript_words=ENRICH_MAX_TRANSCRIPT_WORDS,
     )
-    _emit_progress(emit, "enrich", f"✨ Enriching {total} slides...", 70)
-    slides_by_num = {s["slide"]: s for s in slides}
-
-    def chunk_alignment_rows(rows: list[dict], size: int) -> list[list[dict]]:
-        return [rows[idx:idx + size] for idx in range(0, len(rows), size)]
-
-    def enrich_batch(batch: list[dict]) -> list[dict]:
-        nonlocal done_count
-        batch_inputs: list[tuple[dict, str]] = []
-        slide_numbers: list[int] = []
-        for a in batch:
-            slide = slides_by_num[a["slide"]]
-            text = " ".join(
-                seg["text"].strip()
-                for seg in transcript[a["start_segment"]: a["end_segment"] + 1]
-            )
-            batch_inputs.append((slide, text))
-            slide_numbers.append(int(a["slide"]))
-        with done_lock:
-            in_progress_done = done_count
-        pct_start = 70 + int((in_progress_done / total) * 20) if total > 0 else 70
-        if len(slide_numbers) == 1:
-            batch_label = str(slide_numbers[0])
-        else:
-            batch_label = f"{slide_numbers[0]}-{slide_numbers[-1]}"
-        print(
-            f"  ⏳ Enriching slides {batch_label} ({in_progress_done + 1}/{total})...",
-            flush=True,
-        )
-
-        def slide_log(msg: str) -> None:
-            _emit_progress(emit, "enrich", msg, pct_start)
-
-        with _global_enrich_semaphore:
-            enriched_batch, metrics = enrich_slides_batch_notes(
-                batch_inputs,
-                max_attempts=ENRICH_MAX_ATTEMPTS,
-                log_callback=slide_log,
-                token_callback=slide_log,
-                return_metrics=True,
-                course_context=course_context,
-            )
-        with metrics_lock:
-            usage_totals["input_tokens"] += int(metrics.get("input_tokens", 0))
-            usage_totals["output_tokens"] += int(metrics.get("output_tokens", 0))
-            usage_totals["total_tokens"] += int(metrics.get("total_tokens", 0))
-            usage_totals["retries"] += int(metrics.get("retries", 0))
-            usage_totals["duration_ms"] += int(metrics.get("duration_ms", 0))
-            usage_totals["fallbacks"] += int(metrics.get("fallbacks", 0))
-            for reason, count in dict(metrics.get("failure_reason_counts", {})).items():
-                if reason not in failure_reason_counts:
-                    continue
-                failure_reason_counts[reason] += int(count)
-
-        enriched_by_slide = {int(entry["slide"]): entry for entry in enriched_batch}
-        transcript_by_slide = {
-            int(slide["slide"]): text
-            for slide, text in batch_inputs
-        }
-        batch_results: list[dict] = []
-        for a in batch:
-            slide = slides_by_num[a["slide"]]
-            enriched = enriched_by_slide.get(int(a["slide"]))
-            if enriched is None:
-                enriched = {
-                    "slide": a["slide"],
-                    **build_fallback_enrichment(slide, transcript_by_slide.get(int(a["slide"]), "")),
-                }
-            with done_lock:
-                done_count += 1
-                local_done = done_count
-            print(f"  ✅ Slide {a['slide']} done ({local_done}/{total})", flush=True)
-            if total > 0:
-                pct = 70 + int((local_done / total) * 20)
-            else:
-                pct = 90
-            _emit_progress(
-                emit,
-                "enrich",
-                f"✅ Slide {a['slide']} done ({local_done}/{total})",
-                pct,
-            )
-            result = {
-                "slide": a["slide"],
-                "original_text": slide["text"],
-                "start_segment": a["start_segment"],
-                "end_segment": a["end_segment"],
-                "summary": enriched.get("summary", ""),
-                "slide_content": enriched.get("slide_content", ""),
-                "lecturer_additions": enriched.get("lecturer_additions", ""),
-                "key_takeaways": enriched.get("key_takeaways", []),
-            }
-            if on_slide_enriched is not None:
-                try:
-                    on_slide_enriched(a["slide"], {
-                        "slide": a["slide"],
-                        "summary": result["summary"],
-                        "slide_content": result["slide_content"],
-                        "lecturer_additions": result["lecturer_additions"],
-                        "key_takeaways": result["key_takeaways"],
-                    })
-                except Exception:
-                    pass
-            batch_results.append(result)
-        return batch_results
-
-    results: list[dict] = []
-    batches = chunk_alignment_rows(alignment, ENRICH_BATCH_SIZE)
-    with ThreadPoolExecutor(max_workers=ENRICH_MAX_WORKERS) as pool:
-        futures = [pool.submit(enrich_batch, batch) for batch in batches]
-        for future in as_completed(futures):
-            results.extend(future.result())
-
-    results.sort(key=lambda x: x["slide"])
-    wall_duration_ms = int((time.perf_counter() - stage_started) * 1000)
-    summary = (
-        f"Slide enrichment complete. total_tokens={usage_totals['total_tokens']} "
-        f"(input={usage_totals['input_tokens']}, output={usage_totals['output_tokens']}), "
-        f"retries={usage_totals['retries']}, fallbacks={usage_totals['fallbacks']}, "
-        f"fallback_reasons=truncated_json:{failure_reason_counts['truncated_json']}"
-        f"|empty_payload:{failure_reason_counts['empty_payload']}"
-        f"|connection_error:{failure_reason_counts['connection_error']}"
-        f"|other_error:{failure_reason_counts['other_error']}, "
-        f"api_duration_ms={usage_totals['duration_ms']}, wall_duration_ms={wall_duration_ms}"
-    )
-    print(f"✅ {summary}", flush=True)
-    return results
 
 
 def run_pipeline(
@@ -821,46 +596,18 @@ def run_pipeline(
     on_pre_enrich: Callable[[list, list, list], None] | None = None,
     course_context: str | None = None,
 ) -> dict:
-    # Step 1: Extract slides
-    print("📄 Parsing slides from PDF...", flush=True)
-    _emit_progress(emit, "parse_slides", "📄 Parsing slides...", 12)
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
-        slides_tmp = f.name
-    parse_slides(pdf_path, slides_tmp)
-    with open(slides_tmp, encoding="utf-8") as f:
-        slides = json.load(f)
-    Path(slides_tmp).unlink(missing_ok=True)
-    _emit_progress(emit, "parse_slides", f"📄 Extracted {len(slides)} slides.", 22)
-    if on_slides_parsed is not None:
-        try:
-            on_slides_parsed(len(slides))
-        except Exception:
-            pass
-
-    # Step 2: Transcribe audio
-    transcript = transcribe(audio_path, emit=emit)
-
-    # Step 3: Align
-    alignment = align(slides, transcript, emit=emit)
-
-    # Step 4: Enrich
-    if on_pre_enrich is not None:
-        try:
-            on_pre_enrich(slides, transcript, alignment)
-        except Exception:
-            pass
-    enhanced = enrich(slides, transcript, alignment, emit=emit, on_slide_enriched=on_slide_enriched, course_context=course_context)
-
-    # Step 5: Generate PPTX
-    _emit_progress(emit, "generate_pptx", "🎉 Generating presentation...", 93)
-    generate_presentation_from_enhanced(pdf_path, enhanced, pptx_output_path)
-    print("🎉 Pipeline complete!", flush=True)
-    _emit_progress(emit, "generate_pptx", "🎉 Done!", 98)
-
-    return {
-        "slides": slides,
-        "transcript": transcript,
-        "alignment": alignment,
-        "enhanced": enhanced,
-        "download_url": f"/download/{Path(pptx_output_path).name}",
-    }
+    return run_pipeline_steps(
+        pdf_path,
+        audio_path,
+        pptx_output_path,
+        emit=emit,
+        on_slides_parsed=on_slides_parsed,
+        on_slide_enriched=on_slide_enriched,
+        on_pre_enrich=on_pre_enrich,
+        course_context=course_context,
+        emit_progress=_emit_progress,
+        transcribe=transcribe,
+        align=lambda slides_, transcript_, emit_: align(slides_, transcript_, emit=emit_),
+        enrich=enrich,
+        generate_presentation_from_enhanced=generate_presentation_from_enhanced,
+    )

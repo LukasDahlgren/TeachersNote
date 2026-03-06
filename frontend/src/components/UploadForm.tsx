@@ -1,9 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { getProfileCourseOptions } from "../api";
 import {
-  type Course,
   type UploadRecordingInput,
 } from "../types";
+import { useCourseOptions } from "../hooks/useCourseOptions";
 import CoursePicker from "./CoursePicker";
 
 interface ConsoleEntry {
@@ -149,16 +148,10 @@ export default function UploadForm({
   const [showHowItWorks, setShowHowItWorks] = useState(false);
   const [lectureName, setLectureName] = useState("");
   const [selectedCourseCode, setSelectedCourseCode] = useState<string | null>(null);
-  const [availableCourses, setAvailableCourses] = useState<Course[]>([]);
+  const availableCourses = useCourseOptions();
 
   const pdfInputRef = useRef<HTMLInputElement>(null);
   const audioInputRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    getProfileCourseOptions()
-      .then((opts) => setAvailableCourses(opts.all_courses ?? []))
-      .catch(() => {});
-  }, []);
 
   useEffect(() => {
     consoleEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });

@@ -1,5 +1,6 @@
 import { type KeyboardEvent } from "react";
 import type { TeachersNoteSummary } from "../types";
+import { formatLectureDisplayName } from "../utils/lectureNaming";
 
 interface SidebarProps {
   collapsed?: boolean;
@@ -24,37 +25,6 @@ function formatDate(iso: string): string {
     minute: "2-digit",
     hour12: false,
   });
-}
-
-function normalizeCourseToken(value: string | null | undefined): string {
-  return (value ?? "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
-}
-
-function escapeRegex(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function formatLectureDisplayName(lecture: TeachersNoteSummary): string {
-  const rawName = lecture.name ?? "";
-  const name = rawName.trim();
-  if (!name) return rawName;
-
-  const courseId = (lecture.course_id ?? "").trim();
-  const courseDisplay = (lecture.course_display ?? "").trim();
-  if (!courseId || !courseDisplay) return rawName;
-  if (normalizeCourseToken(courseId) === normalizeCourseToken(courseDisplay)) return rawName;
-
-  const prefixPattern = new RegExp(`^${escapeRegex(courseId)}(?=($|[-_\\s]))`, "i");
-  if (prefixPattern.test(name)) {
-    return name.replace(prefixPattern, courseDisplay);
-  }
-
-  const firstToken = name.split(/[-_\s]+/, 1)[0] ?? "";
-  if (normalizeCourseToken(firstToken) === normalizeCourseToken(courseId)) {
-    return `${courseDisplay}${name.slice(firstToken.length)}`;
-  }
-
-  return rawName;
 }
 
 export default function Sidebar({
