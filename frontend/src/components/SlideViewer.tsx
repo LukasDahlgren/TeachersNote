@@ -22,28 +22,35 @@ export default function SlideViewer({ slideText, slideNumber, total, onPrev, onN
   const pdfError = pdfUrl && pdfErrorByUrl?.url === pdfUrl ? pdfErrorByUrl.message : "";
 
   useEffect(() => {
-    const updateWidth = () => {
-      if (containerRef.current) {
-        const width = containerRef.current.offsetWidth - 32; // account for padding
-        setPdfWidth(Math.max(width, 300));
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const updateWidth = (immediate = false) => {
+      if (!containerRef.current) return;
+      const width = containerRef.current.offsetWidth - 32;
+      const next = Math.max(width, 300);
+      if (immediate) {
+        if (debounceTimer !== null) { clearTimeout(debounceTimer); debounceTimer = null; }
+        setPdfWidth(next);
+      } else {
+        if (debounceTimer !== null) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => { setPdfWidth(next); debounceTimer = null; }, 120);
       }
     };
 
-    updateWidth();
+    updateWidth(true);
 
     const container = containerRef.current;
     let observer: ResizeObserver | null = null;
     if (container && typeof ResizeObserver !== "undefined") {
-      observer = new ResizeObserver(() => {
-        updateWidth();
-      });
+      observer = new ResizeObserver(() => updateWidth(false));
       observer.observe(container);
     }
 
-    window.addEventListener("resize", updateWidth);
+    window.addEventListener("resize", () => updateWidth(false));
     return () => {
+      if (debounceTimer !== null) clearTimeout(debounceTimer);
       observer?.disconnect();
-      window.removeEventListener("resize", updateWidth);
+      window.removeEventListener("resize", () => updateWidth(false));
     };
   }, [pdfUrl, pdfError]);
 

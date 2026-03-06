@@ -113,6 +113,7 @@ export async function processFiles(
   pdf: File,
   recording: UploadRecordingInput,
   naming?: UploadLectureNamingInput,
+  courseContext?: string | null,
 ): Promise<ProcessResult> {
   const form = new FormData();
   form.append("pdf", pdf);
@@ -126,6 +127,9 @@ export async function processFiles(
     form.append("kind", naming.kind);
     form.append("lecture", naming.lecture);
     form.append("year", naming.year);
+  }
+  if (courseContext) {
+    form.append("course_context", courseContext);
   }
   const res = await apiFetch("/process", { method: "POST", body: form });
   if (!res.ok) throw new Error(await res.text());
@@ -153,9 +157,14 @@ export async function getMyLectures(): Promise<TeachersNoteSummary[]> {
   return res.json();
 }
 
-export async function getLecture(id: number): Promise<LectureDetail> {
-  const res = await apiFetch(`/lectures/${id}`, { cache: "no-store" });
-  if (!res.ok) throw new Error(await res.text());
+export async function getLecture(id: number, options?: { includeTranscript?: boolean }): Promise<LectureDetail> {
+  const query = options?.includeTranscript ? "?include_transcript=true" : "";
+  const res = await apiFetch(`/lectures/${id}${query}`, { cache: "no-store" });
+  if (!res.ok) {
+    const body = await readBody(res);
+    const message = (body as { detail?: string } | null)?.detail || `Request failed (${res.status})`;
+    throw new ApiError(res.status, message, body);
+  }
   return res.json();
 }
 
@@ -260,6 +269,38 @@ export async function regenerateLectureNotes(id: number): Promise<RegenerateNote
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
+
+export interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export async function chatWithLecture(
+  lectureId: number,
+  message: string,
+  selectedText: string | null,
+  history: ChatMessage[],
+): Promise<string> {
+  const res = await apiFetch(`/lectures/${lectureId}/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message, selected_text: selectedText, history }),
+  });
+  const data = await readBody(res);
+  if (!res.ok) {
+    const detail = typeof data === "object" && data !== null && "detail" in data && typeof data.detail === "string"
+      ? data.detail
+      : typeof data === "string" && data.trim()
+        ? data
+        : "Failed to get a response. Please try again.";
+    throw new ApiError(res.status, detail, data);
+  }
+  if (!data || typeof data !== "object" || !("reply" in data) || typeof data.reply !== "string") {
+    throw new Error("Unexpected chat response from server.");
+  }
+  return data.reply as string;
+}
+
 
 export async function startRegenerateNotesJob(id: number): Promise<RegenerateNotesJobStartResponse> {
   const res = await apiFetch(`/lectures/${id}/regenerate-notes/jobs`, { method: "POST" });
@@ -529,6 +570,8 @@ export async function startProcessJob(
   pdf: File,
   recording: UploadRecordingInput,
   naming?: UploadLectureNamingInput,
+  courseContext?: string | null,
+  customName?: string,
 ): Promise<UploadProcessJobStartResponse> {
   const form = new FormData();
   form.append("pdf", pdf);
@@ -542,6 +585,12 @@ export async function startProcessJob(
     form.append("kind", naming.kind);
     form.append("lecture", naming.lecture);
     form.append("year", naming.year);
+  }
+  if (courseContext) {
+    form.append("course_context", courseContext);
+  }
+  if (customName) {
+    form.append("custom_name", customName);
   }
   const res = await apiFetch("/process/jobs", { method: "POST", body: form });
   if (!res.ok) {

@@ -5,6 +5,8 @@ interface Props {
   segments: Segment[];
   enriched?: EnrichedSlide;
   isEnriching?: boolean;
+  onAskAI?: (selectedText: string) => void;
+  showTranscriptTab?: boolean;
 }
 
 function formatTime(seconds: number): string {
@@ -117,9 +119,17 @@ function renderWithBold(text: string): ReactNode {
   return nodes.length > 0 ? nodes : text;
 }
 
-export default function TranscriptPanel({ segments, enriched, isEnriching }: Props) {
+export default function TranscriptPanel({
+  segments,
+  enriched,
+  isEnriching,
+  onAskAI,
+  showTranscriptTab = true,
+}: Props) {
   const topRef = useRef<HTMLDivElement>(null);
+  const notesRef = useRef<HTMLDivElement>(null);
   const [tab, setTab] = useState<"transcript" | "notes">("notes");
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; text: string } | null>(null);
   const notesInvalid = isEnrichedSlideInvalid(enriched);
   const lecturerBullets = enriched?.lecturer_additions
     ? parseLecturerBullets(enriched.lecturer_additions)
@@ -132,25 +142,53 @@ export default function TranscriptPanel({ segments, enriched, isEnriching }: Pro
     topRef.current?.scrollIntoView();
   }, [segments]);
 
+  // Hide context menu on outside click
+  useEffect(() => {
+    if (!contextMenu) return;
+    function onDown() { setContextMenu(null); }
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [contextMenu]);
+
+  function handleNotesMouseUp(e: React.MouseEvent) {
+    if (!onAskAI) return;
+    const selection = window.getSelection();
+    const text = selection?.toString().trim();
+    if (!text || text.length < 3) return;
+    // Only show menu if selection is within the notes area
+    if (notesRef.current && !notesRef.current.contains(selection?.anchorNode ?? null)) return;
+    setContextMenu({ x: e.clientX, y: e.clientY, text });
+  }
+
+  function handleAskAI() {
+    if (!contextMenu) return;
+    onAskAI?.(contextMenu.text);
+    window.getSelection()?.removeAllRanges();
+    setContextMenu(null);
+  }
+
+
   return (
     <div className="transcript-panel">
       <div ref={topRef} />
-      <div className="panel-tabs">
-        <button
-          className={`panel-tab${tab === "notes" ? " active" : ""}`}
-          onClick={() => setTab("notes")}
-        >
-          📝 Notes
-        </button>
-        <button
-          className={`panel-tab${tab === "transcript" ? " active" : ""}`}
-          onClick={() => setTab("transcript")}
-        >
-          🎙 Transcript
-        </button>
-      </div>
+      {showTranscriptTab && (
+        <div className="panel-tabs">
+          <button
+            className={`panel-tab${tab === "notes" ? " active" : ""}`}
+            onClick={() => setTab("notes")}
+          >
+            📝 Notes
+          </button>
+          <button
+            className={`panel-tab${tab === "transcript" ? " active" : ""}`}
+            onClick={() => setTab("transcript")}
+          >
+            🎙 Transcript
+          </button>
+        </div>
+      )}
 
-      {tab === "transcript" && (
+      {showTranscriptTab && tab === "transcript" && (
         <div className="tab-content">
           {segments.length === 0 ? (
             <p className="empty">No transcript segments for this slide.</p>
@@ -168,7 +206,7 @@ export default function TranscriptPanel({ segments, enriched, isEnriching }: Pro
       )}
 
       {tab === "notes" && (
-        <div className="tab-content">
+        <div className="tab-content" onMouseUp={handleNotesMouseUp}>
           {!enriched && isEnriching ? (
             <div className="notes-pending">
               <span className="spinner spinner--dark-sm" />
@@ -179,7 +217,7 @@ export default function TranscriptPanel({ segments, enriched, isEnriching }: Pro
           ) : notesInvalid ? (
             <p className="empty">Notes for this slide are invalid or empty. Regenerate is currently unavailable.</p>
           ) : (
-            <div className="notes">
+            <div className="notes" ref={notesRef}>
               <p className="notes-summary">{renderWithBold(enriched.summary)}</p>
 
               {enriched.slide_content && (
@@ -224,6 +262,17 @@ export default function TranscriptPanel({ segments, enriched, isEnriching }: Pro
               )}
             </div>
           )}
+        </div>
+      )}
+
+      {contextMenu && (
+        <div
+          className="ask-ai-context-menu"
+          style={{ top: contextMenu.y + 6, left: contextMenu.x }}
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={handleAskAI}
+        >
+          💬 Ask AI about this
         </div>
       )}
     </div>

@@ -36,13 +36,15 @@ Some tests are intentionally skipped when optional dependencies are unavailable 
 
 ### Data Flow (`POST /process` and `/process/jobs`)
 1. Upload PDF + recording (`audio` file XOR `audio_url`) to temporary upload staging.
-2. **Parse slides** via `scripts/parse_slides.py`.
-3. **Normalize audio** to mono 16k MP3 using FFmpeg.
-4. **Transcribe** with Groq Whisper in `backend/pipeline.py`.
-5. **Align** transcript to slides using `scripts/align.py` helpers and Anthropic Claude (`ALIGN_MODEL=sonnet|haiku`, default sonnet).
-6. **Enrich** slide notes using `scripts/enrich.py` provider abstraction with bounded parallel workers and retries.
-7. **Generate PPTX** using `scripts/generate_presentation.py`.
-8. **Persist** lecture/slides/transcript/alignment/enrichment to MySQL via async SQLAlchemy.
+2. For non-admin users, hash the PDF and check for an approved, non-archived, non-deleted lecture with the same `pdf_hash`.
+3. If a reusable lecture exists, grant access to that existing lecture, auto-save it for the uploader, and skip the AI pipeline entirely.
+4. Otherwise **parse slides** via `scripts/parse_slides.py`.
+5. **Normalize audio** to mono 16k MP3 using FFmpeg.
+6. **Transcribe** with Groq Whisper in `backend/pipeline.py`.
+7. **Align** transcript to slides using `scripts/align.py` helpers and Anthropic Claude (`ALIGN_MODEL=sonnet|haiku`, default sonnet).
+8. **Enrich** slide notes using `scripts/enrich.py` provider abstraction with bounded parallel workers and retries.
+9. **Generate PPTX** using `scripts/generate_presentation.py`.
+10. **Persist** lecture/slides/transcript/alignment/enrichment to MySQL via async SQLAlchemy.
 
 ### Backend (`backend/`)
 - `main.py` - FastAPI app and route handlers.
@@ -52,6 +54,7 @@ Some tests are intentionally skipped when optional dependencies are unavailable 
 - `catalog_sync.py` - DSV catalog import/sync logic.
 - `media_download.py` - remote recording URL validation + streaming download.
 - In-memory job stores support async processing and regeneration with SSE progress.
+- Lecture visibility for non-admins is uploader-only unless access is granted through the `lecture_access` table.
 
 ### Route Families (current)
 - **Auth:** `/auth/register`, `/auth/login`, `/auth/me`
@@ -63,14 +66,18 @@ Some tests are intentionally skipped when optional dependencies are unavailable 
 
 Auth boundary notes:
 - Most protected routes require `Authorization: Bearer <token>`.
-- `/pdf/{filename}`, `/download/{filename}`, and SSE event streams use query-token auth (`?token=<jwt>`), which is required for `EventSource` and asset URL access.
-- `/demo` is authenticated and returns the newest visible lecture named `IB133N-lecture-14-2026` from DB records.
+- `/pdf/{filename}`, `/download/{filename}`, and regeneration SSE endpoints use query-token auth (`?token=<jwt>`), which is required for `EventSource` and asset URL access.
+- `/pdf/{filename}` and `/download/{filename}` also enforce lecture-level access; a valid token alone is not enough.
+- `/process/jobs/{job_id}` and `/process/jobs/{job_id}/events` are restricted to the upload job owner.
+- Regular users can access only lectures they uploaded themselves or lectures unlocked through duplicate-upload reuse; approval no longer makes a lecture globally visible.
+- `/demo` is admin-only and returns the newest visible lecture named `IB133N-lecture-14-2026` from DB records.
 
 ### Frontend (`frontend/src/`)
 - `App.tsx` - auth-aware app shell, routes (`/`, `/lectures/:id`, `/admin`, `/profile`), lecture selection, process/regeneration job state.
 - `api.ts` - typed API wrappers for auth, lecture lifecycle, async process jobs + SSE, regeneration jobs + SSE, profile, and admin/catalog operations.
 - `types.ts` - shared interfaces including `UploadRecordingInput`, `UploadProcessJobStatus`, `RegenerateNotesJobStatus`, `StudentProfile`, `TeachersNoteSummary`.
 - `components/` - upload flow, results view, transcript/slide viewers, admin panel, profile setup, auth pages, dialogs.
+- Upload completion can now return `reused_existing=true`, which means the user unlocked an already-generated lecture/PPTX instead of running the pipeline.
 
 ## Scripts (`scripts/`) - Import Guidance
 

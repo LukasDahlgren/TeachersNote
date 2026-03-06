@@ -67,7 +67,7 @@ export default function LectureReviewModal({ lecture, onApproved, onRejected, on
 
   useEffect(() => {
     let cancelled = false;
-    getLecture(lecture.id)
+    getLecture(lecture.id, { includeTranscript: true })
       .then((d) => { if (!cancelled) setData(d); })
       .catch((err: unknown) => {
         if (!cancelled) setLoadError(toErrorMessage(err));
@@ -194,7 +194,7 @@ export default function LectureReviewModal({ lecture, onApproved, onRejected, on
     <>
     {confirmRejectOpen && (
       <ConfirmDialog
-        message="Reject and delete this lecture?"
+        message="Reject and permanently delete this lecture?"
         onConfirm={() => { setConfirmRejectOpen(false); void handleReject(); }}
         onCancel={() => setConfirmRejectOpen(false)}
       />

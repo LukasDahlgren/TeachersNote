@@ -2,6 +2,7 @@ import { type KeyboardEvent } from "react";
 import type { TeachersNoteSummary } from "../types";
 
 interface SidebarProps {
+  collapsed?: boolean;
   savedLectures: TeachersNoteSummary[];
   loading: boolean;
   selectedId: number | null;
@@ -57,6 +58,7 @@ function formatLectureDisplayName(lecture: TeachersNoteSummary): string {
 }
 
 export default function Sidebar({
+  collapsed = false,
   savedLectures,
   loading,
   selectedId,
@@ -65,7 +67,7 @@ export default function Sidebar({
   newLectureButtonRef,
   isNewLectureOverlayOpen = false,
   onGoHome,
-  currentUserId,
+  currentUserId: _currentUserId,
   onOpenProfile,
 }: SidebarProps) {
   const handleLogoKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
@@ -76,28 +78,24 @@ export default function Sidebar({
   };
 
   function renderLectureCard(lecture: TeachersNoteSummary) {
-    const isPendingOwn = lecture.is_approved === false && lecture.uploaded_by === currentUserId;
     const lectureDisplayName = formatLectureDisplayName(lecture);
     return (
       <button
         key={lecture.id}
-        className={`lecture-card${selectedId === lecture.id ? " active" : ""}${isPendingOwn ? " lecture-card--pending" : ""}`}
+        className={`lecture-card${selectedId === lecture.id ? " active" : ""}`}
         onClick={() => onSelect(lecture.id)}
       >
         <span className="lecture-card-icon">📄</span>
         <span className="lecture-card-body">
           <span className="lecture-card-name">{lectureDisplayName}</span>
           <span className="lecture-card-date">{formatDate(lecture.created_at)}</span>
-          {isPendingOwn && (
-            <span className="lecture-card-pending-badge">⏳ Pending approval</span>
-          )}
         </span>
       </button>
     );
   }
 
   return (
-    <aside className="sidebar">
+    <aside className={`sidebar${collapsed ? " sidebar--collapsed" : ""}`}>
       <div
         className="sidebar-logo"
         role="button"

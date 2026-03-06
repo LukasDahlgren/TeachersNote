@@ -5,7 +5,6 @@ import {
   archiveLecture,
   buildAssetUrl,
   checkHealth,
-  getDeletedLectures,
   getLectures,
   getLecture,
   getMe,
@@ -14,7 +13,6 @@ import {
   getProcessJob,
   getRegenerateNotesJob,
   logout,
-  restoreLecture,
   saveLecture,
   startProcessJob,
   subscribeProcessJobEvents,
@@ -29,6 +27,8 @@ import ProcessingConsoleOverlay from "./components/ProcessingConsoleOverlay";
 import ResizableSplitPane, { NOTES_PRESENTATION_SPLIT_STORAGE_KEY } from "./components/ResizableSplitPane";
 import SlideViewer from "./components/SlideViewer";
 import TranscriptPanel from "./components/TranscriptPanel";
+import ChatPanel from "./components/ChatPanel";
+import ChatSplitArea from "./components/ChatSplitArea";
 import Sidebar from "./components/Sidebar";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { type ProcessChatEntry } from "./components/ProcessChat";
@@ -176,8 +176,6 @@ export default function App() {
   const [lectures, setLectures] = useState<TeachersNoteSummary[]>([]);
   const [savedLectures, setSavedLectures] = useState<TeachersNoteSummary[]>([]);
   const [profile, setProfile] = useState<StudentProfile | null>(null);
-  const [profileLoading, setProfileLoading] = useState(true);
-  const [deletedLectures, setDeletedLectures] = useState<TeachersNoteSummary[]>([]);
   const [lecturesLoading, setLecturesLoading] = useState(true);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [processJob, setProcessJob] = useState<UploadProcessJobStatus | null>(null);
@@ -211,6 +209,19 @@ export default function App() {
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [authView, setAuthView] = useState<"login" | "signup">("login");
   const isAdmin = authUser?.is_admin ?? false;
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatPrefill, setChatPrefill] = useState<string | null>(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    () => localStorage.getItem("sidebar-collapsed") === "true"
+  );
+
+  function toggleSidebar() {
+    setSidebarCollapsed((c) => {
+      const next = !c;
+      localStorage.setItem("sidebar-collapsed", String(next));
+      return next;
+    });
+  }
 
   const regenUnsubscribeRef = useRef<(() => void) | null>(null);
   const regenReconnectTimerRef = useRef<number | null>(null);
@@ -267,17 +278,8 @@ export default function App() {
     setLecturesLoading(true);
     try {
       const [catalog, saved] = await Promise.all([getLectures(), getMyLectures()]);
-      let deleted: TeachersNoteSummary[] = [];
-      if (isAdmin) {
-        try {
-          deleted = await getDeletedLectures();
-        } catch (err) {
-          console.warn("Failed to refresh deleted lectures list:", toErrorMessage(err));
-        }
-      }
       setLectures(catalog);
       setSavedLectures(saved);
-      setDeletedLectures(deleted);
       return { ok: true };
     } catch (err) {
       const message = toErrorMessage(err);
@@ -289,14 +291,11 @@ export default function App() {
   }, [isAdmin]);
 
   const fetchProfile = useCallback(async () => {
-    setProfileLoading(true);
     try {
       const nextProfile = await getProfile();
       setProfile(nextProfile);
     } catch (err) {
       console.warn("Failed to refresh profile:", toErrorMessage(err));
-    } finally {
-      setProfileLoading(false);
     }
   }, []);
 
@@ -317,6 +316,7 @@ export default function App() {
         setAuthState("authenticated");
       })
       .catch(() => {
+        logout();
         setAuthState("unauthenticated");
       });
   }, []);
@@ -515,6 +515,9 @@ export default function App() {
       return;
     }
 
+    const successText = status.reused_existing
+      ? "Existing lecture unlocked."
+      : "Lecture processed successfully.";
     const refreshResult = await fetchLectures();
     let completionWarning: string | null = null;
     if (!refreshResult.ok) {
@@ -531,7 +534,7 @@ export default function App() {
       setProcessBanner(null);
       setProcessToast({
         kind: completionWarning ? "error" : "success",
-        text: completionWarning ?? "Lecture processed successfully.",
+        text: completionWarning ?? successText,
         lectureId,
       });
       setProcessOverlayDoneData({ lectureId, downloadUrl: null });
@@ -945,7 +948,7 @@ export default function App() {
     }
   }, [appendProcessChat, fetchLectures, resetProcessUi, resetRegenerationUi]);
 
-  async function handleSubmit(pdf: File, recording: UploadRecordingInput) {
+  async function handleSubmit(pdf: File, recording: UploadRecordingInput, courseContext: string | null = null, lectureName = "") {
     demoRunRef.current += 1;
     setDemoPreviewActive(false);
     setProcessToast(null);
@@ -958,7 +961,7 @@ export default function App() {
     setProcessingLectureName("Pending admin naming");
     setMainView({ view: "upload", loading: true });
     try {
-      const job = await startProcessJob(pdf, recording);
+      const job = await startProcessJob(pdf, recording, undefined, courseContext, lectureName || undefined);
       processTerminalHandledRef.current.delete(job.job_id);
       setSelectedId(null);
       setProcessJob(job);
@@ -1028,9 +1031,15 @@ export default function App() {
       const data = await getLecture(id);
       setMainView({ view: "results", data, activeSlide: 0, lectureId: id });
     } catch (err) {
-      setMainView({ view: "upload", loading: false, error: String(err) });
+      if (err instanceof ApiError && (err.status === 404 || err.status === 403)) {
+        setSelectedId(null);
+        setMainView({ view: "empty" });
+        navigate("/workspace", { replace: true });
+      } else {
+        setMainView({ view: "upload", loading: false, error: String(err) });
+      }
     }
-  }, [resetProcessUi, resetRegenerationUi]);
+  }, [navigate, resetProcessUi, resetRegenerationUi]);
 
   const handleSelectLecture = useCallback((id: number) => {
     setIsNewLectureOverlayOpen(false);
@@ -1261,19 +1270,6 @@ export default function App() {
       setDeleteTarget(null);
     }
   }
-
-  async function handleRestoreLecture(id: number) {
-    try {
-      await restoreLecture(id);
-      await fetchLectures();
-    } catch (err) {
-      console.warn("Failed to restore lecture:", err);
-    }
-  }
-
-  const handleProfileChange = useCallback((nextProfile: StudentProfile) => {
-    setProfile(nextProfile);
-  }, []);
 
   const activeSlideComputed = useMemo(() => {
     if (mainView.view !== "results") return null;
@@ -1506,6 +1502,14 @@ export default function App() {
         return (
           <div className="results">
               <div className="results-header">
+                <button
+                  className="sidebar-toggle-btn"
+                  onClick={toggleSidebar}
+                  title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+                  aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+                >
+                  {sidebarCollapsed ? "›" : "‹"}
+                </button>
                 <span className="results-lecture-name">{formatLectureDisplayName(data) || "Lecture"}</span>
                 {demoPreviewActive && <span className="demo-pill">Demo preview</span>}
                 <div className="results-actions">
@@ -1536,6 +1540,18 @@ export default function App() {
                       <button>Download PPTX</button>
                     </a>
                   )}
+                  {canShowTrashAction && (
+                    <button
+                      type="button"
+                      className="secondary danger"
+                      onClick={openDeleteDialog}
+                      disabled={archivePending || savePending || regeneratingNotes || deletePending}
+                      aria-label="Delete lecture"
+                      title="Delete lecture"
+                    >
+                      🗑 Delete
+                    </button>
+                  )}
                 </div>
             </div>
             {regeneratingNotes && (
@@ -1554,26 +1570,44 @@ export default function App() {
               <div className={`banner ${archiveBanner.kind}`}>{archiveBanner.text}</div>
             )}
             <ResizableSplitPane
-              className="results-body"
-              storageKey={NOTES_PRESENTATION_SPLIT_STORAGE_KEY}
-              left={(
-                <SlideViewer
-                  slideText={data.slides[activeSlide]?.text ?? ""}
-                  slideNumber={activeSlide + 1}
-                  total={data.slides.length}
-                  onPrev={onPrev}
-                  onNext={onNext}
-                  pdfUrl={pdfUrl}
-                />
-              )}
-              right={(
-                <TranscriptPanel
-                  segments={segments}
-                  enriched={data.enhanced?.find(e => e.slide === activeSlide + 1)}
-                  isEnriching={isEnriching}
-                />
-              )}
-            />
+                className="results-body"
+                storageKey={NOTES_PRESENTATION_SPLIT_STORAGE_KEY}
+                left={(
+                  <ChatSplitArea
+                    chatOpen={chatOpen}
+                    chatPanel={(
+                      <ChatPanel
+                        key={mainView.lectureId ?? mainView.data.lecture_id ?? 0}
+                        lectureId={mainView.lectureId ?? mainView.data.lecture_id ?? 0}
+                        expanded={chatOpen}
+                        onExpand={() => setChatOpen(true)}
+                        onCollapse={() => setChatOpen(false)}
+                        prefillText={chatPrefill}
+                        consoleVisible={showProcessOverlay}
+                      />
+                    )}
+                    viewer={(
+                      <SlideViewer
+                        slideText={data.slides[activeSlide]?.text ?? ""}
+                        slideNumber={activeSlide + 1}
+                        total={data.slides.length}
+                        onPrev={onPrev}
+                        onNext={onNext}
+                        pdfUrl={pdfUrl}
+                      />
+                    )}
+                  />
+                )}
+                right={(
+                  <TranscriptPanel
+                    segments={segments}
+                    enriched={data.enhanced?.find(e => e.slide === activeSlide + 1)}
+                    isEnriching={isEnriching}
+                    onAskAI={(text) => { setChatPrefill(text); setChatOpen(true); }}
+                    showTranscriptTab={false}
+                  />
+                )}
+              />
           </div>
         );
       })()}
@@ -1611,6 +1645,7 @@ export default function App() {
     <ErrorBoundary>
     <div className="app-shell">
       <Sidebar
+        collapsed={sidebarCollapsed}
         savedLectures={sidebarSavedLectures}
         loading={lecturesLoading}
         selectedId={selectedId}
@@ -1624,6 +1659,16 @@ export default function App() {
       />
 
       <main className={`main-content${isAdminRoute ? " main-content--admin" : ""}`}>
+        {sidebarCollapsed && (
+          <button
+            className="sidebar-expand-btn"
+            onClick={toggleSidebar}
+            title="Expand sidebar"
+            aria-label="Expand sidebar"
+          >
+            ›
+          </button>
+        )}
         <div className="route-motion-shell route-motion-shell--main" data-motion-phase={routeMotion.phase}>
           <div className="route-motion-content route-motion-content--main">
             {showBackendOfflineBanner && (
@@ -1634,28 +1679,6 @@ export default function App() {
               <div className={`banner ${processBanner.kind}`}>{processBanner.text}</div>
             )}
 
-            {canShowTrashAction && (
-              <button
-                type="button"
-                className="trash-fab"
-                onClick={openDeleteDialog}
-                disabled={archivePending || savePending || regeneratingNotes || deletePending}
-                aria-label="Delete lecture"
-                title="Delete lecture"
-              >
-                <svg className="trash-fab-icon" viewBox="0 0 24 24" aria-hidden="true">
-                  <path
-                    d="M3 6h18M8 6V4h8v2m-9 0l1 14h8l1-14M10 10v7m4-7v7"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.8"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  />
-                </svg>
-              </button>
-            )}
-
             <Routes location={routeMotion.displayLocation}>
               <Route
                 path="/"
@@ -1664,9 +1687,6 @@ export default function App() {
                     savedLectures={savedLectures}
                     allLectures={lectures}
                     loading={lecturesLoading}
-                    profile={profile}
-                    profileLoading={profileLoading}
-                    onProfileChange={handleProfileChange}
                     onOpenLecture={handleSelectLecture}
                   />
                 )}
@@ -1693,10 +1713,7 @@ export default function App() {
                     profile={profile}
                     isAdmin={isAdmin}
                     archivedLectures={sidebarArchivedLectures}
-                    deletedLectures={deletedLectures}
                     onLogout={handleLogout}
-                    onRestore={handleRestoreLecture}
-                    onProfileChange={handleProfileChange}
                     onSelectLecture={handleSelectLecture}
                   />
                 )}
@@ -1730,11 +1747,12 @@ export default function App() {
               </button>
             </div>
             <UploadForm
-              onSubmit={(pdf, recording) => {
+              onSubmit={(pdf, recording, courseContext, lectureName) => {
                 setIsNewLectureOverlayOpen(false);
-                void handleSubmit(pdf, recording);
+                void handleSubmit(pdf, recording, courseContext, lectureName);
               }}
               loading={isUploadActive}
+              canRunDemo={isAdmin}
               onRunDemo={() => {
                 setIsNewLectureOverlayOpen(false);
                 void handleRunDemo();
@@ -1771,7 +1789,7 @@ export default function App() {
           <div className="confirm-dialog" onClick={(e) => e.stopPropagation()}>
             <h2 id="delete-confirm-title" className="confirm-title">Delete lecture?</h2>
             <p className="confirm-text">
-              Delete <strong>"{deleteTarget.name}"</strong>? This will move the PPTX to Recently Deleted.
+              Delete <strong>"{deleteTarget.name}"</strong>? This permanently removes the lecture, PPTX, PDF, and stored notes.
             </p>
             <div className="confirm-actions">
               <button

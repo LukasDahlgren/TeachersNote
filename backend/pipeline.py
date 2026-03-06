@@ -19,9 +19,14 @@ ProgressEmitter = Callable[[str, str, int], None]
 
 # Allow importing from sibling scripts/ directory
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=Path(__file__).resolve().with_name(".env"), override=False)
+
 from scripts.parse_slides import parse_slides
 from scripts.align import build_prompt, parse_response
 from scripts.enrich import (
+    DEFAULT_ENRICH_BATCH_SIZE,
     DEFAULT_ENRICH_LOG_USAGE,
     DEFAULT_ENRICH_MAX_ATTEMPTS,
     DEFAULT_ENRICH_MAX_OUTPUT_TOKENS,
@@ -30,6 +35,7 @@ from scripts.enrich import (
     build_fallback_enrichment,
     create_enrichment_client,
     default_enrichment_model,
+    enrich_slides_batch_with_retry,
     enrich_slide_with_retry,
     is_enriched_payload_invalid,
     normalize_enriched_payload,
@@ -52,6 +58,7 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
 
 ENRICH_PROVIDER = resolve_enrichment_provider(os.getenv("ENRICH_PROVIDER"))
 ENRICH_MODEL = os.getenv("ENRICH_MODEL", "").strip() or default_enrichment_model(ENRICH_PROVIDER)
+ENRICH_BATCH_SIZE = DEFAULT_ENRICH_BATCH_SIZE
 ENRICH_MAX_WORKERS = DEFAULT_ENRICH_MAX_WORKERS
 ENRICH_MAX_TRANSCRIPT_WORDS = DEFAULT_ENRICH_MAX_TRANSCRIPT_WORDS
 ENRICH_MAX_OUTPUT_TOKENS = DEFAULT_ENRICH_MAX_OUTPUT_TOKENS
@@ -95,6 +102,7 @@ def enrich_slide_notes(
     token_callback=None,
     *,
     return_metrics: bool = False,
+    course_context: str | None = None,
 ) -> dict | tuple[dict, dict]:
     enriched, metrics = enrich_slide_with_retry(
         enrichment_client,
@@ -108,6 +116,34 @@ def enrich_slide_notes(
         log_usage=ENRICH_LOG_USAGE,
         log_callback=log_callback,
         token_callback=token_callback,
+        course_context=course_context,
+    )
+    if return_metrics:
+        return enriched, metrics
+    return enriched
+
+
+def enrich_slides_batch_notes(
+    slides_with_transcripts: list[tuple[dict, str]],
+    max_attempts: int = ENRICH_MAX_ATTEMPTS,
+    log_callback=None,
+    token_callback=None,
+    *,
+    return_metrics: bool = False,
+    course_context: str | None = None,
+) -> list[dict] | tuple[list[dict], dict]:
+    enriched, metrics = enrich_slides_batch_with_retry(
+        enrichment_client,
+        slides_with_transcripts,
+        provider=ENRICH_PROVIDER,
+        model=ENRICH_MODEL,
+        max_output_tokens=ENRICH_MAX_OUTPUT_TOKENS,
+        max_transcript_words=ENRICH_MAX_TRANSCRIPT_WORDS,
+        max_attempts=max_attempts,
+        log_usage=ENRICH_LOG_USAGE,
+        log_callback=log_callback,
+        token_callback=token_callback,
+        course_context=course_context,
     )
     if return_metrics:
         return enriched, metrics
@@ -617,6 +653,7 @@ def enrich(
     alignment: list[dict],
     emit: ProgressEmitter | None = None,
     on_slide_enriched: Callable[[int, dict], None] | None = None,
+    course_context: str | None = None,
 ) -> list[dict]:
     total = len(alignment)
     done_count = 0
@@ -641,89 +678,122 @@ def enrich(
     print(
         f"✨ Enriching {total} slides via {ENRICH_PROVIDER}:{ENRICH_MODEL} "
         f"(workers={ENRICH_MAX_WORKERS}, retries={ENRICH_MAX_ATTEMPTS}, "
-        f"max_output_tokens={ENRICH_MAX_OUTPUT_TOKENS}, max_transcript_words={ENRICH_MAX_TRANSCRIPT_WORDS})...",
+        f"batch_size={ENRICH_BATCH_SIZE}, max_output_tokens={ENRICH_MAX_OUTPUT_TOKENS}, "
+        f"max_transcript_words={ENRICH_MAX_TRANSCRIPT_WORDS})...",
         flush=True,
     )
     _emit_progress(emit, "enrich", f"✨ Enriching {total} slides...", 70)
     slides_by_num = {s["slide"]: s for s in slides}
 
-    def enrich_one(a: dict) -> dict:
-        nonlocal done_count
-        slide = slides_by_num[a["slide"]]
-        text = " ".join(
-            seg["text"].strip()
-            for seg in transcript[a["start_segment"]: a["end_segment"] + 1]
-        )
+    def chunk_alignment_rows(rows: list[dict], size: int) -> list[list[dict]]:
+        return [rows[idx:idx + size] for idx in range(0, len(rows), size)]
 
+    def enrich_batch(batch: list[dict]) -> list[dict]:
+        nonlocal done_count
+        batch_inputs: list[tuple[dict, str]] = []
+        slide_numbers: list[int] = []
+        for a in batch:
+            slide = slides_by_num[a["slide"]]
+            text = " ".join(
+                seg["text"].strip()
+                for seg in transcript[a["start_segment"]: a["end_segment"] + 1]
+            )
+            batch_inputs.append((slide, text))
+            slide_numbers.append(int(a["slide"]))
         with done_lock:
             in_progress_done = done_count
         pct_start = 70 + int((in_progress_done / total) * 20) if total > 0 else 70
-        print(f"  ⏳ Enriching slide {a['slide']} ({in_progress_done + 1}/{total})...", flush=True)
+        if len(slide_numbers) == 1:
+            batch_label = str(slide_numbers[0])
+        else:
+            batch_label = f"{slide_numbers[0]}-{slide_numbers[-1]}"
+        print(
+            f"  ⏳ Enriching slides {batch_label} ({in_progress_done + 1}/{total})...",
+            flush=True,
+        )
 
         def slide_log(msg: str) -> None:
             _emit_progress(emit, "enrich", msg, pct_start)
 
         with _global_enrich_semaphore:
-            enriched, metrics = enrich_slide_notes(
-                slide,
-                text,
+            enriched_batch, metrics = enrich_slides_batch_notes(
+                batch_inputs,
                 max_attempts=ENRICH_MAX_ATTEMPTS,
                 log_callback=slide_log,
                 token_callback=slide_log,
                 return_metrics=True,
+                course_context=course_context,
             )
-        with done_lock:
-            done_count += 1
-            local_done = done_count
         with metrics_lock:
             usage_totals["input_tokens"] += int(metrics.get("input_tokens", 0))
             usage_totals["output_tokens"] += int(metrics.get("output_tokens", 0))
             usage_totals["total_tokens"] += int(metrics.get("total_tokens", 0))
             usage_totals["retries"] += int(metrics.get("retries", 0))
             usage_totals["duration_ms"] += int(metrics.get("duration_ms", 0))
-            if metrics.get("fallback_used"):
-                usage_totals["fallbacks"] += 1
-                reason = str(metrics.get("failure_reason", "other_error"))
+            usage_totals["fallbacks"] += int(metrics.get("fallbacks", 0))
+            for reason, count in dict(metrics.get("failure_reason_counts", {})).items():
                 if reason not in failure_reason_counts:
-                    reason = "other_error"
-                failure_reason_counts[reason] += 1
+                    continue
+                failure_reason_counts[reason] += int(count)
 
-        print(f"  ✅ Slide {a['slide']} done ({local_done}/{total})", flush=True)
-        if total > 0:
-            pct = 70 + int((local_done / total) * 20)
-        else:
-            pct = 90
-        _emit_progress(
-            emit,
-            "enrich",
-            f"✅ Slide {a['slide']} done ({local_done}/{total})",
-            pct,
-        )
-        result = {
-            "slide": a["slide"],
-            "original_text": slide["text"],
-            "start_segment": a["start_segment"],
-            "end_segment": a["end_segment"],
-            **enriched,
+        enriched_by_slide = {int(entry["slide"]): entry for entry in enriched_batch}
+        transcript_by_slide = {
+            int(slide["slide"]): text
+            for slide, text in batch_inputs
         }
-        if on_slide_enriched is not None:
-            try:
-                on_slide_enriched(a["slide"], {
+        batch_results: list[dict] = []
+        for a in batch:
+            slide = slides_by_num[a["slide"]]
+            enriched = enriched_by_slide.get(int(a["slide"]))
+            if enriched is None:
+                enriched = {
                     "slide": a["slide"],
-                    "summary": enriched.get("summary", ""),
-                    "slide_content": enriched.get("slide_content", ""),
-                    "lecturer_additions": enriched.get("lecturer_additions", ""),
-                    "key_takeaways": enriched.get("key_takeaways", []),
-                })
-            except Exception:
-                pass
-        return result
+                    **build_fallback_enrichment(slide, transcript_by_slide.get(int(a["slide"]), "")),
+                }
+            with done_lock:
+                done_count += 1
+                local_done = done_count
+            print(f"  ✅ Slide {a['slide']} done ({local_done}/{total})", flush=True)
+            if total > 0:
+                pct = 70 + int((local_done / total) * 20)
+            else:
+                pct = 90
+            _emit_progress(
+                emit,
+                "enrich",
+                f"✅ Slide {a['slide']} done ({local_done}/{total})",
+                pct,
+            )
+            result = {
+                "slide": a["slide"],
+                "original_text": slide["text"],
+                "start_segment": a["start_segment"],
+                "end_segment": a["end_segment"],
+                "summary": enriched.get("summary", ""),
+                "slide_content": enriched.get("slide_content", ""),
+                "lecturer_additions": enriched.get("lecturer_additions", ""),
+                "key_takeaways": enriched.get("key_takeaways", []),
+            }
+            if on_slide_enriched is not None:
+                try:
+                    on_slide_enriched(a["slide"], {
+                        "slide": a["slide"],
+                        "summary": result["summary"],
+                        "slide_content": result["slide_content"],
+                        "lecturer_additions": result["lecturer_additions"],
+                        "key_takeaways": result["key_takeaways"],
+                    })
+                except Exception:
+                    pass
+            batch_results.append(result)
+        return batch_results
 
     results: list[dict] = []
+    batches = chunk_alignment_rows(alignment, ENRICH_BATCH_SIZE)
     with ThreadPoolExecutor(max_workers=ENRICH_MAX_WORKERS) as pool:
-        futures = [pool.submit(enrich_one, a) for a in alignment]
+        futures = [pool.submit(enrich_batch, batch) for batch in batches]
         for future in as_completed(futures):
-            results.append(future.result())
+            results.extend(future.result())
 
     results.sort(key=lambda x: x["slide"])
     wall_duration_ms = int((time.perf_counter() - stage_started) * 1000)
@@ -749,6 +819,7 @@ def run_pipeline(
     on_slides_parsed: Callable[[int], None] | None = None,
     on_slide_enriched: Callable[[int, dict], None] | None = None,
     on_pre_enrich: Callable[[list, list, list], None] | None = None,
+    course_context: str | None = None,
 ) -> dict:
     # Step 1: Extract slides
     print("📄 Parsing slides from PDF...", flush=True)
@@ -778,7 +849,7 @@ def run_pipeline(
             on_pre_enrich(slides, transcript, alignment)
         except Exception:
             pass
-    enhanced = enrich(slides, transcript, alignment, emit=emit, on_slide_enriched=on_slide_enriched)
+    enhanced = enrich(slides, transcript, alignment, emit=emit, on_slide_enriched=on_slide_enriched, course_context=course_context)
 
     # Step 5: Generate PPTX
     _emit_progress(emit, "generate_pptx", "🎉 Generating presentation...", 93)

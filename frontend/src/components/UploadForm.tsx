@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from "react";
+import { getProfileCourseOptions } from "../api";
 import {
+  type Course,
   type UploadRecordingInput,
 } from "../types";
+import CoursePicker from "./CoursePicker";
 
 interface ConsoleEntry {
   id: number;
@@ -10,8 +13,9 @@ interface ConsoleEntry {
 }
 
 interface Props {
-  onSubmit: (pdf: File, recording: UploadRecordingInput) => void;
+  onSubmit: (pdf: File, recording: UploadRecordingInput, courseContext: string | null, lectureName: string) => void;
   loading: boolean;
+  canRunDemo?: boolean;
   onRunDemo: () => void;
   progressPct?: number | null;
   consoleEntries?: ConsoleEntry[];
@@ -128,7 +132,14 @@ function DropZone({
   );
 }
 
-export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, consoleEntries }: Props) {
+export default function UploadForm({
+  onSubmit,
+  loading,
+  canRunDemo = false,
+  onRunDemo,
+  progressPct,
+  consoleEntries,
+}: Props) {
   const consoleEndRef = useRef<HTMLDivElement>(null);
   const [pdfFile, setPdfFile] = useState<File | null>(null);
   const [audioFile, setAudioFile] = useState<File | null>(null);
@@ -136,9 +147,18 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
   const [audioDragOver, setAudioDragOver] = useState(false);
   const [error, setError] = useState("");
   const [showHowItWorks, setShowHowItWorks] = useState(false);
+  const [lectureName, setLectureName] = useState("");
+  const [selectedCourseCode, setSelectedCourseCode] = useState<string | null>(null);
+  const [availableCourses, setAvailableCourses] = useState<Course[]>([]);
 
   const pdfInputRef = useRef<HTMLInputElement>(null);
   const audioInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    getProfileCourseOptions()
+      .then((opts) => setAvailableCourses(opts.all_courses ?? []))
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     consoleEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -187,7 +207,11 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
     }
 
     setError("");
-    onSubmit(pdfFile, { type: "file", file: audioFile });
+    const selectedCourse = availableCourses.find((c) => c.code === selectedCourseCode) ?? null;
+    const courseContext = selectedCourse
+      ? `${selectedCourse.name} (${selectedCourse.display_code ?? selectedCourse.code})`
+      : null;
+    onSubmit(pdfFile, { type: "file", file: audioFile }, courseContext, lectureName.trim());
   }
 
   return (
@@ -211,19 +235,43 @@ export default function UploadForm({ onSubmit, loading, onRunDemo, progressPct, 
           <div className="form-info-box-content">
             <p className="form-info-box-text">
               Upload your lecture slides (PDF) and recording. The system extracts slide content, transcribes audio,
-              aligns transcript to slides, and creates a temporary lecture name from the first slide. Admin sets the
-              final canonical name before approval.
+              aligns the transcript to slides, and generates enriched notes. Give your lecture a name in the field below.
             </p>
-            <button
-              type="button"
-              className="form-info-box-demo-btn"
-              onClick={onRunDemo}
-              disabled={loading}
-            >
-              Show demo
-            </button>
+            {canRunDemo && (
+              <button
+                type="button"
+                className="form-info-box-demo-btn"
+                onClick={onRunDemo}
+                disabled={loading}
+              >
+                Show demo
+              </button>
+            )}
           </div>
         )}
+      </div>
+
+      <div className="drop-zone-wrapper">
+        <div className="drop-zone-label">COURSE (OPTIONAL)</div>
+        <CoursePicker
+          courses={availableCourses}
+          value={selectedCourseCode}
+          onChange={setSelectedCourseCode}
+          disabled={loading}
+        />
+      </div>
+
+      <div className="drop-zone-wrapper">
+        <div className="drop-zone-label">NAME (OPTIONAL)</div>
+        <input
+          type="text"
+          className="form-name-input"
+          placeholder="e.g. Linear Algebra – Lecture 5"
+          value={lectureName}
+          onChange={(e) => setLectureName(e.target.value)}
+          disabled={loading}
+          maxLength={120}
+        />
       </div>
 
       <DropZone

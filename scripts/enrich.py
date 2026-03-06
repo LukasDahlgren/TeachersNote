@@ -25,15 +25,19 @@ def _env_truthy(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
     raw = os.getenv(name)
     if raw is None:
-        return default
-    try:
-        parsed = int(raw.strip())
-    except ValueError:
-        return default
-    return max(minimum, parsed)
+        parsed = default
+    else:
+        try:
+            parsed = int(raw.strip())
+        except ValueError:
+            parsed = default
+    parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
 
 
 
@@ -45,6 +49,7 @@ DEFAULT_ENRICH_MAX_WORKERS = _env_int("ENRICH_MAX_WORKERS", 1, minimum=1)
 DEFAULT_ENRICH_MAX_TRANSCRIPT_WORDS = _env_int("ENRICH_MAX_TRANSCRIPT_WORDS", 700, minimum=1)
 DEFAULT_ENRICH_MAX_OUTPUT_TOKENS = _env_int("ENRICH_MAX_OUTPUT_TOKENS", 320, minimum=64)
 DEFAULT_ENRICH_MAX_ATTEMPTS = _env_int("ENRICH_MAX_ATTEMPTS", 4, minimum=1)
+DEFAULT_ENRICH_BATCH_SIZE = _env_int("ENRICH_BATCH_SIZE", 1, minimum=1, maximum=8)
 DEFAULT_ENRICH_LOG_USAGE = _env_truthy("ENRICH_LOG_USAGE", True)
 
 SUPPORTED_ENRICH_PROVIDERS = {"anthropic", "groq"}
@@ -54,18 +59,21 @@ Du får en föreläsningsbild (slide) och en transkription av vad föreläsaren 
 Din uppgift är att skapa berikade anteckningar på svenska med strikt relevans till sliden:
 1. Fokus ska vara det som visas eller direkt förklarar sliden.
 2. Ignorera operativt prat och småprat (t.ex. kamera, mikrofon, ljud, pauser, adminpåminnelser).
-3. I lecturer_additions får du ta med upp till 3 punkter som inte står på sliden, men bara om de är akademiskt kursrelevanta och hjälper studenten förstå ämnet djupare.
+3. I lecturer_additions får du bara ta med sådant som faktiskt sägs av föreläsaren i transkriptionen och som tillför något utöver själva slide-texten, till exempel förtydliganden, exempel, varningar eller tentabetoningar.
 4. Ta aldrig med praktiska/logistiska detaljer som inte hjälper studenten förstå slideinnehållet.
-5. Håll anteckningarna informativa, inte för korta: summary ska vara en fullständig informativ mening, slide_content ska ha 2-4 substantiella punkter, lecturer_additions ska ha 3-6 punkter när relevant material finns, och key_takeaways ska ha 2-4 konkreta punkter beroende på hur innehållsrikt sliden är.
+5. Håll anteckningarna informativa, inte för korta: summary ska vara en fullständig informativ mening, slide_content ska ha 2-4 substantiella punkter, lecturer_additions ska ha 0-4 punkter när transkriptionen faktiskt tillför värde, och key_takeaways ska ha 2-4 konkreta punkter beroende på hur innehållsrikt sliden är.
+10. Varje enskild punkt i slide_content, lecturer_additions och key_takeaways MÅSTE vara en meningsfull, komplett fras eller mening – aldrig en renodlad agendapost (t.ex. "Idag", "Nästa", "Sammanfattning") eller ett ofullständigt fragment. Om sliden är gles eller bara en agenda, är det OK att ha färre punkter i stället för att fylla med meningslösa rader.
 6. Markera den viktigaste termen i varje punkt i slide_content, lecturer_additions och key_takeaways med markdown-formatet **viktig term** (helst en gång per punkt). Om föreläsaren definierade en term, skriv definitionen direkt efter termen i parentes: **term** (= definition).
 7. Om föreläsaren gav ett konkret exempel eller analogi, inkludera det som en punkt i lecturer_additions med prefixet "Exempel: ...".
 8. Om föreläsaren explicit markerade något som tentarelevant eller extra viktigt, lägg till prefixet "[Tentaviktigt]" på den punkten i lecturer_additions eller key_takeaways.
+9. Om KURSKONTEXT anges i prompten, använd det för att korrekt tolka kursspecifika förkortningar och termer. Expandera ALDRIG en förkortning på ett sätt som strider mot KURSKONTEXT – kursens egna förkortningar har alltid företräde framför din allmänna kunskap.
+11. Kopiera aldrig slide-texten ordagrant eller nästan ordagrant till lecturer_additions. Information som finns på sliden ska stanna i slide_content. Om transkriptionen inte tillför någon extra förklaring ska lecturer_additions vara en tom sträng.
 
 Svara ALLTID med ett JSON-objekt (inga kodblock, bara ren JSON) med dessa fält:
 {
   "summary": "En komplett och informativ mening som sammanfattar slidens ämne och varför det är relevant i kursens sammanhang (om det framgår av transkriptionen)",
   "slide_content": "2-4 punktlistor där varje rad börjar med '- ' och är direkt slide-relevanta",
-  "lecturer_additions": "3-6 punktlistor där varje rad börjar med '- '. Upp till 3 punkter får vara akademisk kontext utanför sliden.",
+  "lecturer_additions": "0-4 punktlistor där varje rad börjar med '- ' och bygger på föreläsarens extra förklaringar i transkriptionen. Använd tom sträng om inget utöver sliden tillkommer.",
   "key_takeaways": ["2-4 takeaways beroende på slidens innehållsrikedom"]
 }"""
 
@@ -73,16 +81,65 @@ STRICT_SYSTEM_PROMPT = """Du måste svara med ENDAST ett giltigt JSON-objekt.
 Ingen inledande text, inga kodblock, inga extra nycklar.
 Innehållet måste vara strikt slide-relevant.
 Ignorera operativt prat/småprat (kamera, mikrofon, ljud, zoom, paus, admin).
-I lecturer_additions får upp till 3 punkter vara akademisk kontext utanför sliden.
-Undvik ultrakorta svar: summary ska vara informativ, slide_content ska normalt ha 2-4 punkter och key_takeaways ska ha 2-4 tydliga punkter beroende på slidens innehållsrikedom.
+I lecturer_additions får du endast använda innehåll som kommer från transkriptionen och som tillför något utöver slide-texten.
+Undvik ultrakorta svar: summary ska vara informativ, slide_content ska normalt ha 2-4 punkter, lecturer_additions ska ha 0-4 punkter när transkriptionen faktiskt tillför värde, och key_takeaways ska ha 2-4 tydliga punkter beroende på slidens innehållsrikedom.
+Varje enskild punkt i slide_content, lecturer_additions och key_takeaways MÅSTE vara en meningsfull, komplett fras – aldrig en renodlad agendapost (t.ex. "Idag", "Nästa") eller ett ofullständigt fragment. Om sliden är gles, ha färre punkter i stället för att fylla med meningslösa rader.
 Markera viktigaste term i varje punkt i slide_content, lecturer_additions och key_takeaways med **...** (helst en gång per punkt). Om föreläsaren definierade en term, skriv definitionen direkt efter: **term** (= definition).
 Om föreläsaren gav ett konkret exempel eller analogi, inkludera det i lecturer_additions med prefixet "Exempel: ...".
 Om föreläsaren explicit markerade något som tentarelevant eller extra viktigt, lägg till prefixet "[Tentaviktigt]" på den punkten.
+Om KURSKONTEXT anges i prompten, använd det för att korrekt tolka kursspecifika förkortningar och termer. Expandera ALDRIG en förkortning på ett sätt som strider mot KURSKONTEXT – kursens egna förkortningar har alltid företräde framför din allmänna kunskap.
+Kopiera aldrig slide-text ordagrant eller nästan ordagrant till lecturer_additions. Om transkriptionen inte tillför någon extra förklaring ska lecturer_additions vara en tom sträng.
 Använd exakt dessa nycklar:
 - summary (string, en komplett informativ mening som förklarar ämnet och dess relevans om det framgår)
 - slide_content (string med 2-4 punktlistor där varje rad börjar med '- ' och är slide-relevanta)
-- lecturer_additions (string med 3-6 punktlistor där varje rad börjar med '- ', där upp till 3 punkter får vara icke-slide men akademiska)
+- lecturer_additions (string med 0-4 punktlistor där varje rad börjar med '- ' och kommer från föreläsarens extra förklaringar; tom sträng om inget extra finns)
 - key_takeaways (array med 2-4 strings)"""
+
+BATCH_SYSTEM_PROMPT = """Du är assistent som hjälper studenter att förstå föreläsningsinnehåll.
+Du får flera föreläsningsbilder (slides) och en separat transkription för varje slide.
+Behandla varje slide självständigt och blanda aldrig ihop innehåll mellan olika slides.
+Din uppgift är att skapa berikade anteckningar på svenska med strikt relevans till varje slide:
+1. Fokus ska vara det som visas eller direkt förklarar respektive slide.
+2. Ignorera operativt prat och småprat (t.ex. kamera, mikrofon, ljud, pauser, adminpåminnelser).
+3. I lecturer_additions får du bara ta med sådant som faktiskt sägs av föreläsaren i transkriptionen och som tillför något utöver själva slide-texten, till exempel förtydliganden, exempel, varningar eller tentabetoningar.
+4. Ta aldrig med praktiska/logistiska detaljer som inte hjälper studenten förstå slideinnehållet.
+5. Håll anteckningarna informativa, inte för korta: summary ska vara en fullständig informativ mening, slide_content ska ha 2-4 substantiella punkter, lecturer_additions ska ha 0-4 punkter när transkriptionen faktiskt tillför värde, och key_takeaways ska ha 2-4 konkreta punkter beroende på hur innehållsrik sliden är.
+6. Varje enskild punkt i slide_content, lecturer_additions och key_takeaways MÅSTE vara en meningsfull, komplett fras eller mening – aldrig en renodlad agendapost eller ett ofullständigt fragment. Om en slide är gles eller bara en agenda, är det OK att ha färre punkter i stället för att fylla med meningslösa rader.
+7. Markera den viktigaste termen i varje punkt i slide_content, lecturer_additions och key_takeaways med markdown-formatet **viktig term** (helst en gång per punkt). Om föreläsaren definierade en term, skriv definitionen direkt efter termen i parentes: **term** (= definition).
+8. Om föreläsaren gav ett konkret exempel eller analogi, inkludera det som en punkt i lecturer_additions med prefixet "Exempel: ...".
+9. Om föreläsaren explicit markerade något som tentarelevant eller extra viktigt, lägg till prefixet "[Tentaviktigt]" på den punkten i lecturer_additions eller key_takeaways.
+10. Om KURSKONTEXT anges i prompten, använd det för att korrekt tolka kursspecifika förkortningar och termer. Expandera ALDRIG en förkortning på ett sätt som strider mot KURSKONTEXT – kursens egna förkortningar har alltid företräde framför din allmänna kunskap.
+11. Kopiera aldrig slide-texten ordagrant eller nästan ordagrant till lecturer_additions. Information som finns på sliden ska stanna i slide_content. Om transkriptionen inte tillför någon extra förklaring ska lecturer_additions vara en tom sträng.
+
+Svara ALLTID med en JSON-array (inga kodblock, bara ren JSON) med exakt ett objekt per angiven slide.
+Varje objekt i arrayen måste ha dessa fält:
+{
+  "slide": 12,
+  "summary": "En komplett och informativ mening som sammanfattar slidens ämne och varför det är relevant i kursens sammanhang (om det framgår av transkriptionen)",
+  "slide_content": "2-4 punktlistor där varje rad börjar med '- ' och är direkt slide-relevanta",
+  "lecturer_additions": "0-4 punktlistor där varje rad börjar med '- ' och bygger på föreläsarens extra förklaringar i transkriptionen. Använd tom sträng om inget utöver sliden tillkommer.",
+  "key_takeaways": ["2-4 takeaways beroende på slidens innehållsrikedom"]
+}"""
+
+STRICT_BATCH_SYSTEM_PROMPT = """Du måste svara med ENDAST en giltig JSON-array.
+Ingen inledande text, inga kodblock, inga extra nycklar utanför objekten.
+Returnera exakt ett objekt per angiven slide och inga extra slides.
+Varje objekt måste innehålla exakt dessa nycklar:
+- slide (integer, samma slide-nummer som i prompten)
+- summary (string, en komplett informativ mening som förklarar ämnet och dess relevans om det framgår)
+- slide_content (string med 2-4 punktlistor där varje rad börjar med '- ' och är slide-relevanta)
+- lecturer_additions (string med 0-4 punktlistor där varje rad börjar med '- ' och kommer från föreläsarens extra förklaringar; tom sträng om inget extra finns)
+- key_takeaways (array med 2-4 strings)
+Innehållet måste vara strikt slide-relevant.
+Ignorera operativt prat/småprat (kamera, mikrofon, ljud, zoom, paus, admin).
+I lecturer_additions får du endast använda innehåll som kommer från transkriptionen och som tillför något utöver slide-texten.
+Undvik ultrakorta svar: summary ska vara informativ, slide_content ska normalt ha 2-4 punkter, lecturer_additions ska ha 0-4 punkter när transkriptionen faktiskt tillför värde, och key_takeaways ska ha 2-4 tydliga punkter beroende på slidens innehållsrikedom.
+Varje enskild punkt i slide_content, lecturer_additions och key_takeaways MÅSTE vara en meningsfull, komplett fras – aldrig en renodlad agendapost eller ett ofullständigt fragment. Om en slide är gles, ha färre punkter i stället för att fylla med meningslösa rader.
+Markera viktigaste term i varje punkt i slide_content, lecturer_additions och key_takeaways med **...** (helst en gång per punkt). Om föreläsaren definierade en term, skriv definitionen direkt efter: **term** (= definition).
+Om föreläsaren gav ett konkret exempel eller analogi, inkludera det i lecturer_additions med prefixet "Exempel: ...".
+Om föreläsaren explicit markerade något som tentarelevant eller extra viktigt, lägg till prefixet "[Tentaviktigt]" på den punkten.
+Om KURSKONTEXT anges i prompten, använd det för att korrekt tolka kursspecifika förkortningar och termer. Expandera ALDRIG en förkortning på ett sätt som strider mot KURSKONTEXT – kursens egna förkortningar har alltid företräde framför din allmänna kunskap.
+Kopiera aldrig slide-text ordagrant eller nästan ordagrant till lecturer_additions. Om transkriptionen inte tillför någon extra förklaring ska lecturer_additions vara en tom sträng."""
 
 KEY_ALIASES = {
     "summary": ("summary", "sammanfattning", "overview", "title"),
@@ -117,6 +174,7 @@ KEY_ALIASES = {
 
 BULLET_PREFIX_RE = re.compile(r"^\s*(?:[-*•]\s+|\d+[.)]\s+)")
 TOKEN_RE = re.compile(r"[a-zA-Z0-9åäöÅÄÖ]{3,}")
+MARKDOWN_BOLD_RE = re.compile(r"\*\*(.*?)\*\*")
 
 # Phrases/keywords that indicate operational chatter rather than content relevant to slide understanding.
 OPERATIONAL_CHATTER_KEYWORDS = (
@@ -208,12 +266,12 @@ RELEVANCE_STOPWORDS = {
 }
 
 MAX_MISC_ACADEMIC_BULLETS = 3
-MAX_LECTURER_ADDITIONS_BULLETS = 6
-MIN_LECTURER_ADDITIONS_BULLETS = 4
+MAX_LECTURER_ADDITIONS_BULLETS = 4
 MIN_SLIDE_CONTENT_BULLETS = 2
 MAX_SLIDE_CONTENT_BULLETS = 4
 MIN_KEY_TAKEAWAYS = 2
 MAX_KEY_TAKEAWAYS = 4
+MIN_BULLET_WORDS = 4
 TARGET_MIN_DEPTH_RATIO = 1.0
 MIN_NOTE_WORD_FLOOR = 60
 MAX_NOTE_WORD_FLOOR = 280
@@ -399,10 +457,44 @@ def _call_enrichment_model(
     return raw, usage
 
 
-def build_user_prompt(slide: dict, transcript_text: str) -> str:
+def _course_context_prefix(course_context: str | None = None) -> str:
+    if not course_context:
+        return ""
     return (
-        f"BILD (Slide {slide['slide']}):\n{slide['text']}\n\n"
+        f"KURSKONTEXT: {course_context}\n"
+        f"VIKTIGT: Kursförkortningar och facktermer i nedanstående slide och transkription ska tolkas enligt ovanstående KURSKONTEXT.\n\n"
+    )
+
+
+def build_user_prompt(slide: dict, transcript_text: str, course_context: str | None = None) -> str:
+    slide_text = _normalize_slide_text(str(slide.get("text", "")))
+    return (
+        f"{_course_context_prefix(course_context)}BILD (Slide {slide['slide']}):\n{slide_text}\n\n"
         f"TRANSKRIPTION AV FÖRELÄSARENS ORD:\n{transcript_text}"
+    )
+
+
+def build_batch_user_prompt(
+    slides_with_transcripts: list[tuple[dict, str]],
+    course_context: str | None = None,
+) -> str:
+    sections: list[str] = []
+    for slide, transcript_text in slides_with_transcripts:
+        slide_num = slide.get("slide", "?")
+        slide_text = _normalize_slide_text(str(slide.get("text", "")))
+        sections.append(
+            (
+                f"SLIDE {slide_num}:\n"
+                f"BILD:\n{slide_text}\n\n"
+                f"TRANSKRIPTION AV FÖRELÄSARENS ORD:\n{transcript_text}"
+            )
+        )
+    joined = "\n\n===\n\n".join(sections)
+    return (
+        f"{_course_context_prefix(course_context)}"
+        "Bearbeta varje slide separat. Ateranvand inte innehall mellan slides.\n"
+        "Returnera en JSON-array i samma ordning som slidesen anges ovan.\n\n"
+        f"{joined}"
     )
 
 
@@ -470,6 +562,85 @@ def _extract_prefixed_bullets(text: str) -> list[str]:
     return items
 
 
+def _should_merge_wrapped_line(previous: str, current: str) -> bool:
+    previous_clean = BULLET_PREFIX_RE.sub("", previous, count=1).rstrip()
+    current_clean = current.strip()
+    if not previous_clean or not current_clean:
+        return False
+
+    first = current_clean[0]
+    if first.islower():
+        return True
+    if first in ",.;:!?)]}%":
+        return True
+    return previous_clean.endswith((",", ";", ":", "-", "–", "—", "/", "("))
+
+
+def _merge_wrapped_lines(lines: list[str]) -> list[str]:
+    merged: list[str] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if merged and not BULLET_PREFIX_RE.match(line) and not BULLET_PREFIX_RE.match(merged[-1]) and _should_merge_wrapped_line(merged[-1], line):
+            merged[-1] = f"{merged[-1]} {line}".strip()
+            continue
+        merged.append(line)
+    return merged
+
+
+def _normalize_slide_text(text: str) -> str:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return ""
+
+    blocks: list[str] = []
+    paragraph_lines: list[str] = []
+    active_bullet: str | None = None
+
+    def flush_paragraph() -> None:
+        nonlocal paragraph_lines
+        if paragraph_lines:
+            blocks.extend(_merge_wrapped_lines(paragraph_lines))
+            paragraph_lines = []
+
+    def flush_bullet() -> None:
+        nonlocal active_bullet
+        if active_bullet:
+            blocks.append(active_bullet)
+            active_bullet = None
+
+    for raw_line in normalized.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            flush_bullet()
+            flush_paragraph()
+            continue
+
+        match = BULLET_PREFIX_RE.match(line)
+        if match:
+            flush_bullet()
+            flush_paragraph()
+            item = line[match.end():].strip()
+            if item:
+                active_bullet = f"- {item}"
+            continue
+
+        if active_bullet is not None:
+            if _should_merge_wrapped_line(active_bullet, line):
+                active_bullet = f"{active_bullet} {line}".strip()
+            else:
+                flush_bullet()
+                paragraph_lines.append(line)
+            continue
+
+        paragraph_lines.append(line)
+
+    flush_bullet()
+    flush_paragraph()
+    return "\n".join(block for block in blocks if block)
+
+
 def _split_text_to_bullets(text: str) -> list[str]:
     normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not normalized:
@@ -479,7 +650,7 @@ def _split_text_to_bullets(text: str) -> list[str]:
     if prefixed_items:
         return prefixed_items
 
-    lines = [line.strip() for line in normalized.split("\n") if line.strip()]
+    lines = _merge_wrapped_lines([line.strip() for line in normalized.split("\n") if line.strip()])
     if len(lines) > 1:
         return lines
 
@@ -538,6 +709,12 @@ def _is_academic_misc_context(text: str) -> bool:
 
 def _word_count(text: str) -> int:
     return len(_collapse_whitespace(text).split())
+
+
+def _normalize_for_duplicate_check(text: str) -> str:
+    without_bold = MARKDOWN_BOLD_RE.sub(r"\1", text or "")
+    without_bullets = BULLET_PREFIX_RE.sub("", without_bold, count=1)
+    return _collapse_whitespace(without_bullets.strip(" \t\r\n-•")).lower()
 
 
 def _slide_text_fragments(slide_text: str) -> list[str]:
@@ -666,7 +843,8 @@ def _format_bullets(items: list[str]) -> str:
 
 def enforce_relevance_policy(payload: dict, slide_text: str) -> dict:
     normalized = normalize_enriched_payload(payload)
-    slide_terms = _tokenize_for_relevance(slide_text)
+    normalized_slide_text = _normalize_slide_text(slide_text)
+    slide_terms = _tokenize_for_relevance(normalized_slide_text)
     summary_raw = _collapse_whitespace(normalized["summary"])
     slide_content_raw = _clean_lines_for_relevance(normalized["slide_content"])
     lecturer_raw = _clean_lines_for_relevance(normalized["lecturer_additions"])
@@ -675,7 +853,15 @@ def enforce_relevance_policy(payload: dict, slide_text: str) -> dict:
         for item in normalized["key_takeaways"]
         if _collapse_whitespace(str(item).strip(" \t\r\n-•"))
     ]
-    slide_fragments = _slide_text_fragments(slide_text)
+    slide_fragments = _slide_text_fragments(normalized_slide_text)
+    slide_duplicate_keys = {
+        key
+        for key in {
+            _normalize_for_duplicate_check(normalized_slide_text),
+            *(_normalize_for_duplicate_check(fragment) for fragment in slide_fragments),
+        }
+        if key
+    }
 
     order_counter = 0
     summary_candidates: list[dict[str, Any]] = []
@@ -742,6 +928,8 @@ def enforce_relevance_policy(payload: dict, slide_text: str) -> dict:
         text = str(candidate["text"])
         if not text or text in slide_seen:
             return
+        if _word_count(text) < MIN_BULLET_WORDS:
+            return
         if candidate["tier"] == "weak":
             return
         if require_slide_related and not bool(candidate["slide_related"]):
@@ -769,7 +957,7 @@ def enforce_relevance_policy(payload: dict, slide_text: str) -> dict:
         if len(slide_content_items) >= MIN_SLIDE_CONTENT_BULLETS:
             break
         cleaned = _collapse_whitespace(fragment.strip(" \t\r\n-•"))
-        if cleaned and cleaned not in slide_seen and not _is_operational_chatter(cleaned):
+        if cleaned and cleaned not in slide_seen and not _is_operational_chatter(cleaned) and _word_count(cleaned) >= MIN_BULLET_WORDS:
             slide_seen.add(cleaned)
             slide_content_items.append(cleaned)
     slide_content_items = _dedupe_keep_order(slide_content_items)[:MAX_SLIDE_CONTENT_BULLETS]
@@ -785,7 +973,11 @@ def enforce_relevance_policy(payload: dict, slide_text: str) -> dict:
         text = str(candidate["text"])
         if not text or text in lecturer_seen:
             return
+        if _word_count(text) < MIN_BULLET_WORDS:
+            return
         if candidate["tier"] == "weak":
+            return
+        if _normalize_for_duplicate_check(text) in slide_duplicate_keys:
             return
         if candidate["slide_related"]:
             lecturer_seen.add(text)
@@ -802,12 +994,6 @@ def enforce_relevance_policy(payload: dict, slide_text: str) -> dict:
     for candidate in lecturer_candidates:
         if candidate["tier"] == "moderate":
             _append_lecturer_candidate(candidate, allow_misc=True)
-
-    for candidate in slide_candidates + takeaway_candidates + slide_fragment_candidates:
-        if len(lecturer_items_out) >= MIN_LECTURER_ADDITIONS_BULLETS:
-            break
-        if candidate["tier"] in {"strong", "moderate"} and candidate["slide_related"]:
-            _append_lecturer_candidate(candidate, allow_misc=False)
     lecturer_items_out = _dedupe_keep_order(lecturer_items_out)[:MAX_LECTURER_ADDITIONS_BULLETS]
 
     takeaways: list[str] = []
@@ -818,6 +1004,8 @@ def enforce_relevance_policy(payload: dict, slide_text: str) -> dict:
             return
         text = str(candidate["text"])
         if not text or text in takeaway_seen:
+            return
+        if _word_count(text) < MIN_BULLET_WORDS:
             return
         if candidate["tier"] == "weak":
             return
@@ -846,7 +1034,7 @@ def enforce_relevance_policy(payload: dict, slide_text: str) -> dict:
         if len(takeaways) >= MIN_KEY_TAKEAWAYS:
             break
         cleaned = _collapse_whitespace(fragment.strip(" \t\r\n-•"))
-        if cleaned and cleaned not in takeaway_seen and not _is_operational_chatter(cleaned):
+        if cleaned and cleaned not in takeaway_seen and not _is_operational_chatter(cleaned) and _word_count(cleaned) >= MIN_BULLET_WORDS:
             takeaway_seen.add(cleaned)
             takeaways.append(cleaned)
     takeaways = _dedupe_keep_order(takeaways)[:MAX_KEY_TAKEAWAYS]
@@ -875,7 +1063,7 @@ def enforce_relevance_policy(payload: dict, slide_text: str) -> dict:
             text = str(candidate["text"])
             if text in lecturer_seen or text in takeaway_seen:
                 continue
-            if len(lecturer_items_out) < MAX_LECTURER_ADDITIONS_BULLETS:
+            if len(lecturer_items_out) < MAX_LECTURER_ADDITIONS_BULLETS and candidate["source"] == "lecturer_additions":
                 pre_count = len(lecturer_items_out)
                 _append_lecturer_candidate(candidate, allow_misc=True)
                 if len(lecturer_items_out) > pre_count:
@@ -896,14 +1084,14 @@ def enforce_relevance_policy(payload: dict, slide_text: str) -> dict:
             summary = _to_summary_sentence(slide_fragments[0])
 
     while len(slide_content_items) < MIN_SLIDE_CONTENT_BULLETS and len(slide_content_items) < MAX_SLIDE_CONTENT_BULLETS:
-        candidate = next((t for t in lecturer_items_out + takeaways + slide_fragments if t not in slide_seen), "")
+        candidate = next((t for t in lecturer_items_out + takeaways + slide_fragments if t not in slide_seen and _word_count(t) >= MIN_BULLET_WORDS), "")
         if not candidate:
             break
         slide_seen.add(candidate)
         slide_content_items.append(candidate)
 
     while len(takeaways) < MIN_KEY_TAKEAWAYS and len(takeaways) < MAX_KEY_TAKEAWAYS:
-        candidate = next((t for t in slide_content_items + lecturer_items_out + slide_fragments if t not in takeaway_seen), "")
+        candidate = next((t for t in slide_content_items + lecturer_items_out + slide_fragments if t not in takeaway_seen and _word_count(t) >= MIN_BULLET_WORDS), "")
         if not candidate:
             break
         takeaway_seen.add(candidate)
@@ -928,8 +1116,8 @@ def _pick_first(payload: dict, keys: tuple[str, ...]) -> Any:
     return None
 
 
-def _extract_first_json_object(text: str) -> str | None:
-    start = text.find("{")
+def _extract_first_json_block(text: str, opener: str, closer: str) -> str | None:
+    start = text.find(opener)
     while start != -1:
         in_string = False
         escaped = False
@@ -949,14 +1137,22 @@ def _extract_first_json_object(text: str) -> str | None:
                 in_string = True
                 continue
 
-            if ch == "{":
+            if ch == opener:
                 depth += 1
-            elif ch == "}":
+            elif ch == closer:
                 depth -= 1
                 if depth == 0:
                     return text[start:idx + 1]
-        start = text.find("{", start + 1)
+        start = text.find(opener, start + 1)
     return None
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    return _extract_first_json_block(text, "{", "}")
+
+
+def _extract_first_json_array(text: str) -> str | None:
+    return _extract_first_json_block(text, "[", "]")
 
 
 def _json_to_dict(candidate: str) -> dict | None:
@@ -971,13 +1167,41 @@ def _json_to_dict(candidate: str) -> dict | None:
     return None
 
 
+def _json_to_list_of_dicts(candidate: str) -> list[dict] | None:
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, list) and all(isinstance(item, dict) for item in parsed):
+        return parsed
+    if isinstance(parsed, dict):
+        for key in ("slides", "results", "items", "enriched_slides"):
+            value = parsed.get(key)
+            if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+                return value
+        return [parsed]
+    return None
+
+
+def _strip_reasoning_blocks(raw_text: str) -> str:
+    return re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
+
+
+def _iter_fenced_json_candidates(candidate: str) -> list[str]:
+    return re.findall(
+        r"```(?:json)?\s*(.*?)\s*```",
+        candidate,
+        re.DOTALL | re.IGNORECASE,
+    )
+
+
 def parse_enrichment_response(raw_text: str) -> dict | None:
     candidate = raw_text.strip()
     if not candidate:
         return None
 
     # Strip <think>...</think> reasoning blocks (e.g. Qwen3 thinking mode)
-    candidate = re.sub(r"<think>.*?</think>", "", candidate, flags=re.DOTALL).strip()
+    candidate = _strip_reasoning_blocks(candidate)
     if not candidate:
         return None
 
@@ -985,19 +1209,44 @@ def parse_enrichment_response(raw_text: str) -> dict | None:
     if parsed is not None:
         return parsed
 
-    fenced = re.search(
-        r"```(?:json)?\s*(\{.*?\})\s*```",
-        candidate,
-        re.DOTALL | re.IGNORECASE,
-    )
-    if fenced:
-        parsed = _json_to_dict(fenced.group(1))
+    for fenced in _iter_fenced_json_candidates(candidate):
+        parsed = _json_to_dict(fenced)
         if parsed is not None:
             return parsed
 
     extracted = _extract_first_json_object(candidate)
     if extracted:
         return _json_to_dict(extracted)
+    return None
+
+
+def parse_enrichment_batch_response(raw_text: str) -> list[dict] | None:
+    candidate = raw_text.strip()
+    if not candidate:
+        return None
+
+    candidate = _strip_reasoning_blocks(candidate)
+    if not candidate:
+        return None
+
+    parsed = _json_to_list_of_dicts(candidate)
+    if parsed is not None:
+        return parsed
+
+    for fenced in _iter_fenced_json_candidates(candidate):
+        parsed = _json_to_list_of_dicts(fenced)
+        if parsed is not None:
+            return parsed
+
+    extracted_array = _extract_first_json_array(candidate)
+    if extracted_array:
+        parsed = _json_to_list_of_dicts(extracted_array)
+        if parsed is not None:
+            return parsed
+
+    extracted_object = _extract_first_json_object(candidate)
+    if extracted_object:
+        return _json_to_list_of_dicts(extracted_object)
     return None
 
 
@@ -1035,7 +1284,7 @@ def _sentence_chunks(text: str, limit: int) -> list[str]:
 
 
 def build_fallback_enrichment(slide: dict, transcript_text: str) -> dict:
-    slide_text = _collapse_whitespace(str(slide.get("text", "")))
+    slide_text = _normalize_slide_text(str(slide.get("text", "")))
     transcript_compact = _collapse_whitespace(transcript_text)
     slide_number = slide.get("slide", "?")
 
@@ -1043,13 +1292,11 @@ def build_fallback_enrichment(slide: dict, transcript_text: str) -> dict:
     summary = summary_candidates[0] if summary_candidates else f"Slide {slide_number} sammanfattar forelasningens innehall."
 
     slide_content = slide_text or "Slideinnehall kunde inte extraheras automatiskt."
-    lecturer_additions = _format_lecturer_additions(
-        transcript_compact or "Transkript saknas for denna slide."
-    )
+    lecturer_additions = _format_lecturer_additions(transcript_compact) if transcript_compact else ""
 
     takeaways = _sentence_chunks(transcript_compact, 3)
     if not takeaways:
-        takeaways = [line.strip(" -•\t") for line in str(slide.get("text", "")).splitlines() if line.strip()][:3]
+        takeaways = _clean_lines_for_relevance(slide_text)[:3]
     if not takeaways:
         takeaways = [f"Se slide {slide_number} och transkriptet for fullstandig kontext."]
 
@@ -1074,8 +1321,9 @@ def enrich_slide(
     max_output_tokens: int,
     system_prompt: str = SYSTEM_PROMPT,
     token_callback: Callable[[str], None] | None = None,
+    course_context: str | None = None,
 ) -> tuple[dict, dict[str, int]]:
-    user_prompt = build_user_prompt(slide, transcript_text)
+    user_prompt = build_user_prompt(slide, transcript_text, course_context=course_context)
     raw, usage = _call_enrichment_model(
         client,
         provider=provider,
@@ -1104,6 +1352,109 @@ def enrich_slide(
     return filtered, usage
 
 
+def _coerce_slide_number(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _batch_slide_label(slides_with_transcripts: list[tuple[dict, str]]) -> str:
+    slide_numbers = [
+        slide_num
+        for slide_num in (_coerce_slide_number(slide.get("slide")) for slide, _ in slides_with_transcripts)
+        if slide_num is not None
+    ]
+    if not slide_numbers:
+        return "?"
+    if len(slide_numbers) == 1:
+        return str(slide_numbers[0])
+    return f"{slide_numbers[0]}-{slide_numbers[-1]}"
+
+
+def _empty_failure_reason_counts() -> dict[str, int]:
+    return {
+        "truncated_json": 0,
+        "empty_payload": 0,
+        "connection_error": 0,
+        "other_error": 0,
+    }
+
+
+def _record_fallback_reason(counts: dict[str, int], reason: Any) -> None:
+    key = str(reason or "other_error")
+    if key not in counts:
+        key = "other_error"
+    counts[key] += 1
+
+
+def enrich_slides_batch(
+    client: Any,
+    slides_with_transcripts: list[tuple[dict, str]],
+    *,
+    provider: str,
+    model: str,
+    max_output_tokens: int,
+    system_prompt: str = BATCH_SYSTEM_PROMPT,
+    token_callback: Callable[[str], None] | None = None,
+    course_context: str | None = None,
+) -> tuple[dict[int, dict], list[tuple[dict, str]], dict[str, int]]:
+    user_prompt = build_batch_user_prompt(slides_with_transcripts, course_context=course_context)
+    raw, usage = _call_enrichment_model(
+        client,
+        provider=provider,
+        model=model,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        max_output_tokens=max_output_tokens,
+        token_callback=token_callback,
+    )
+    parsed_items = parse_enrichment_batch_response(raw)
+    if parsed_items is None:
+        raise EnrichmentResponseError(
+            f"No JSON array found in batch enrichment response: {raw[:240]}",
+            usage=usage,
+            reason="no_json",
+        )
+
+    parsed_by_slide: dict[int, dict] = {}
+    for item in parsed_items:
+        slide_num = _coerce_slide_number(
+            _pick_first(item, ("slide", "slide_number", "slideNumber"))
+        )
+        if slide_num is None or slide_num in parsed_by_slide:
+            continue
+        parsed_by_slide[slide_num] = item
+
+    resolved: dict[int, dict] = {}
+    unresolved: list[tuple[dict, str]] = []
+    for slide, transcript_text in slides_with_transcripts:
+        slide_num = _coerce_slide_number(slide.get("slide"))
+        if slide_num is None:
+            unresolved.append((slide, transcript_text))
+            continue
+        payload = parsed_by_slide.get(slide_num)
+        if payload is None:
+            unresolved.append((slide, transcript_text))
+            continue
+        normalized = normalize_enriched_payload(payload)
+        filtered = enforce_relevance_policy(normalized, str(slide.get("text", "")))
+        if is_enriched_payload_invalid(filtered):
+            unresolved.append((slide, transcript_text))
+            continue
+        resolved[slide_num] = filtered
+
+    if not resolved:
+        raise EnrichmentResponseError(
+            "Batch enrichment response parsed but all canonical fields were empty",
+            usage=usage,
+            reason="empty_payload",
+        )
+    return resolved, unresolved, usage
+
+
 _HEARTBEAT_INTERVAL = 10  # seconds between progress pings during a long sleep
 
 
@@ -1123,6 +1474,269 @@ def _sleep_with_heartbeat(
             log_callback(f"⏳ Slide {slide_num}: rate-limited, ~{remaining}s remaining...")
 
 
+def enrich_slides_batch_with_retry(
+    client: Any,
+    slides_with_transcripts: list[tuple[dict, str]],
+    *,
+    provider: str,
+    model: str,
+    max_output_tokens: int = DEFAULT_ENRICH_MAX_OUTPUT_TOKENS,
+    max_transcript_words: int = DEFAULT_ENRICH_MAX_TRANSCRIPT_WORDS,
+    max_attempts: int = DEFAULT_ENRICH_MAX_ATTEMPTS,
+    log_usage: bool = DEFAULT_ENRICH_LOG_USAGE,
+    log_callback: Callable[[str], None] | None = None,
+    token_callback: Callable[[str], None] | None = None,
+    course_context: str | None = None,
+) -> tuple[list[dict], dict[str, Any]]:
+    if not slides_with_transcripts:
+        empty_metrics = {
+            "provider": provider,
+            "model": model,
+            "attempts": 0,
+            "retries": 0,
+            "fallbacks": 0,
+            "duration_ms": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "raw_transcript_words": 0,
+            "prompt_transcript_words": 0,
+            "failure_reason_counts": _empty_failure_reason_counts(),
+            "batch_size": 0,
+        }
+        return [], empty_metrics
+
+    if len(slides_with_transcripts) == 1:
+        slide, transcript_text = slides_with_transcripts[0]
+        enriched, metrics = enrich_slide_with_retry(
+            client,
+            slide,
+            transcript_text,
+            provider=provider,
+            model=model,
+            max_output_tokens=max_output_tokens,
+            max_transcript_words=max_transcript_words,
+            max_attempts=max_attempts,
+            log_usage=log_usage,
+            log_callback=log_callback,
+            token_callback=token_callback,
+            course_context=course_context,
+        )
+        failure_reason_counts = _empty_failure_reason_counts()
+        if metrics.get("fallback_used"):
+            _record_fallback_reason(failure_reason_counts, metrics.get("failure_reason"))
+        slide_num = _coerce_slide_number(slide.get("slide")) or 0
+        adapted_metrics = {
+            "provider": provider,
+            "model": model,
+            "attempts": int(metrics.get("attempts", 0)),
+            "retries": int(metrics.get("retries", 0)),
+            "fallbacks": 1 if metrics.get("fallback_used") else 0,
+            "duration_ms": int(metrics.get("duration_ms", 0)),
+            "input_tokens": int(metrics.get("input_tokens", 0)),
+            "output_tokens": int(metrics.get("output_tokens", 0)),
+            "total_tokens": int(metrics.get("total_tokens", 0)),
+            "raw_transcript_words": int(metrics.get("raw_transcript_words", 0)),
+            "prompt_transcript_words": int(metrics.get("prompt_transcript_words", 0)),
+            "failure_reason_counts": failure_reason_counts,
+            "batch_size": 1,
+        }
+        return [{"slide": slide_num, **enriched}], adapted_metrics
+
+    usage_total = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    raw_word_count = sum(len(transcript_text.split()) for _, transcript_text in slides_with_transcripts)
+    prompt_batch = [
+        (slide, truncate_transcript_for_prompt(transcript_text, max_transcript_words))
+        for slide, transcript_text in slides_with_transcripts
+    ]
+    prompt_word_count = sum(len(prompt_text.split()) for _, prompt_text in prompt_batch)
+    started = time.perf_counter()
+    attempts = 0
+    batch_retries = 0
+    truncation_retry_used = False
+    next_attempt_tokens: int | None = None
+    batch_label = _batch_slide_label(slides_with_transcripts)
+    batch_resolved: dict[int, dict] = {}
+    unresolved = list(slides_with_transcripts)
+    last_error: Exception | None = None
+
+    batch_count = len(prompt_batch)
+
+    for attempt in range(max_attempts):
+        attempts = attempt + 1
+        current_max_output_tokens = next_attempt_tokens or max_output_tokens
+        next_attempt_tokens = None
+        batch_max_output_tokens = current_max_output_tokens * batch_count
+        try:
+            batch_resolved, unresolved, usage = enrich_slides_batch(
+                client,
+                prompt_batch,
+                provider=provider,
+                model=model,
+                max_output_tokens=batch_max_output_tokens,
+                system_prompt=STRICT_BATCH_SYSTEM_PROMPT,
+                token_callback=token_callback,
+                course_context=course_context,
+            )
+            _add_usage(usage_total, usage)
+            break
+        except EnrichmentResponseError as exc:
+            last_error = exc
+            _add_usage(usage_total, exc.usage)
+            attempt_output_tokens = _safe_int(exc.usage.get("output_tokens", 0))
+            is_truncated_json = (
+                exc.reason == "no_json"
+                and attempt_output_tokens >= batch_max_output_tokens
+            )
+            if is_truncated_json:
+                if not truncation_retry_used and attempt < max_attempts - 1:
+                    truncation_retry_used = True
+                    expanded_per_slide = min(max_output_tokens * 2, 1200)
+                    if expanded_per_slide > current_max_output_tokens:
+                        next_attempt_tokens = expanded_per_slide
+                        batch_retries += 1
+                        msg = (
+                            f"⚠️ Truncated JSON detected on slides {batch_label} "
+                            f"(attempt {attempt + 1}/{max_attempts}), retrying with max_output_tokens={expanded_per_slide * batch_count}..."
+                        )
+                        print(f"  {msg}", flush=True)
+                        if log_callback:
+                            log_callback(msg)
+                        continue
+            if attempt < max_attempts - 1:
+                batch_retries += 1
+                wait = min(8, attempt + 1)
+                msg = (
+                    f"⚠️ Batch enrichment error on slides {batch_label} [{exc.reason}] "
+                    f"(attempt {attempt + 1}/{max_attempts}), retrying in {wait}s..."
+                )
+                print(f"  {msg}", flush=True)
+                if log_callback:
+                    log_callback(msg)
+                time.sleep(wait)
+            else:
+                break
+        except Exception as exc:
+            last_error = exc
+            if _is_rate_limit_error(exc):
+                if attempt < max_attempts - 1:
+                    batch_retries += 1
+                wait = min(30 * (attempt + 1), 120)
+                msg = f"⏳ Rate limited on slides {batch_label}, waiting {wait}s..."
+                print(f"  {msg}", flush=True)
+                if log_callback:
+                    log_callback(msg)
+                _sleep_with_heartbeat(wait, slide_num=batch_label, log_callback=log_callback)
+            else:
+                if attempt < max_attempts - 1:
+                    batch_retries += 1
+                    wait = min(8, attempt + 1)
+                    msg = (
+                        f"⚠️ Batch enrichment exception on slides {batch_label} "
+                        f"[{type(exc).__name__}: {exc}] (attempt {attempt + 1}/{max_attempts}), retrying in {wait}s..."
+                    )
+                    print(f"  {msg}", flush=True)
+                    if log_callback:
+                        log_callback(msg)
+                    time.sleep(wait)
+                else:
+                    break
+
+    slide_results: dict[int, dict] = dict(batch_resolved)
+    failure_reason_counts = _empty_failure_reason_counts()
+    fallback_count = 0
+
+    unresolved_slide_numbers = [
+        slide_num
+        for slide_num in (
+            _coerce_slide_number(slide.get("slide"))
+            for slide, _ in unresolved
+        )
+        if slide_num is not None
+    ]
+
+    if unresolved:
+        if batch_resolved:
+            missing = ", ".join(str(slide_num) for slide_num in unresolved_slide_numbers) or "?"
+            msg = f"⚠️ Batch response incomplete for slides {missing}; retrying those slides individually..."
+        else:
+            msg = (
+                f"⚠️ Falling back to individual enrichment for slides {batch_label} "
+                f"after repeated batch errors"
+            )
+            if last_error is not None:
+                msg = f"{msg}: {last_error}"
+        print(f"  {msg}", flush=True)
+        if log_callback:
+            log_callback(msg)
+
+    for slide, transcript_text in unresolved:
+        enriched, metrics = enrich_slide_with_retry(
+            client,
+            slide,
+            transcript_text,
+            provider=provider,
+            model=model,
+            max_output_tokens=max_output_tokens,
+            max_transcript_words=max_transcript_words,
+            max_attempts=max_attempts,
+            log_usage=log_usage,
+            log_callback=log_callback,
+            token_callback=token_callback,
+            course_context=course_context,
+        )
+        slide_num = _coerce_slide_number(slide.get("slide"))
+        if slide_num is not None:
+            slide_results[slide_num] = enriched
+        usage_total["input_tokens"] += int(metrics.get("input_tokens", 0))
+        usage_total["output_tokens"] += int(metrics.get("output_tokens", 0))
+        usage_total["total_tokens"] += int(metrics.get("total_tokens", 0))
+        batch_retries += int(metrics.get("retries", 0))
+        if metrics.get("fallback_used"):
+            fallback_count += 1
+            _record_fallback_reason(failure_reason_counts, metrics.get("failure_reason"))
+
+    ordered_results: list[dict] = []
+    for slide, transcript_text in slides_with_transcripts:
+        slide_num = _coerce_slide_number(slide.get("slide"))
+        if slide_num is None:
+            continue
+        enriched = slide_results.get(slide_num)
+        if enriched is None:
+            enriched = build_fallback_enrichment(slide, transcript_text)
+            fallback_count += 1
+            _record_fallback_reason(failure_reason_counts, "other_error")
+        ordered_results.append({"slide": slide_num, **enriched})
+
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    metrics = {
+        "provider": provider,
+        "model": model,
+        "attempts": attempts,
+        "retries": batch_retries,
+        "fallbacks": fallback_count,
+        "duration_ms": duration_ms,
+        "input_tokens": usage_total["input_tokens"],
+        "output_tokens": usage_total["output_tokens"],
+        "total_tokens": usage_total["total_tokens"],
+        "raw_transcript_words": raw_word_count,
+        "prompt_transcript_words": prompt_word_count,
+        "failure_reason_counts": failure_reason_counts,
+        "batch_size": len(slides_with_transcripts),
+    }
+    if log_usage:
+        msg = (
+            f"📊 Slides {batch_label} usage: provider={provider} model={model} attempts={metrics['attempts']} "
+            f"retries={metrics['retries']} input_tokens={metrics['input_tokens']} "
+            f"output_tokens={metrics['output_tokens']} total_tokens={metrics['total_tokens']} "
+            f"duration_ms={metrics['duration_ms']} fallback_slides={metrics['fallbacks']}"
+        )
+        print(f"  {msg}", flush=True)
+        if log_callback:
+            log_callback(msg)
+    return ordered_results, metrics
+
+
 def enrich_slide_with_retry(
     client: Any,
     slide: dict,
@@ -1136,6 +1750,7 @@ def enrich_slide_with_retry(
     log_usage: bool = DEFAULT_ENRICH_LOG_USAGE,
     log_callback: Callable[[str], None] | None = None,
     token_callback: Callable[[str], None] | None = None,
+    course_context: str | None = None,
 ) -> tuple[dict, dict[str, Any]]:
     last_error: Exception | None = None
     attempts = 0
@@ -1164,6 +1779,7 @@ def enrich_slide_with_retry(
                 max_output_tokens=current_max_output_tokens,
                 system_prompt=system_prompt,
                 token_callback=token_callback,
+                course_context=course_context,
             )
             _add_usage(usage_total, usage)
 
@@ -1337,16 +1953,22 @@ def enrich(
         else (DEFAULT_ENRICH_MODEL_OVERRIDE or default_enrichment_model(resolved_provider))
     )
     enrich_client = create_enrichment_client(resolved_provider)
+    batch_size = DEFAULT_ENRICH_BATCH_SIZE
 
-    def process(a: dict) -> None:
-        slide = slides_by_num[a["slide"]]
-        transcript_segs = segments[a["start_segment"]: a["end_segment"] + 1]
-        transcript_text = " ".join(s["text"].strip() for s in transcript_segs)
+    def _chunked(items: list[dict], size: int) -> list[list[dict]]:
+        return [items[idx:idx + size] for idx in range(0, len(items), size)]
 
-        enriched, _metrics = enrich_slide_with_retry(
+    def process(batch: list[dict]) -> None:
+        batch_inputs: list[tuple[dict, str]] = []
+        for a in batch:
+            slide = slides_by_num[a["slide"]]
+            transcript_segs = segments[a["start_segment"]: a["end_segment"] + 1]
+            transcript_text = " ".join(s["text"].strip() for s in transcript_segs)
+            batch_inputs.append((slide, transcript_text))
+
+        enriched_batch, _metrics = enrich_slides_batch_with_retry(
             enrich_client,
-            slide,
-            transcript_text,
+            batch_inputs,
             provider=resolved_provider,
             model=resolved_model,
             max_output_tokens=max_output_tokens,
@@ -1354,22 +1976,43 @@ def enrich(
             max_attempts=max_attempts,
             log_usage=log_usage,
         )
-        entry = {
-            "slide": a["slide"],
-            "original_text": slide["text"],
-            "start_segment": a["start_segment"],
-            "end_segment": a["end_segment"],
-            **enriched,
+        enriched_by_slide = {entry["slide"]: entry for entry in enriched_batch}
+        transcript_by_slide = {
+            int(slide["slide"]): transcript_text
+            for slide, transcript_text in batch_inputs
         }
+        batch_entries: list[dict] = []
+        for a in batch:
+            slide = slides_by_num[a["slide"]]
+            enriched = enriched_by_slide.get(a["slide"]) or {
+                "slide": a["slide"],
+                **build_fallback_enrichment(slide, transcript_by_slide.get(a["slide"], "")),
+            }
+            batch_entries.append({
+                "slide": a["slide"],
+                "original_text": slide["text"],
+                "start_segment": a["start_segment"],
+                "end_segment": a["end_segment"],
+                "summary": enriched.get("summary", ""),
+                "slide_content": enriched.get("slide_content", ""),
+                "lecturer_additions": enriched.get("lecturer_additions", ""),
+                "key_takeaways": enriched.get("key_takeaways", []),
+            })
 
         with results_lock:
-            results.append(entry)
-            done_count = len(results)
+            results.extend(batch_entries)
+            total_done = len(results)
 
-        print(f"  Slide {a['slide']}/{total} done ({done_count}/{total} total)", flush=True)
+        start_done = total_done - len(batch_entries)
+        for offset, a in enumerate(batch, start=1):
+            print(
+                f"  Slide {a['slide']}/{total} done ({start_done + offset}/{total} total)",
+                flush=True,
+            )
 
+    batches = _chunked(pending, batch_size)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [pool.submit(process, a) for a in pending]
+        futures = [pool.submit(process, batch) for batch in batches]
         for future in as_completed(futures):
             future.result()  # re-raise any exceptions
 

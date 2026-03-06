@@ -1,25 +1,13 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { Document, Page } from "react-pdf";
-import {
-  buildAssetUrl,
-  getProfileCourseOptions,
-  updateProfileProgram,
-} from "../api";
-import ProgramPicker from "./ProgramPicker";
-import type {
-  TeachersNoteSummary,
-  ProfileCourseOptions,
-  StudentProfile,
-} from "../types";
+import { buildAssetUrl } from "../api";
+import type { TeachersNoteSummary } from "../types";
 import { ensurePdfWorker } from "../pdfWorker";
 
 interface HomepageProps {
   savedLectures: TeachersNoteSummary[];
   allLectures: TeachersNoteSummary[];
   loading: boolean;
-  profile: StudentProfile | null;
-  profileLoading: boolean;
-  onProfileChange: (profile: StudentProfile) => void;
   onOpenLecture: (id: number) => void;
 }
 
@@ -35,13 +23,21 @@ interface HomepageLectureItem {
   lecture: TeachersNoteSummary;
   courseId: string;
   courseDisplay: string;
-  courseCodeNormalized: string;
   lectureLabel: string;
   displayName: string;
   kind: string;
   number: string;
   createdAtMs: number;
 }
+
+type HomepageSectionKey = "saved" | "all";
+
+interface HomepageSectionState {
+  saved: boolean;
+  all: boolean;
+}
+
+const HOMEPAGE_SECTION_STORAGE_KEY = "teachers-note.homepage-sections";
 
 function stripExtension(value: string): string {
   return value.replace(/\.[^./\\]+$/, "");
@@ -70,7 +66,10 @@ function splitLectureName(name: string): LectureNameParts {
       if (/^[a-z]/i.test(potentialKind) && !/^\d+$/.test(potentialKind)) {
         kind = potentialKind;
         displayName = parts.slice(0, parts.length - 2).join(" ");
-        if (!displayName) { displayName = potentialKind; kind = ""; }
+        if (!displayName) {
+          displayName = potentialKind;
+          kind = "";
+        }
       } else {
         displayName = parts.slice(0, parts.length - 1).join(" ");
       }
@@ -82,10 +81,6 @@ function splitLectureName(name: string): LectureNameParts {
 
 function normalizeQuery(value: string): string {
   return value.trim().toLowerCase();
-}
-
-function normalizeCourseCode(value: string | null | undefined): string {
-  return (value ?? "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
 function lectureMatchesQuery(item: HomepageLectureItem, normalizedQuery: string): boolean {
@@ -102,55 +97,36 @@ function sortLectureItems(lectures: HomepageLectureItem[]): HomepageLectureItem[
   });
 }
 
+function readStoredHomepageSectionState(): HomepageSectionState {
+  const fallback: HomepageSectionState = { saved: true, all: true };
+  if (typeof window === "undefined") return fallback;
+
+  try {
+    const raw = window.localStorage.getItem(HOMEPAGE_SECTION_STORAGE_KEY);
+    if (!raw) return fallback;
+
+    const parsed = JSON.parse(raw) as Partial<Record<string, unknown>> | null;
+    if (!parsed || typeof parsed !== "object") return fallback;
+
+    return {
+      saved: typeof parsed.saved === "boolean" ? parsed.saved : fallback.saved,
+      all: typeof parsed.all === "boolean" ? parsed.all : fallback.all,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
 ensurePdfWorker();
 
 export default function Homepage({
   savedLectures,
   allLectures,
   loading,
-  profile,
-  profileLoading,
-  onProfileChange,
   onOpenLecture,
 }: HomepageProps) {
   const [searchQuery, setSearchQuery] = useState("");
-
-  const [profileOptions, setProfileOptions] = useState<ProfileCourseOptions | null>(null);
-  const [profileOptionsLoading, setProfileOptionsLoading] = useState(true);
-  const [profileOptionsError, setProfileOptionsError] = useState<string | null>(null);
-  const [programSavePending, setProgramSavePending] = useState(false);
-  const [profileSaveBanner, setProfileSaveBanner] = useState<{
-    kind: "success" | "error";
-    text: string;
-  } | null>(null);
-  const [isProgramMenuOpen, setIsProgramMenuOpen] = useState(false);
-  const [draftProgramId, setDraftProgramId] = useState<number | null>(null);
-
-  useEffect(() => {
-    setDraftProgramId(profile?.program?.id ?? null);
-  }, [profile]);
-
-  async function loadProfileOptions() {
-    setProfileOptionsLoading(true);
-    setProfileOptionsError(null);
-    try {
-      const options = await getProfileCourseOptions();
-      setProfileOptions(options);
-    } catch (err) {
-      setProfileOptionsError(err instanceof Error ? err.message : "Failed to load profile options.");
-    } finally {
-      setProfileOptionsLoading(false);
-    }
-  }
-
-  useEffect(() => { void loadProfileOptions(); }, []);
-
-  useEffect(() => {
-    if (!profile?.program) setIsProgramMenuOpen(false);
-  }, [profile?.program]);
-
-  const currentProgram = profile?.program ?? null;
-  const programCourses = useMemo(() => profileOptions?.program_courses ?? [], [profileOptions?.program_courses]);
+  const [sectionState, setSectionState] = useState<HomepageSectionState>(() => readStoredHomepageSectionState());
 
   const toLectureItem = (lecture: TeachersNoteSummary): HomepageLectureItem => {
     const parsed = splitLectureName(lecture.name);
@@ -160,7 +136,6 @@ export default function Homepage({
       lecture,
       courseId: derivedCourseId,
       courseDisplay: derivedCourseDisplay,
-      courseCodeNormalized: normalizeCourseCode(derivedCourseId || parsed.courseId),
       lectureLabel: parsed.lectureLabel,
       displayName: parsed.displayName,
       kind: parsed.kind,
@@ -170,25 +145,14 @@ export default function Homepage({
   };
 
   const mySavedActiveLectures = useMemo(
-    () => savedLectures.filter((l) => !l.is_archived).map(toLectureItem),
+    () => sortLectureItems(savedLectures.filter((lecture) => !lecture.is_archived).map(toLectureItem)),
     [savedLectures],
   );
 
   const acceptedAllLectures = useMemo(
-    () => allLectures.filter((l) => !l.is_archived).map(toLectureItem),
+    () => sortLectureItems(allLectures.filter((lecture) => !lecture.is_archived).map(toLectureItem)),
     [allLectures],
   );
-
-  const programCourseCodeSet = useMemo(() => new Set(
-    programCourses.map((c) => normalizeCourseCode(c.code)).filter((code) => code.length > 0),
-  ), [programCourses]);
-
-  const totalMyProgramLectures = useMemo(() => {
-    if (!currentProgram || programCourseCodeSet.size === 0) return [];
-    return sortLectureItems(
-      acceptedAllLectures.filter((l) => programCourseCodeSet.has(l.courseCodeNormalized)),
-    );
-  }, [acceptedAllLectures, currentProgram, programCourseCodeSet]);
 
   const normalizedQuery = normalizeQuery(searchQuery);
 
@@ -197,36 +161,22 @@ export default function Homepage({
     return mySavedActiveLectures.filter((item) => lectureMatchesQuery(item, normalizedQuery));
   }, [mySavedActiveLectures, normalizedQuery]);
 
-  const filteredMyProgramLectures = useMemo(() => {
-    if (!normalizedQuery) return totalMyProgramLectures;
-    return totalMyProgramLectures.filter((item) => lectureMatchesQuery(item, normalizedQuery));
-  }, [totalMyProgramLectures, normalizedQuery]);
-
   const filteredAllLectures = useMemo(() => {
     if (!normalizedQuery) return acceptedAllLectures;
     return acceptedAllLectures.filter((item) => lectureMatchesQuery(item, normalizedQuery));
   }, [acceptedAllLectures, normalizedQuery]);
 
-  async function handleSaveProgram() {
-    setProgramSavePending(true);
-    setProfileSaveBanner(null);
-    try {
-      const updatedProfile = await updateProfileProgram(draftProgramId);
-      onProfileChange(updatedProfile);
-      await loadProfileOptions();
-      setProfileSaveBanner({ kind: "success", text: "Program saved." });
-      setIsProgramMenuOpen(false);
-    } catch (err) {
-      setProfileSaveBanner({
-        kind: "error",
-        text: err instanceof Error ? err.message : "Failed to save program.",
-      });
-    } finally {
-      setProgramSavePending(false);
-    }
+  function toggleSection(section: HomepageSectionKey) {
+    setSectionState((prev) => {
+      const next = { ...prev, [section]: !prev[section] };
+      try {
+        window.localStorage.setItem(HOMEPAGE_SECTION_STORAGE_KEY, JSON.stringify(next));
+      } catch {
+        // Ignore storage errors so the homepage still works in restricted environments.
+      }
+      return next;
+    });
   }
-
-  const programOptions = profileOptions?.programs ?? [];
 
   function renderLectureCard(item: HomepageLectureItem) {
     const { lecture, courseDisplay, displayName, kind, number } = item;
@@ -264,10 +214,47 @@ export default function Homepage({
     );
   }
 
+  function renderSection(
+    section: HomepageSectionKey,
+    title: string,
+    count: number,
+    surfaceClassName: string,
+    children: ReactNode,
+  ) {
+    const isExpanded = sectionState[section];
+    const contentId = `homepage-v2-section-${section}`;
+
+    return (
+      <section className={`homepage-v2-section ${surfaceClassName}`}>
+        <div className="homepage-v2-section-header">
+          <button
+            type="button"
+            className="homepage-v2-section-toggle"
+            onClick={() => toggleSection(section)}
+            aria-expanded={isExpanded}
+            aria-controls={contentId}
+          >
+            <span className="homepage-v2-section-heading">{title}</span>
+            <span className="homepage-v2-section-header-meta">
+              <span className="homepage-v2-section-count">{count}</span>
+              <span
+                className={`homepage-v2-section-chevron${isExpanded ? " homepage-v2-section-chevron--expanded" : ""}`}
+                aria-hidden="true"
+              >
+                ▾
+              </span>
+            </span>
+          </button>
+        </div>
+        <div id={contentId} className="homepage-v2-section-body" hidden={!isExpanded}>
+          {children}
+        </div>
+      </section>
+    );
+  }
+
   return (
     <section className="homepage homepage-v2 app-surface app-surface--stagger">
-
-      {/* Header: search + program badge */}
       <div className="homepage-v2-header app-surface-item app-surface-item--1">
         <input
           type="search"
@@ -276,107 +263,7 @@ export default function Homepage({
           value={searchQuery}
           onChange={(event) => setSearchQuery(event.target.value)}
         />
-        {currentProgram && (
-          <div className="homepage-v2-program-badge">
-            <div className="homepage-v2-program-badge-text">
-              <span className="homepage-v2-program-badge-label">Program</span>
-              <span className="homepage-v2-program-badge-value">{currentProgram.code} – {currentProgram.name}</span>
-            </div>
-            <button
-              type="button"
-              className="homepage-v2-program-change-btn"
-              onClick={() => setIsProgramMenuOpen((prev) => !prev)}
-              disabled={programSavePending}
-            >
-              {isProgramMenuOpen ? "Close" : "Change"}
-            </button>
-            {isProgramMenuOpen && (
-              <div className="homepage-program-popup" role="dialog" aria-label="Change program">
-                {profileOptionsError && <p className="homepage-profile-error">{profileOptionsError}</p>}
-                <div className="homepage-profile-field">
-                  <label htmlFor="profile-program-popup">Program</label>
-                  <ProgramPicker
-                    id="profile-program-popup"
-                    value={draftProgramId}
-                    programs={programOptions}
-                    onChange={setDraftProgramId}
-                    disabled={profileOptionsLoading || programSavePending}
-                    showAllOption
-                    showAllLabel="Show all"
-                    placeholder="Select a program"
-                  />
-                </div>
-                <div className="homepage-program-popup-actions">
-                  <button
-                    type="button"
-                    className="homepage-program-popup-cancel-btn"
-                    onClick={() => setIsProgramMenuOpen(false)}
-                    disabled={programSavePending}
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    type="button"
-                    className="homepage-profile-save-btn"
-                    onClick={() => void handleSaveProgram()}
-                    disabled={programSavePending || profileOptionsLoading}
-                  >
-                    {programSavePending ? "Saving..." : "Save program"}
-                  </button>
-                </div>
-                {profileSaveBanner && (
-                  <p className={`homepage-profile-banner homepage-profile-banner--${profileSaveBanner.kind}`}>
-                    {profileSaveBanner.text}
-                  </p>
-                )}
-              </div>
-            )}
-          </div>
-        )}
       </div>
-
-      {/* Program setup — shown when no program configured */}
-      {!currentProgram && !profileLoading && (
-        <section className="homepage-profile-section app-surface-item app-surface-item--2">
-          <div className="homepage-profile-setup-card">
-            <h3>Select your program</h3>
-            <p>Configure your program to unlock your program courses on the homepage.</p>
-          </div>
-          <div className="homepage-profile-editor">
-            <div className="homepage-profile-editor-header">
-              <h3>My study profile</h3>
-              {profileOptionsLoading && <span className="homepage-profile-meta">Loading options...</span>}
-            </div>
-            {profileOptionsError && <p className="homepage-profile-error">{profileOptionsError}</p>}
-            <div className="homepage-profile-field">
-              <label htmlFor="profile-program">Program</label>
-              <ProgramPicker
-                id="profile-program"
-                value={draftProgramId}
-                programs={programOptions}
-                onChange={setDraftProgramId}
-                disabled={profileOptionsLoading || programSavePending}
-                showAllOption
-                showAllLabel="Show all"
-                placeholder="Select a program"
-              />
-              <button
-                type="button"
-                className="homepage-profile-save-btn"
-                onClick={() => void handleSaveProgram()}
-                disabled={programSavePending || profileOptionsLoading}
-              >
-                {programSavePending ? "Saving..." : "Save program"}
-              </button>
-            </div>
-            {profileSaveBanner && (
-              <p className={`homepage-profile-banner homepage-profile-banner--${profileSaveBanner.kind}`}>
-                {profileSaveBanner.text}
-              </p>
-            )}
-          </div>
-        </section>
-      )}
 
       {loading && (
         <div className="homepage-loading app-surface-item app-surface-item--2">
@@ -384,36 +271,27 @@ export default function Homepage({
         </div>
       )}
 
-      {/* Saved lectures */}
       {!loading && mySavedActiveLectures.length > 0 && (
-        <div className="homepage-v2-section app-surface-item app-surface-item--2">
-          <h2 className="homepage-v2-section-heading">Saved</h2>
+        renderSection(
+          "saved",
+          "Saved",
+          filteredSavedLectures.length,
+          "app-surface-item app-surface-item--2",
           <div className="homepage-v2-grid">
             {filteredSavedLectures.map((item) => renderLectureCard(item))}
             {filteredSavedLectures.length === 0 && (
               <p className="homepage-v2-empty">No saved lectures match your search.</p>
             )}
-          </div>
-        </div>
+          </div>,
+        )
       )}
 
-      {/* My Program lectures */}
-      {!loading && currentProgram && totalMyProgramLectures.length > 0 && (
-        <div className="homepage-v2-section app-surface-item app-surface-item--3">
-          <h2 className="homepage-v2-section-heading">My Program</h2>
-          <div className="homepage-v2-grid">
-            {filteredMyProgramLectures.map((item) => renderLectureCard(item))}
-            {filteredMyProgramLectures.length === 0 && (
-              <p className="homepage-v2-empty">No program lectures match your search.</p>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* All lectures */}
       {!loading && (
-        <div className="homepage-v2-section app-surface-item app-surface-item--4">
-          <h2 className="homepage-v2-section-heading">All</h2>
+        renderSection(
+          "all",
+          "All",
+          filteredAllLectures.length,
+          "app-surface-item app-surface-item--3",
           <div className="homepage-v2-grid">
             {acceptedAllLectures.length === 0 && (
               <p className="homepage-v2-empty">No lectures are available yet.</p>
@@ -422,10 +300,9 @@ export default function Homepage({
               <p className="homepage-v2-empty">No lectures match your search.</p>
             )}
             {filteredAllLectures.map((item) => renderLectureCard(item))}
-          </div>
-        </div>
+          </div>,
+        )
       )}
-
     </section>
   );
 }

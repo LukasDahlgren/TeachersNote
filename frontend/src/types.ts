@@ -59,6 +59,7 @@ export interface ProcessResult {
   download_url: string | null;
   pdf_url?: string | null;
   is_archived?: boolean;
+  reused_existing?: boolean;
 }
 
 export interface TeachersNoteSummary {
@@ -216,6 +217,7 @@ export interface UploadProcessJobStatus {
   lecture_id: number | null;
   total_slides: number | null;
   pdf_url: string | null;
+  reused_existing?: boolean;
   error: string | null;
   updated_at: string;
 }

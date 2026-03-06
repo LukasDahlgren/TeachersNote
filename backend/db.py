@@ -37,25 +37,40 @@ AsyncSessionLocal = async_sessionmaker(
 async def init_db() -> None:
     from models import Base
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+        try:
+            await conn.run_sync(Base.metadata.create_all)
+        except OperationalError as exc:
+            if not _is_duplicate_ddl_error(exc):
+                raise
+            logging.warning("Ignoring concurrent create_all race: %s", exc)
+            await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_ensure_schema_compatibility)
+
+
+def _is_duplicate_ddl_error(exc: OperationalError) -> bool:
+    orig = getattr(exc, "orig", None)
+    code = None
+    if orig is not None and getattr(orig, "args", None):
+        try:
+            code = int(orig.args[0])
+        except (TypeError, ValueError):
+            code = None
+    message = str(orig or exc).lower()
+    if code in {1050, 1060, 1061}:
+        return True
+    duplicate_markers = (
+        "already exists",
+        "duplicate column name",
+        "duplicate key name",
+    )
+    return any(marker in message for marker in duplicate_markers)
 
 
 def _execute_ddl_ignore_duplicate(sync_conn, statement: str) -> None:
     try:
         sync_conn.execute(text(statement))
     except OperationalError as exc:
-        orig = getattr(exc, "orig", None)
-        code = None
-        if orig is not None and getattr(orig, "args", None):
-            try:
-                code = int(orig.args[0])
-            except (TypeError, ValueError):
-                code = None
-        message = str(orig or exc).lower()
-        if code in {1060, 1061}:
-            return
-        if "duplicate column name" in message or "duplicate key name" in message:
+        if _is_duplicate_ddl_error(exc):
             return
         raise
 
@@ -106,6 +121,8 @@ def _ensure_schema_compatibility(sync_conn) -> None:
         _execute_ddl_ignore_duplicate(sync_conn, "ALTER TABLE lectures ADD COLUMN upload_lecture_raw VARCHAR(255) NULL")
     if "upload_year_raw" not in lecture_columns:
         _execute_ddl_ignore_duplicate(sync_conn, "ALTER TABLE lectures ADD COLUMN upload_year_raw VARCHAR(4) NULL")
+    if "pdf_hash" not in lecture_columns:
+        _execute_ddl_ignore_duplicate(sync_conn, "ALTER TABLE lectures ADD COLUMN pdf_hash VARCHAR(64) NULL")
 
     sync_conn.execute(
         text(

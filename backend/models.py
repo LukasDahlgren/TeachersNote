@@ -41,12 +41,21 @@ class Lecture(Base):
     uploaded_by = Column(String(255), nullable=True)
     pptx_path   = Column(String(512), nullable=True)
     pdf_path    = Column(String(512), nullable=True)
+    pdf_hash    = Column(String(64), nullable=True)
     created_at  = Column(DateTime, nullable=False, default=datetime.utcnow)
 
     slides              = relationship("Slide", back_populates="lecture", cascade="all, delete-orphan")
     transcript_segments = relationship("TranscriptSegment", back_populates="lecture", cascade="all, delete-orphan")
     alignments          = relationship("Alignment", back_populates="lecture", cascade="all, delete-orphan")
     enriched_slides     = relationship("EnrichedSlide", back_populates="lecture", cascade="all, delete-orphan")
+
+
+class LectureAccess(Base):
+    __tablename__ = "lecture_access"
+
+    user_id    = Column(String(255), primary_key=True)
+    lecture_id = Column(Integer, ForeignKey("lectures.id", ondelete="CASCADE"), primary_key=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
 class Slide(Base):

@@ -120,6 +120,13 @@ Authentication modes:
 - Most protected endpoints use `Authorization: Bearer <token>`.
 - File-serving and SSE endpoints that use `EventSource` require `?token=<jwt>` query parameter.
 
+Access model:
+- Admins can view and download all lectures.
+- Non-admins can only access lectures they originally uploaded or lectures they explicitly unlock by uploading a matching approved PDF.
+- Approval is moderation/canonicalization only; it does not make a lecture public to every user.
+- When a non-admin uploads a PDF matching an approved, non-archived, non-deleted lecture with the same `pdf_hash`, the backend reuses the existing lecture/PPTX, grants access, auto-saves it for that user, and skips AI processing.
+- `/demo` is admin-only.
+
 ### Auth
 
 | Method | Path | Auth | Description |
@@ -132,10 +139,10 @@ Authentication modes:
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `POST` | `/process` | Bearer | Run full pipeline synchronously |
-| `POST` | `/process/jobs` | Bearer | Start async pipeline job |
-| `GET` | `/process/jobs/{job_id}` | Bearer | Get async upload job status |
-| `GET` | `/process/jobs/{job_id}/events` | Query token | Stream async upload job events (SSE) |
+| `POST` | `/process` | Bearer | Run full pipeline synchronously, or reuse an approved matching lecture without reprocessing |
+| `POST` | `/process/jobs` | Bearer | Start async pipeline job, or immediately unlock an approved matching lecture without reprocessing |
+| `GET` | `/process/jobs/{job_id}` | Bearer | Get async upload job status for the job owner |
+| `GET` | `/process/jobs/{job_id}/events` | Query token | Stream async upload job events for the job owner (SSE) |
 
 `POST /process` and `POST /process/jobs` accept `multipart/form-data`:
 
@@ -148,24 +155,27 @@ Authentication modes:
 | `lecture` | Yes | Alphanumeric + dashes |
 | `year` | Yes | Exactly 4 digits |
 | `kind` | No | Defaults to `lecture` |
+| `course_context` | No | Optional course label/context string forwarded to enrichment |
 
 Generated asset stem: `<COURSEID>-<kind>-<lecture>-<year>`
+
+Uploaded/downloaded audio or video is staged as a temporary file during processing and removed afterward. Long-term assets are the generated PPTX and saved source PDF on disk, plus lecture metadata and note/transcript tables in the database.
 
 ### Lectures
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `GET` | `/lectures` | Bearer | List visible lectures |
-| `GET` | `/lectures/my` | Bearer | List current user's saved lectures |
-| `GET` | `/lectures/deleted` | Bearer (Admin) | List soft-deleted lectures |
-| `GET` | `/lectures/{lecture_id}` | Bearer | Get lecture details |
-| `PUT` | `/lectures/{lecture_id}/save` | Bearer | Save lecture to user list |
-| `DELETE` | `/lectures/{lecture_id}/save` | Bearer | Remove lecture from user list |
+| `GET` | `/lectures` | Bearer | List lectures visible to the current user |
+| `GET` | `/lectures/my` | Bearer | List the current user's saved lectures that they can still access |
+| `GET` | `/lectures/deleted` | Bearer (Admin) | Compatibility endpoint; always returns an empty list |
+| `GET` | `/lectures/{lecture_id}` | Bearer | Get lecture details if the current user has access |
+| `PUT` | `/lectures/{lecture_id}/save` | Bearer | Save an accessible lecture to the current user's list |
+| `DELETE` | `/lectures/{lecture_id}/save` | Bearer | Remove an accessible lecture from the current user's list |
 | `POST` | `/lectures/{lecture_id}/archive` | Bearer (Admin) | Set archive state (`archive=true|false` query param) |
-| `POST` | `/lectures/{lecture_id}/trash` | Bearer (Admin) | Soft-delete lecture |
-| `POST` | `/lectures/{lecture_id}/restore` | Bearer (Admin) | Restore soft-deleted lecture |
+| `POST` | `/lectures/{lecture_id}/trash` | Bearer (Admin) | Permanently delete lecture and its stored assets |
+| `POST` | `/lectures/{lecture_id}/restore` | Bearer (Admin) | Compatibility endpoint; restore is no longer supported |
 | `POST` | `/lectures/{lecture_id}/approve` | Bearer (Admin) | Approve pending lecture |
-| `POST` | `/lectures/{lecture_id}/reject` | Bearer (Admin) | Reject pending lecture (marks deleted) |
+| `POST` | `/lectures/{lecture_id}/reject` | Bearer (Admin) | Reject pending lecture and permanently delete it |
 | `POST` | `/lectures/{lecture_id}/regenerate-notes` | Bearer | Sync note regeneration |
 | `POST` | `/lectures/{lecture_id}/regenerate-notes/jobs` | Bearer | Start async note regeneration job |
 | `GET` | `/lectures/regenerate-notes/jobs/{job_id}` | Bearer | Get async note regeneration status |
@@ -204,9 +214,9 @@ Generated asset stem: `<COURSEID>-<kind>-<lecture>-<year>`
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | `GET` | `/health` | Public | Health check |
-| `GET` | `/demo` | Bearer | Return newest visible lecture named `IB133N-lecture-14-2026` |
-| `GET` | `/download/{filename}` | Query token | Download generated PPTX |
-| `GET` | `/pdf/{filename}` | Query token | Download source PDF |
+| `GET` | `/demo` | Bearer (Admin) | Return newest visible lecture named `IB133N-lecture-14-2026` |
+| `GET` | `/download/{filename}` | Query token | Download generated PPTX if the authenticated user has lecture access |
+| `GET` | `/pdf/{filename}` | Query token | Download source PDF if the authenticated user has lecture access |
 
 ---
 
@@ -216,7 +226,8 @@ Generated asset stem: `<COURSEID>-<kind>-<lecture>-<year>`
 |---|---|
 | `users` | `id`, `uuid`, `email`, `password_hash`, `display_name`, `is_active`, `created_at` |
 | `admin_users` | `id`, `user_id`, `registered_at` |
-| `lectures` | `id`, `name`, `course_id`, `is_demo`, `is_archived`, `is_deleted`, `is_approved`, `uploaded_by`, `pptx_path`, `pdf_path`, `created_at` |
+| `lectures` | `id`, `name`, `course_id`, `is_demo`, `is_archived`, `is_deleted`, `is_approved`, `uploaded_by`, `pptx_path`, `pdf_path`, `pdf_hash`, `created_at` |
+| `lecture_access` | `user_id`, `lecture_id`, `created_at` |
 | `lecture_saves` | `id`, `user_id`, `lecture_id`, `created_at` |
 | `slides` | `lecture_id`, `slide_number`, `text` |
 | `transcript_segments` | `lecture_id`, `segment_index`, `start_time`, `end_time`, `text` |

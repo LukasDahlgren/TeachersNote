@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -23,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db import AsyncSessionLocal, get_db, init_db
 from catalog_sync import run_catalog_sync
+import chatbot as _chatbot
 from media_download import (
     RecordingSourceKind,
     RemoteMediaDownloadError,
@@ -46,6 +48,7 @@ from models import (
     Course,
     EnrichedSlide,
     Lecture,
+    LectureAccess,
     LectureSave,
     Program,
     ProgramCourse,
@@ -57,7 +60,8 @@ from models import (
     User,
 )
 from pipeline import (
-    enrich_slide_notes,
+    ENRICH_BATCH_SIZE,
+    enrich_slides_batch_notes,
     generate_presentation_from_enhanced,
     run_pipeline,
 )
@@ -71,6 +75,7 @@ from scripts.enrich import (
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    await _cleanup_orphaned_uploads()
     yield
 
 
@@ -115,6 +120,46 @@ DEMO_LECTURE_NAME = "IB133N-lecture-14-2026"
 ALLOWED_CANONICAL_KINDS = {"lecture", "other"}
 
 
+async def _cleanup_orphaned_uploads() -> None:
+    """Delete DB rows and files left behind by upload jobs interrupted mid-pipeline.
+
+    A lecture with pptx_path=NULL was created by the early-save callback inside the
+    pipeline (on_pre_enrich) but never completed.  When the server is starting up
+    there are no active processing tasks, so any such row is guaranteed orphaned.
+    Cascade deletes on child tables (slides, transcript_segments, alignments,
+    enriched_slides, lecture_saves, lecture_access) handle the rest automatically.
+
+    Also removes any stale process-* staging directories in UPLOADS_DIR that were
+    not cleaned up due to a previous crash.
+    """
+    deleted_lectures = 0
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Lecture).where(Lecture.pptx_path.is_(None), Lecture.is_demo == False)  # noqa: E712
+        )
+        orphans = result.scalars().all()
+        for lecture in orphans:
+            if lecture.pdf_path:
+                pdf_file = BACKEND_DIR / lecture.pdf_path
+                pdf_file.unlink(missing_ok=True)
+            await db.delete(lecture)
+            deleted_lectures += 1
+        if deleted_lectures:
+            await db.commit()
+
+    stale_dirs = list(UPLOADS_DIR.glob("process-*"))
+    for stale in stale_dirs:
+        if stale.is_dir():
+            shutil.rmtree(stale, ignore_errors=True)
+
+    if deleted_lectures or stale_dirs:
+        LOGGER.info(
+            "Startup cleanup: removed %d orphaned lecture(s) and %d stale staging dir(s)",
+            deleted_lectures,
+            len(stale_dirs),
+        )
+
+
 def _env_truthy(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -149,21 +194,72 @@ async def get_lecture_or_404(db: AsyncSession, lecture_id: int) -> Lecture:
     return lecture
 
 
-def can_view_lecture(*, user_id: str, lecture: Lecture, is_admin: bool) -> bool:
+def _non_admin_lecture_access_filter(user_id: str):
+    return or_(
+        Lecture.uploaded_by == user_id,
+        Lecture.id.in_(select(LectureAccess.lecture_id).where(LectureAccess.user_id == user_id)),
+    )
+
+
+async def _user_has_explicit_lecture_access(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    lecture_id: int,
+) -> bool:
+    result = await db.execute(
+        select(LectureAccess.lecture_id).where(
+            LectureAccess.user_id == user_id,
+            LectureAccess.lecture_id == lecture_id,
+        )
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def can_view_lecture(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    lecture: Lecture,
+    is_admin: bool,
+) -> bool:
     if is_admin:
         return True
     if bool(lecture.is_deleted):
         return False
-    if bool(lecture.is_approved):
+    if lecture.uploaded_by == user_id:
         return True
-    return lecture.uploaded_by == user_id
+    return await _user_has_explicit_lecture_access(db, user_id=user_id, lecture_id=int(lecture.id))
 
 
-def assert_user_can_view_lecture(*, user_id: str, lecture: Lecture, is_admin: bool) -> None:
-    if can_view_lecture(user_id=user_id, lecture=lecture, is_admin=is_admin):
+async def assert_user_can_view_lecture(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    lecture: Lecture,
+    is_admin: bool,
+) -> None:
+    if await can_view_lecture(db, user_id=user_id, lecture=lecture, is_admin=is_admin):
         return
     # Intentionally return 404 to avoid revealing lecture visibility state to non-admin users.
     raise HTTPException(status_code=404, detail="Lecture not found")
+
+
+async def grant_lecture_access_for_user(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    lecture_id: int,
+    commit: bool = True,
+) -> None:
+    if await _user_has_explicit_lecture_access(db, user_id=user_id, lecture_id=lecture_id):
+        return
+    db.add(LectureAccess(user_id=user_id, lecture_id=lecture_id))
+    if commit:
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
 
 
 async def _require_admin_user_or_403(*, user_id: str, db: AsyncSession) -> None:
@@ -265,6 +361,11 @@ class UploadSubmissionResolution(NamedTuple):
     year: str | None
     raw: UploadRawNaming
     temporary_name_seed: str | None
+
+
+class StagedLectureAsset(NamedTuple):
+    original_path: Path
+    staged_path: Path
 
 
 def _parse_standard_upload_name(name: str) -> tuple[str, str, str, str] | None:
@@ -516,6 +617,90 @@ def _path_is_archived_generated(path: Path) -> bool:
     return _path_is_within(path, ARCHIVED_GENERATED_DIR.resolve())
 
 
+def _lecture_asset_paths_for_permanent_delete(lecture: Lecture) -> list[Path]:
+    backend_root = BACKEND_DIR.resolve()
+    raw_paths = [lecture.pptx_path, lecture.pdf_path]
+    resolved_paths: list[Path] = []
+    seen_paths: set[Path] = set()
+
+    for raw_path in raw_paths:
+        if not raw_path:
+            continue
+        resolved = _resolve_lecture_asset_path(raw_path)
+        if not _path_is_within(resolved, backend_root):
+            raise RuntimeError(f"Refusing to delete lecture asset outside backend dir: {resolved}")
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        resolved_paths.append(resolved)
+
+    return resolved_paths
+
+
+def _rollback_staged_lecture_assets(staged_assets: list[StagedLectureAsset]) -> None:
+    for staged in reversed(staged_assets):
+        try:
+            if not staged.staged_path.exists():
+                continue
+            staged.original_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(staged.staged_path), str(staged.original_path))
+        except Exception:
+            LOGGER.exception(
+                "Failed to restore staged lecture asset from %s to %s",
+                staged.staged_path,
+                staged.original_path,
+            )
+
+
+async def _assert_lecture_can_be_permanently_deleted(lecture_id: int) -> None:
+    active_regen_job = await _get_active_job_for_lecture(lecture_id)
+    if active_regen_job is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Lecture is currently regenerating notes. Wait for the job to finish before deleting it.",
+        )
+
+    active_upload_job = await _get_active_upload_job_for_lecture(lecture_id)
+    if active_upload_job is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Lecture is still processing. Wait for the upload job to finish before deleting it.",
+        )
+
+
+async def _permanently_delete_lecture(db: AsyncSession, lecture: Lecture) -> None:
+    asset_paths = _lecture_asset_paths_for_permanent_delete(lecture)
+    stage_dir: Path | None = None
+    staged_assets: list[StagedLectureAsset] = []
+
+    try:
+        for index, asset_path in enumerate(asset_paths):
+            if not asset_path.exists():
+                continue
+            if asset_path.is_dir() and not asset_path.is_symlink():
+                raise RuntimeError(f"Lecture asset is a directory, expected a file: {asset_path}")
+            if stage_dir is None:
+                stage_dir = Path(tempfile.mkdtemp(prefix=f"lecture-delete-{lecture.id}-", dir=UPLOADS_DIR))
+            staged_path = stage_dir / f"{index}-{asset_path.name}"
+            shutil.move(str(asset_path), str(staged_path))
+            staged_assets.append(StagedLectureAsset(original_path=asset_path, staged_path=staged_path))
+
+        await db.delete(lecture)
+        await db.commit()
+    except Exception as exc:
+        try:
+            await db.rollback()
+        finally:
+            _rollback_staged_lecture_assets(staged_assets)
+        raise HTTPException(status_code=500, detail=f"Failed to permanently delete lecture: {exc}") from exc
+    finally:
+        if stage_dir is not None:
+            try:
+                shutil.rmtree(stage_dir)
+            except Exception:
+                LOGGER.exception("Failed to remove staged lecture delete directory: %s", stage_dir)
+
+
 def _resolve_generated_download_path(filename: str) -> Path | None:
     direct = (GENERATED_DIR / filename).resolve()
     if _path_is_within(direct, GENERATED_DIR.resolve()) and direct.is_file():
@@ -589,6 +774,77 @@ def _lecture_has_visible_pptx(lecture: Lecture) -> bool:
         return bool(lecture.pdf_path) or bool(lecture.is_demo)
     pptx_path = _resolve_lecture_asset_path(lecture.pptx_path)
     return pptx_path.exists() and pptx_path.is_file()
+
+
+def _stored_path_variants(path: Path) -> list[str]:
+    variants = {str(path), path.as_posix()}
+    try:
+        variants.add(_to_backend_relative_path(path))
+    except ValueError:
+        pass
+    return sorted(variants)
+
+
+async def _find_lecture_for_asset_path(
+    db: AsyncSession,
+    *,
+    path: Path,
+    use_pdf_path: bool,
+) -> Lecture | None:
+    column = Lecture.pdf_path if use_pdf_path else Lecture.pptx_path
+    result = await db.execute(
+        select(Lecture)
+        .where(column.in_(_stored_path_variants(path)))
+        .order_by(Lecture.created_at.desc(), Lecture.id.desc())
+    )
+    return result.scalars().first()
+
+
+async def _find_reusable_lecture_by_pdf_hash(
+    db: AsyncSession,
+    *,
+    pdf_hash: str | None,
+) -> Lecture | None:
+    if not pdf_hash:
+        return None
+    result = await db.execute(
+        select(Lecture)
+        .where(
+            Lecture.pdf_hash == pdf_hash,
+            Lecture.is_approved == True,  # noqa: E712
+            Lecture.is_deleted == False,  # noqa: E712
+            Lecture.is_archived == False,  # noqa: E712
+        )
+        .order_by(Lecture.created_at.desc(), Lecture.id.desc())
+    )
+    for lecture in result.scalars().all():
+        if _lecture_has_visible_pptx(lecture):
+            return lecture
+    return None
+
+
+async def _grant_reused_lecture_access(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    lecture_id: int,
+) -> None:
+    await grant_lecture_access_for_user(
+        db,
+        user_id=user_id,
+        lecture_id=lecture_id,
+        commit=False,
+    )
+    await save_lecture_for_user(
+        db,
+        user_id=user_id,
+        lecture_id=lecture_id,
+        commit=False,
+    )
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
 
 
 def _canonical_course_code(raw_course_id: str | None) -> str:
@@ -965,6 +1221,17 @@ async def _get_job_snapshot(job_id: str) -> dict[str, Any] | None:
         return dict(job)
 
 
+async def _assert_user_can_view_regen_job(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    job: dict[str, Any],
+    is_admin: bool,
+) -> None:
+    lecture = await get_lecture_or_404(db, int(job["lecture_id"]))
+    await assert_user_can_view_lecture(db, user_id=user_id, lecture=lecture, is_admin=is_admin)
+
+
 async def _get_active_job_for_lecture(lecture_id: int) -> dict[str, Any] | None:
     async with REGEN_JOB_LOCK:
         job_id = ACTIVE_REGEN_JOB_BY_LECTURE.get(lecture_id)
@@ -1022,6 +1289,7 @@ def _upload_job_public_state(job: dict[str, Any]) -> dict[str, Any]:
         "lecture_id": job["lecture_id"],
         "total_slides": job.get("total_slides"),
         "pdf_url": job.get("pdf_url"),
+        "reused_existing": bool(job.get("reused_existing")),
         "error": job["error"],
         "updated_at": datetime.fromtimestamp(job["updated_at"], tz=timezone.utc).isoformat(),
     }
@@ -1054,6 +1322,12 @@ async def _get_upload_job_snapshot(job_id: str) -> dict[str, Any] | None:
         return dict(job)
 
 
+def _assert_user_can_view_upload_job(*, user_id: str, job: dict[str, Any]) -> None:
+    if job.get("user_id") == user_id:
+        return
+    raise HTTPException(status_code=404, detail="Job not found")
+
+
 async def _get_active_upload_job(user_id: str) -> dict[str, Any] | None:
     async with UPLOAD_JOB_LOCK:
         job_id = ACTIVE_UPLOAD_JOB_IDS.get(user_id)
@@ -1078,6 +1352,7 @@ async def _create_upload_job(user_id: str) -> dict[str, Any]:
         "lecture_id": None,
         "total_slides": None,
         "pdf_url": None,
+        "reused_existing": False,
         "error": None,
         "updated_at": now,
         "version": 0,
@@ -1132,6 +1407,19 @@ async def _update_upload_job(
                 ACTIVE_UPLOAD_JOB_IDS.pop(uid, None)
 
         return dict(job)
+
+
+async def _get_active_upload_job_for_lecture(lecture_id: int) -> dict[str, Any] | None:
+    async with UPLOAD_JOB_LOCK:
+        for job in UPLOAD_JOB_STORE.values():
+            if job["status"] in TERMINAL_JOB_STATUSES:
+                continue
+            job_lecture_id = job.get("lecture_id")
+            if job_lecture_id is None:
+                continue
+            if int(job_lecture_id) == lecture_id:
+                return dict(job)
+        return None
 
 
 async def _add_upload_job_raw_event(job_id: str, event_name: str, payload: dict[str, Any]) -> None:
@@ -1299,17 +1587,91 @@ def _upsert_enriched_row(
     enriched_by_slide[slide_num] = new_row
 
 
-async def generate_notes_for_slide(slide: dict, transcript_text: str) -> dict:
-    if DISABLE_EXTERNAL_AI:
+async def generate_notes_for_slide(slide: dict, transcript_text: str, course_context: str | None = None) -> dict:
+    notes = await generate_notes_for_slides([(slide, transcript_text)], course_context=course_context)
+    if not notes:
         return build_fallback_enrichment(slide, transcript_text)
+    return {
+        "summary": notes[0]["summary"],
+        "slide_content": notes[0]["slide_content"],
+        "lecturer_additions": notes[0]["lecturer_additions"],
+        "key_takeaways": notes[0]["key_takeaways"],
+    }
 
-    notes = await run_in_threadpool(enrich_slide_notes, slide, transcript_text)
-    if is_enriched_payload_invalid(notes):
-        return build_fallback_enrichment(slide, transcript_text)
-    return notes
+
+async def generate_notes_for_slides(
+    slides_with_transcripts: list[tuple[dict, str]],
+    course_context: str | None = None,
+) -> list[dict]:
+    if not slides_with_transcripts:
+        return []
+
+    if DISABLE_EXTERNAL_AI:
+        return [
+            {
+                "slide": int(slide.get("slide", 0)),
+                **build_fallback_enrichment(slide, transcript_text),
+            }
+            for slide, transcript_text in slides_with_transcripts
+        ]
+
+    notes_list = await run_in_threadpool(
+        enrich_slides_batch_notes,
+        slides_with_transcripts,
+        course_context=course_context,
+    )
+    notes_by_slide = {
+        int(note["slide"]): note
+        for note in notes_list
+        if note.get("slide") is not None
+    }
+    normalized_results: list[dict] = []
+    for slide, transcript_text in slides_with_transcripts:
+        slide_num = int(slide.get("slide", 0))
+        notes = notes_by_slide.get(slide_num)
+        if notes is None or is_enriched_payload_invalid(notes):
+            normalized = build_fallback_enrichment(slide, transcript_text)
+        else:
+            normalized = normalize_enriched_payload(notes)
+            if is_enriched_payload_invalid(normalized):
+                normalized = build_fallback_enrichment(slide, transcript_text)
+        normalized_results.append({"slide": slide_num, **normalized})
+    return normalized_results
+
+
+def _chunk_items(items: list[Any], size: int) -> list[list[Any]]:
+    if size <= 1:
+        return [[item] for item in items]
+    return [items[idx:idx + size] for idx in range(0, len(items), size)]
+
+
+def _notes_payload_from_batch_entry(entry: dict) -> dict:
+    return {
+        "summary": entry["summary"],
+        "slide_content": entry["slide_content"],
+        "lecturer_additions": entry["lecturer_additions"],
+        "key_takeaways": entry["key_takeaways"],
+    }
+
+
+async def _lookup_course_context(db: AsyncSession, course_id: str | None) -> str | None:
+    normalized = _canonical_course_code(course_id)
+    if not normalized:
+        return None
+    row = (await db.execute(
+        select(Course.name, Course.display_code).where(Course.code == normalized)
+    )).first()
+    if not row:
+        return course_id or None
+    name, display_code = row
+    code_label = (display_code or "").strip() or normalized
+    return f"{name} ({code_label})" if name else code_label
 
 
 async def _load_regeneration_context(db: AsyncSession, lecture_id: int) -> dict[str, Any]:
+    lecture_row = (await db.execute(
+        select(Lecture.course_id).where(Lecture.id == lecture_id)
+    )).first()
     slides_rows = (await db.execute(
         select(Slide).where(Slide.lecture_id == lecture_id).order_by(Slide.slide_number)
     )).scalars().all()
@@ -1330,6 +1692,7 @@ async def _load_regeneration_context(db: AsyncSession, lecture_id: int) -> dict[
         "segments_by_index": {s.segment_index: s for s in seg_rows},
         "align_rows": align_rows,
         "enriched_by_slide": {e.slide_number: e for e in enriched_rows},
+        "course_id": lecture_row[0] if lecture_row else None,
     }
 
 
@@ -1356,6 +1719,7 @@ async def _run_regenerate_notes_job(job_id: str, lecture_id: int) -> None:
 
         async with AsyncSessionLocal() as db:
             context = await _load_regeneration_context(db, lecture_id)
+            course_context = await _lookup_course_context(db, context["course_id"])
             targets = _build_regeneration_targets(
                 context["align_rows"],
                 context["enriched_by_slide"],
@@ -1383,40 +1747,58 @@ async def _run_regenerate_notes_job(job_id: str, lecture_id: int) -> None:
                 )
                 return
 
-            for idx, target in enumerate(targets, start=1):
-                slide_num = target["slide_number"]
+            for batch in _chunk_items(targets, ENRICH_BATCH_SIZE):
+                if not batch:
+                    continue
                 await _update_job(
                     job_id,
                     status=JOB_STATUS_RUNNING,
-                    current_slide=slide_num,
-                    completed_slides=idx - 1,
+                    current_slide=batch[0]["slide_number"],
+                    completed_slides=regenerated,
                     regenerated_slides=regenerated,
                 )
 
-                slide = context["slides_by_num"].get(slide_num, {"slide": slide_num, "text": ""})
-                transcript_text = _segment_text_for_alignment(
-                    context["segments_by_index"],
-                    target["start_segment"],
-                    target["end_segment"],
-                )
-                notes = await generate_notes_for_slide(slide, transcript_text)
-                _upsert_enriched_row(
-                    db=db,
-                    lecture_id=lecture_id,
-                    enriched_by_slide=context["enriched_by_slide"],
-                    slide_num=slide_num,
-                    notes=notes,
-                )
-                await db.commit()
+                batch_payloads: list[tuple[dict[str, int], dict, str]] = []
+                for target in batch:
+                    slide_num = target["slide_number"]
+                    slide = context["slides_by_num"].get(slide_num, {"slide": slide_num, "text": ""})
+                    transcript_text = _segment_text_for_alignment(
+                        context["segments_by_index"],
+                        target["start_segment"],
+                        target["end_segment"],
+                    )
+                    batch_payloads.append((target, slide, transcript_text))
 
-                regenerated += 1
-                await _update_job(
-                    job_id,
-                    status=JOB_STATUS_RUNNING,
-                    current_slide=slide_num,
-                    completed_slides=idx,
-                    regenerated_slides=regenerated,
+                batch_notes = await generate_notes_for_slides(
+                    [(slide, transcript_text) for _, slide, transcript_text in batch_payloads],
+                    course_context=course_context,
                 )
+                notes_by_slide = {int(note["slide"]): note for note in batch_notes}
+
+                for target, slide, transcript_text in batch_payloads:
+                    slide_num = target["slide_number"]
+                    notes_entry = notes_by_slide.get(slide_num)
+                    if notes_entry is None:
+                        notes = build_fallback_enrichment(slide, transcript_text)
+                    else:
+                        notes = _notes_payload_from_batch_entry(notes_entry)
+                    _upsert_enriched_row(
+                        db=db,
+                        lecture_id=lecture_id,
+                        enriched_by_slide=context["enriched_by_slide"],
+                        slide_num=slide_num,
+                        notes=notes,
+                    )
+                    await db.commit()
+
+                    regenerated += 1
+                    await _update_job(
+                        job_id,
+                        status=JOB_STATUS_RUNNING,
+                        current_slide=slide_num,
+                        completed_slides=regenerated,
+                        regenerated_slides=regenerated,
+                    )
 
             if regenerated > 0:
                 await _sync_lecture_pptx_with_enriched_notes(db, lecture_id)
@@ -1459,6 +1841,9 @@ async def _run_process_job(
     pptx_path: Path,
     saved_pdf_path: Path,
     user_id: str,
+    pdf_hash: str | None = None,
+    course_context: str | None = None,
+    custom_name: str | None = None,
 ) -> None:
     loop = asyncio.get_running_loop()
     last_stage: str | None = None
@@ -1535,6 +1920,7 @@ async def _run_process_job(
                     is_demo=False,
                     saved_user_id=user_id,
                     uploaded_by=user_id,
+                    pdf_hash=pdf_hash,
                 )
             lecture_id_holder[0] = lid
             await _update_upload_job(
@@ -1591,11 +1977,16 @@ async def _run_process_job(
             on_slides_parsed=on_slides_parsed,
             on_slide_enriched=on_slide_enriched,
             on_pre_enrich=on_pre_enrich,
+            course_context=course_context,
         )
         resolved_lecture_name = (
-            _derive_temporary_lecture_name(result["slides"], temporary_name_seed)
-            if temporary_name_seed
-            else lecture_name
+            _normalize_lecture(custom_name.strip())[:80]
+            if custom_name and custom_name.strip()
+            else (
+                _derive_temporary_lecture_name(result["slides"], temporary_name_seed)
+                if temporary_name_seed
+                else lecture_name
+            )
         )
 
         await _update_upload_job(
@@ -1643,6 +2034,7 @@ async def _run_process_job(
                     is_demo=False,
                     saved_user_id=user_id,
                     uploaded_by=user_id,
+                    pdf_hash=pdf_hash,
                 )
 
         await _update_upload_job(
@@ -1700,13 +2092,14 @@ async def save_lecture_to_db(
     is_demo: bool = False,
     saved_user_id: str | None = None,
     uploaded_by: str | None = None,
+    pdf_hash: str | None = None,
 ) -> int:
     sanitized_enhanced = _sanitize_enhanced_entries(slides, transcript, alignment, enhanced)
 
     lecture = Lecture(
         name=name,
         is_demo=is_demo,
-        is_approved=is_demo,  # Demo lectures are pre-approved; uploads require admin approval
+        is_approved=True,  # All uploads are auto-approved; approval workflow disabled
         course_id=course_id,
         naming_kind=naming_kind,
         naming_lecture=naming_lecture,
@@ -1718,6 +2111,7 @@ async def save_lecture_to_db(
         uploaded_by=uploaded_by,
         pptx_path=pptx_path,
         pdf_path=pdf_path,
+        pdf_hash=pdf_hash,
     )
     db.add(lecture)
     await db.flush()
@@ -1803,7 +2197,12 @@ async def update_lecture_enhanced_and_pptx(
     await db.commit()
 
 
-async def lecture_to_response(db: AsyncSession, lecture_id: int) -> dict:
+async def lecture_to_response(
+    db: AsyncSession,
+    lecture_id: int,
+    *,
+    include_transcript: bool = True,
+) -> dict:
     slides_rows = (await db.execute(
         select(Slide).where(Slide.lecture_id == lecture_id).order_by(Slide.slide_number)
     )).scalars().all()
@@ -1824,9 +2223,11 @@ async def lecture_to_response(db: AsyncSession, lecture_id: int) -> dict:
 
     return {
         "slides": [{"slide": s.slide_number, "text": s.text} for s in slides_rows],
-        "transcript": [
-            {"start": s.start_time, "end": s.end_time, "text": s.text} for s in seg_rows
-        ],
+        "transcript": (
+            [{"start": s.start_time, "end": s.end_time, "text": s.text} for s in seg_rows]
+            if include_transcript
+            else []
+        ),
         "alignment": [
             {"slide": a.slide_number, "start_segment": a.start_segment, "end_segment": a.end_segment}
             for a in align_rows
@@ -1923,8 +2324,13 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/demo", dependencies=[Depends(get_current_user)])
-async def demo(db: AsyncSession = Depends(get_db)):
+@app.get("/demo")
+async def demo(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not await _is_admin(current_user.uuid, db):
+        raise HTTPException(status_code=404, detail="Lecture not found")
     result = await db.execute(
         select(Lecture)
         .where(Lecture.name == DEMO_LECTURE_NAME)
@@ -1941,18 +2347,38 @@ async def demo(db: AsyncSession = Depends(get_db)):
 
 
 @app.get("/pdf/{filename}")
-def serve_pdf(filename: str, _auth: User = Depends(get_current_user_from_query)):
+async def serve_pdf(
+    filename: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user_from_query),
+):
     path = _resolve_pdf_download_path(filename)
     if not path:
         raise HTTPException(status_code=404, detail="File not found")
+    lecture = await _find_lecture_for_asset_path(db, path=path, use_pdf_path=True)
+    if lecture is None:
+        lecture = await _find_lecture_for_asset_path(db, path=path, use_pdf_path=False)
+    if lecture is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    admin = await _is_admin(current_user.uuid, db)
+    await assert_user_can_view_lecture(db, user_id=current_user.uuid, lecture=lecture, is_admin=admin)
     return FileResponse(path, media_type="application/pdf")
 
 
 @app.get("/download/{filename}")
-def download(filename: str, _auth: User = Depends(get_current_user_from_query)):
+async def download(
+    filename: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user_from_query),
+):
     path = _resolve_generated_download_path(filename)
     if not path:
         raise HTTPException(status_code=404, detail="File not found")
+    lecture = await _find_lecture_for_asset_path(db, path=path, use_pdf_path=False)
+    if lecture is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    admin = await _is_admin(current_user.uuid, db)
+    await assert_user_can_view_lecture(db, user_id=current_user.uuid, lecture=lecture, is_admin=admin)
     return FileResponse(
         path,
         filename=filename,
@@ -1969,6 +2395,8 @@ async def start_process_job(
     kind: str | None = Form(None),
     lecture: str | None = Form(None),
     year: str | None = Form(None),
+    course_context: str | None = Form(None),
+    custom_name: str | None = Form(None),
     current_user: User = Depends(get_current_user),
 ):
     user_id = current_user.uuid
@@ -1996,6 +2424,36 @@ async def start_process_job(
         if not resolved_audio_url:
             raise HTTPException(status_code=400, detail="Missing audio_url for URL recording source.")
         validated_audio_url = _validate_audio_url_or_400(resolved_audio_url)
+
+    pdf_bytes = await pdf.read()
+    await pdf.seek(0)
+    pdf_hash = hashlib.sha256(pdf_bytes).hexdigest()
+    async with AsyncSessionLocal() as _dup_db:
+        if not await _is_admin(user_id, _dup_db):
+            existing = await _find_reusable_lecture_by_pdf_hash(_dup_db, pdf_hash=pdf_hash)
+            if existing is not None:
+                await _grant_reused_lecture_access(
+                    _dup_db,
+                    user_id=user_id,
+                    lecture_id=int(existing.id),
+                )
+                job = await _create_upload_job(user_id)
+                await _update_upload_job(
+                    str(job["job_id"]),
+                    status=JOB_STATUS_DONE,
+                    current_stage="done",
+                    progress_pct=100,
+                    lecture_id=int(existing.id),
+                    pdf_url=_lecture_file_urls(existing)["pdf_url"],
+                    reused_existing=True,
+                    error=None,
+                    event_name="done",
+                    message="Existing lecture unlocked without reprocessing.",
+                )
+                snapshot = await _get_upload_job_snapshot(str(job["job_id"]))
+                if not snapshot:
+                    raise HTTPException(status_code=500, detail="Failed to create processing job")
+                return _upload_job_public_state(snapshot)
 
     job = await _create_upload_job(user_id)
     job_id = str(job["job_id"])
@@ -2030,6 +2488,7 @@ async def start_process_job(
             message=f"Failed to stage upload files: {exc}",
         )
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        submission_naming.saved_pdf_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"Failed to stage upload files: {exc}")
 
     await _update_upload_job(
@@ -2067,6 +2526,9 @@ async def start_process_job(
             pptx_path=submission_naming.pptx_path,
             saved_pdf_path=submission_naming.saved_pdf_path,
             user_id=user_id,
+            pdf_hash=pdf_hash,
+            course_context=(course_context or "").strip() or None,
+            custom_name=(custom_name or "").strip() or None,
         )
     )
 
@@ -2076,12 +2538,16 @@ async def start_process_job(
     return _upload_job_public_state(snapshot)
 
 
-@app.get("/process/jobs/{job_id}", dependencies=[Depends(get_current_user)])
-async def get_process_job(job_id: str):
+@app.get("/process/jobs/{job_id}")
+async def get_process_job(
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+):
     await _cleanup_expired_upload_jobs()
     snapshot = await _get_upload_job_snapshot(job_id)
     if not snapshot:
         raise HTTPException(status_code=404, detail="Job not found")
+    _assert_user_can_view_upload_job(user_id=current_user.uuid, job=snapshot)
     return _upload_job_public_state(snapshot)
 
 
@@ -2090,12 +2556,13 @@ async def stream_process_job(
     job_id: str,
     request: Request,
     last_event_id: int | None = None,
-    _auth: User = Depends(get_current_user_from_query),
+    current_user: User = Depends(get_current_user_from_query),
 ):
     await _cleanup_expired_upload_jobs()
     snapshot = await _get_upload_job_snapshot(job_id)
     if not snapshot:
         raise HTTPException(status_code=404, detail="Job not found")
+    _assert_user_can_view_upload_job(user_id=current_user.uuid, job=snapshot)
 
     cursor = max(0, int(last_event_id or 0))
     header_last_event_id = request.headers.get("last-event-id")
@@ -2166,6 +2633,7 @@ async def process(
     kind: str | None = Form(None),
     lecture: str | None = Form(None),
     year: str | None = Form(None),
+    course_context: str | None = Form(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -2184,6 +2652,8 @@ async def process(
             raise HTTPException(status_code=400, detail="Missing audio_url for URL recording source.")
         validated_audio_url = _validate_audio_url_or_400(resolved_audio_url)
 
+    pdf_hash: str | None = None
+
     with tempfile.TemporaryDirectory(dir=UPLOADS_DIR) as tmp:
         pdf_path = Path(tmp) / "slides.pdf"
         if recording_source == "file":
@@ -2197,6 +2667,7 @@ async def process(
         try:
             with open(pdf_path, "wb") as f:
                 shutil.copyfileobj(pdf.file, f)
+            pdf_hash = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
             if recording_source == "file":
                 if audio is None:
                     raise RuntimeError("Missing audio file during staging.")
@@ -2211,9 +2682,37 @@ async def process(
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Failed to stage upload files: {exc}") from exc
 
+        if not await _is_admin(user_id, db):
+            existing = await _find_reusable_lecture_by_pdf_hash(db, pdf_hash=pdf_hash)
+            if existing is not None:
+                await _grant_reused_lecture_access(
+                    db,
+                    user_id=user_id,
+                    lecture_id=int(existing.id),
+                )
+                display_overrides_by_code = await _course_display_overrides_by_code(db, [existing.course_id])
+                existing_data = await lecture_to_response(db, int(existing.id))
+                return {
+                    **existing_data,
+                    "lecture_id": int(existing.id),
+                    "name": existing.name,
+                    "course_id": existing.course_id,
+                    "course_display": _resolve_course_display(existing.course_id, display_overrides_by_code),
+                    "naming_kind": existing.naming_kind,
+                    "naming_lecture": existing.naming_lecture,
+                    "naming_year": existing.naming_year,
+                    "upload_naming_raw": _upload_naming_raw_payload(existing),
+                    "is_archived": bool(existing.is_archived),
+                    "is_approved": bool(existing.is_approved),
+                    "is_saved": True,
+                    "reused_existing": True,
+                    **_lecture_file_urls(existing),
+                }
+
         try:
             result = await run_in_threadpool(
-                run_pipeline, str(pdf_path), str(audio_path), str(submission_naming.pptx_path)
+                run_pipeline, str(pdf_path), str(audio_path), str(submission_naming.pptx_path),
+                course_context=(course_context or "").strip() or None,
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
@@ -2221,9 +2720,13 @@ async def process(
         shutil.copy2(pdf_path, submission_naming.saved_pdf_path)
 
     resolved_lecture_name = (
-        _derive_temporary_lecture_name(result["slides"], submission_naming.temporary_name_seed)
-        if submission_naming.temporary_name_seed
-        else submission_naming.lecture_name
+        _normalize_lecture(custom_name.strip())[:80]
+        if custom_name and custom_name.strip()
+        else (
+            _derive_temporary_lecture_name(result["slides"], submission_naming.temporary_name_seed)
+            if submission_naming.temporary_name_seed
+            else submission_naming.lecture_name
+        )
     )
 
     lecture_id = await save_lecture_to_db(
@@ -2246,6 +2749,7 @@ async def process(
         is_demo=False,
         saved_user_id=user_id,
         uploaded_by=user_id,
+        pdf_hash=pdf_hash,
     )
 
     return {
@@ -2256,8 +2760,9 @@ async def process(
         "naming_lecture": submission_naming.lecture,
         "naming_year": submission_naming.year,
         "is_archived": False,
-        "is_approved": False,
+        "is_approved": True,
         "is_saved": True,
+        "reused_existing": False,
         "pdf_url": f"/pdf/{submission_naming.saved_pdf_path.name}",
     }
 
@@ -2272,11 +2777,7 @@ async def list_lectures(
     if admin:
         visibility_filter = Lecture.is_deleted == False
     else:
-        # Show approved lectures to everyone, plus the uploader's own pending ones
-        visibility_filter = (Lecture.is_deleted == False) & or_(
-            Lecture.is_approved == True,
-            (Lecture.is_approved == False) & (Lecture.uploaded_by == user_id),
-        )
+        visibility_filter = (Lecture.is_deleted == False) & _non_admin_lecture_access_filter(user_id)
     result = await db.execute(select(Lecture).where(visibility_filter).order_by(Lecture.created_at.desc()))
     lectures = [lecture for lecture in result.scalars().all() if _lecture_has_visible_pptx(lecture)]
     saved_ids = await _saved_lecture_ids_for_user(db, user_id, [int(lecture.id) for lecture in lectures])
@@ -2308,12 +2809,7 @@ async def list_my_lectures(
         .where(Lecture.is_deleted == False)
     )
     if not admin:
-        query = query.where(
-            or_(
-                Lecture.is_approved == True,
-                Lecture.uploaded_by == user_id,
-            )
-        )
+        query = query.where(_non_admin_lecture_access_filter(user_id))
     result = await db.execute(query.order_by(LectureSave.created_at.desc(), Lecture.created_at.desc()))
     lectures = [lecture for lecture in result.scalars().all() if _lecture_has_visible_pptx(lecture)]
     display_overrides_by_code = await _course_display_overrides_by_code(
@@ -2337,39 +2833,24 @@ async def list_deleted_lectures(
 ):
     user_id = current_user.uuid
     await _require_admin_user_or_403(user_id=user_id, db=db)
-    result = await db.execute(
-        select(Lecture).where(Lecture.is_deleted == True).order_by(Lecture.created_at.desc())
-    )
-    lectures = result.scalars().all()
-    saved_ids = await _saved_lecture_ids_for_user(db, user_id, [int(lecture.id) for lecture in lectures])
-    display_overrides_by_code = await _course_display_overrides_by_code(
-        db,
-        [lecture.course_id for lecture in lectures],
-    )
-    return [
-        _teachers_note_payload(
-            lecture,
-            is_saved=lecture.id in saved_ids,
-            course_display=_resolve_course_display(lecture.course_id, display_overrides_by_code),
-        )
-        for lecture in lectures
-    ]
+    return []
 
 
 @app.get("/lectures/{lecture_id}")
 async def get_lecture(
     lecture_id: int,
+    include_transcript: bool = False,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     user_id = current_user.uuid
     lecture = await get_lecture_or_404(db, lecture_id)
     admin = await _is_admin(user_id, db)
-    assert_user_can_view_lecture(user_id=user_id, lecture=lecture, is_admin=admin)
+    await assert_user_can_view_lecture(db, user_id=user_id, lecture=lecture, is_admin=admin)
     if not _lecture_has_visible_pptx(lecture):
         raise HTTPException(status_code=404, detail="Lecture file not found")
 
-    data = await lecture_to_response(db, lecture_id)
+    data = await lecture_to_response(db, lecture_id, include_transcript=include_transcript)
     display_overrides_by_code = await _course_display_overrides_by_code(db, [lecture.course_id])
     return {
         **data,
@@ -2396,7 +2877,7 @@ async def save_lecture(
     user_id = current_user.uuid
     lecture = await get_lecture_or_404(db, lecture_id)
     admin = await _is_admin(user_id, db)
-    assert_user_can_view_lecture(user_id=user_id, lecture=lecture, is_admin=admin)
+    await assert_user_can_view_lecture(db, user_id=user_id, lecture=lecture, is_admin=admin)
 
     await save_lecture_for_user(db, user_id=user_id, lecture_id=lecture_id)
     display_overrides_by_code = await _course_display_overrides_by_code(db, [lecture.course_id])
@@ -2416,7 +2897,7 @@ async def unsave_lecture(
     user_id = current_user.uuid
     lecture = await get_lecture_or_404(db, lecture_id)
     admin = await _is_admin(user_id, db)
-    assert_user_can_view_lecture(user_id=user_id, lecture=lecture, is_admin=admin)
+    await assert_user_can_view_lecture(db, user_id=user_id, lecture=lecture, is_admin=admin)
 
     await unsave_lecture_for_user(db, user_id=user_id, lecture_id=lecture_id)
     display_overrides_by_code = await _course_display_overrides_by_code(db, [lecture.course_id])
@@ -2449,9 +2930,10 @@ async def trash_lecture(
     user_id = current_user.uuid
     await _require_admin_user_or_403(user_id=user_id, db=db)
     lecture = await get_lecture_or_404(db, lecture_id)
-    lecture.is_deleted = True
-    await db.commit()
-    return {"id": lecture.id, "is_deleted": True}
+    await _assert_lecture_can_be_permanently_deleted(int(lecture.id))
+    deleted_id = int(lecture.id)
+    await _permanently_delete_lecture(db, lecture)
+    return {"id": deleted_id, "is_deleted": True}
 
 
 @app.post("/lectures/{lecture_id}/restore")
@@ -2462,10 +2944,7 @@ async def restore_lecture(
 ):
     user_id = current_user.uuid
     await _require_admin_user_or_403(user_id=user_id, db=db)
-    lecture = await get_lecture_or_404(db, lecture_id)
-    lecture.is_deleted = False
-    await db.commit()
-    return {"id": lecture.id, "is_deleted": False}
+    raise HTTPException(status_code=410, detail="Lectures are permanently deleted and cannot be restored.")
 
 
 class AdminRegisterRequest(BaseModel):
@@ -3023,20 +3502,23 @@ async def reject_lecture(
     if not await _is_admin(user_id, db):
         raise HTTPException(status_code=403, detail="Admin access required.")
     lecture = await get_lecture_or_404(db, lecture_id)
-    lecture.is_deleted = True
-    await db.commit()
-    return {"id": lecture.id, "rejected": True}
+    await _assert_lecture_can_be_permanently_deleted(int(lecture.id))
+    deleted_id = int(lecture.id)
+    await _permanently_delete_lecture(db, lecture)
+    return {"id": deleted_id, "rejected": True}
 
 
 @app.post("/lectures/{lecture_id}/regenerate-notes/jobs", status_code=status.HTTP_202_ACCEPTED)
 async def start_regenerate_notes_job(
     lecture_id: int,
     db: AsyncSession = Depends(get_db),
-    _auth: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
     await _cleanup_expired_jobs()
 
-    await get_lecture_or_404(db, lecture_id)
+    lecture = await get_lecture_or_404(db, lecture_id)
+    admin = await _is_admin(current_user.uuid, db)
+    await assert_user_can_view_lecture(db, user_id=current_user.uuid, lecture=lecture, is_admin=admin)
 
     active_job = await _get_active_job_for_lecture(lecture_id)
     if active_job:
@@ -3049,12 +3531,18 @@ async def start_regenerate_notes_job(
     return _job_public_state(job)
 
 
-@app.get("/lectures/regenerate-notes/jobs/{job_id}", dependencies=[Depends(get_current_user)])
-async def get_regenerate_notes_job(job_id: str):
+@app.get("/lectures/regenerate-notes/jobs/{job_id}")
+async def get_regenerate_notes_job(
+    job_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     await _cleanup_expired_jobs()
     job = await _get_job_snapshot(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    admin = await _is_admin(current_user.uuid, db)
+    await _assert_user_can_view_regen_job(db, user_id=current_user.uuid, job=job, is_admin=admin)
     return _job_public_state(job)
 
 
@@ -3062,12 +3550,15 @@ async def get_regenerate_notes_job(job_id: str):
 async def stream_regenerate_notes_job(
     job_id: str,
     request: Request,
-    _auth: User = Depends(get_current_user_from_query),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user_from_query),
 ):
     await _cleanup_expired_jobs()
     job = await _get_job_snapshot(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    admin = await _is_admin(current_user.uuid, db)
+    await _assert_user_can_view_regen_job(db, user_id=current_user.uuid, job=job, is_admin=admin)
 
     async def event_stream():
         last_version = -1
@@ -3126,31 +3617,50 @@ async def stream_regenerate_notes_job(
 async def regenerate_notes(
     lecture_id: int,
     db: AsyncSession = Depends(get_db),
-    _auth: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
-    await get_lecture_or_404(db, lecture_id)
+    lecture = await get_lecture_or_404(db, lecture_id)
+    admin = await _is_admin(current_user.uuid, db)
+    await assert_user_can_view_lecture(db, user_id=current_user.uuid, lecture=lecture, is_admin=admin)
 
     context = await _load_regeneration_context(db, lecture_id)
+    course_context = await _lookup_course_context(db, context["course_id"])
     targets = _build_regeneration_targets(context["align_rows"], context["enriched_by_slide"])
 
     regenerated_slides = 0
-    for target in targets:
-        slide_num = target["slide_number"]
-        slide = context["slides_by_num"].get(slide_num, {"slide": slide_num, "text": ""})
-        transcript_text = _segment_text_for_alignment(
-            context["segments_by_index"],
-            target["start_segment"],
-            target["end_segment"],
+    for batch in _chunk_items(targets, ENRICH_BATCH_SIZE):
+        batch_payloads: list[tuple[dict[str, int], dict, str]] = []
+        for target in batch:
+            slide_num = target["slide_number"]
+            slide = context["slides_by_num"].get(slide_num, {"slide": slide_num, "text": ""})
+            transcript_text = _segment_text_for_alignment(
+                context["segments_by_index"],
+                target["start_segment"],
+                target["end_segment"],
+            )
+            batch_payloads.append((target, slide, transcript_text))
+
+        batch_notes = await generate_notes_for_slides(
+            [(slide, transcript_text) for _, slide, transcript_text in batch_payloads],
+            course_context=course_context,
         )
-        notes = await generate_notes_for_slide(slide, transcript_text)
-        _upsert_enriched_row(
-            db=db,
-            lecture_id=lecture_id,
-            enriched_by_slide=context["enriched_by_slide"],
-            slide_num=slide_num,
-            notes=notes,
-        )
-        regenerated_slides += 1
+        notes_by_slide = {int(note["slide"]): note for note in batch_notes}
+
+        for target, slide, transcript_text in batch_payloads:
+            slide_num = target["slide_number"]
+            notes_entry = notes_by_slide.get(slide_num)
+            if notes_entry is None:
+                notes = build_fallback_enrichment(slide, transcript_text)
+            else:
+                notes = _notes_payload_from_batch_entry(notes_entry)
+            _upsert_enriched_row(
+                db=db,
+                lecture_id=lecture_id,
+                enriched_by_slide=context["enriched_by_slide"],
+                slide_num=slide_num,
+                notes=notes,
+            )
+            regenerated_slides += 1
 
     await db.commit()
     if regenerated_slides > 0:
@@ -3168,3 +3678,47 @@ async def regenerate_notes(
         "regenerated_slides": regenerated_slides,
         "enhanced": refreshed["enhanced"],
     }
+
+
+class LectureChatMessage(BaseModel):
+    role: str  # "user" or "assistant"
+    content: str
+
+
+class LectureChatRequest(BaseModel):
+    message: str
+    selected_text: str | None = None
+    history: list[LectureChatMessage] = []
+
+
+@app.post("/lectures/{lecture_id}/chat")
+async def lecture_chat(
+    lecture_id: int,
+    body: LectureChatRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    lecture = await get_lecture_or_404(db, lecture_id)
+    admin = await _is_admin(current_user.uuid, db)
+    await assert_user_can_view_lecture(db, user_id=current_user.uuid, lecture=lecture, is_admin=admin)
+
+    data = await lecture_to_response(db, lecture_id)
+    lecture_context = _chatbot.build_lecture_context(
+        data["slides"],
+        transcript=data.get("transcript"),
+        alignment=data.get("alignment"),
+    )
+    history = [{"role": m.role, "content": m.content} for m in body.history]
+
+    try:
+        reply = await run_in_threadpool(
+            _chatbot.chat,
+            lecture_context,
+            history,
+            body.message,
+            body.selected_text,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    return {"reply": reply}
